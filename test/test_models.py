@@ -303,6 +303,21 @@ def test_tinygrad_matmul_gradients(chip, monkeypatch):
   assert close(w.grad, a @ c)
 
 
+def test_tinygrad_middle_sum(chip, monkeypatch):
+  # A sum over a middle axis moves that axis first. Moved to the front, as a leading dimension, the axes it keeps stay
+  # rows and columns: x.sum(1) + y is a move and one kernel, and the result is stored 4 x 64, not as a column of 256
+  # that each tensor it meets would be moved into.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor
+  rng = np.random.default_rng(5)
+  a, b = rng.standard_normal((4, 8, 64)).astype(np.float32), rng.standard_normal((4, 64)).astype(np.float32)
+  x, y = (Tensor(v, device="BARETILE").realize() for v in (a, b))
+  names, launch = [], adapter.RT.launch
+  monkeypatch.setattr(adapter.RT, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
+  z = (x.sum(1) + y).realize()
+  assert names == ["move", "sum0 add"] and adapter.on_chip(z).value.t.shape == (1, 4, 64), (names, adapter.on_chip(z).value.t.shape)
+  assert np.allclose(z.numpy(), a.sum(1) + b, atol=1e-5)
+
 def test_tinygrad_mse_training_replays(chip):
   # An SGD step on an MSE loss: its square is a POW, and its gradient a WHERE on whether the constant exponent is 0.
   # Both run on the chip, so a TinyJit replays the step, nothing comes back to the host, and the losses are the CPU's.

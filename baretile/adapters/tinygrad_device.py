@@ -214,7 +214,8 @@ def spread(t, shape, groups):  # expand an elementwise result to shape when all 
 def reduce(x, n, op):
   """Reduce x over its first n axes using sum or max, as tinygrad's REDUCE does. Return a baretile tensor with the
   remaining axes in row-major order. Reduce directly when those axes are the tensor's first one or two dimensions
-  as stored, or its last one or two once they're moved to the end; otherwise move them to the end first."""
+  as stored, or its last one or two once they're moved to the end. Otherwise move them to the front, as a leading
+  dimension, so the result keeps the remaining axes as rows and columns, as fold would have them."""
   axes, kept = list(range(n)), list(range(n, len(x.shape)))
   w = x.view.permute(kept + list(axes))
   f = math.prod(x.shape[k] for k in axes)
@@ -224,7 +225,7 @@ def reduce(x, n, op):
   elif w_whole and r * c == f: t, along = x.t, [2, 1]
   elif front and b == f: t, along = x.t, [0]
   elif front and b * r == f: t, along = x.t, [0, 1]
-  else: t, along = materialize(Value(x.t, w, x.dtype), [[], list(range(len(kept))), list(range(len(kept), len(w.shape)))]), [2]
+  else: t, along = materialize(x, [axes, kept[:-1], kept[-1:]]), [0]
   for ax in along: t = t.sum(ax) if op == "sum" else t.max(ax)
   return t
 
