@@ -352,7 +352,7 @@ DEFER = object()  # a product or a one-hot's where that only sums read, or a pad
 
 class Evaluator:
   """Evaluate a tinygrad graph. Each UOp becomes a chip Value, a number or a tinygrad CPU tensor."""
-  def __init__(self, users): self.values, self.users, self.hots = {}, users, {}
+  def __init__(self, users): self.values, self.users, self.hots, self.fresh = {}, users, {}, set()  # fresh: ids of this graph's uploads
 
   def summed(self, u):
     """True if u's uses are sums, maybe through a permute, so u is a matmul's product. A cast that widens it, as
@@ -573,7 +573,8 @@ class Evaluator:
     if u.op is Ops.STACK and all(isinstance(v, Value) for v in srcs) and u.dtype in DTYPES: return self.stack(u, srcs)  # else on the host
     if u.op is Ops.BUFFER: return self.read(u)  # its contents before any STORE in this graph
     if u.op is Ops.COPY and on_baretile(u) and isinstance(v := srcs[0], Tensor) and u.dtype in DTYPES and v.ndim:
-      return to_chip(v, u.dtype)
+      self.fresh.add(id((v := to_chip(v, u.dtype)).t))
+      return v
     if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return srcs[0]
     if u.op is Ops.AFTER: return self.now(u.src[0])
     if u.op is Ops.STORE: return self.store(u.src[0], srcs[1])
@@ -594,10 +595,10 @@ class Evaluator:
   def lay_out(self, u, x):
     """Store a BARETILE buffer in the shape requested by its reshape. tinygrad creates flat weight buffers;
     upload their host bytes in the requested shape, or move the existing tensor once. Return None when this
-    layout can't be used."""
+    layout can't be used, or for a buffer nothing has written yet, as a STORE's target is before the store."""
     h = u.src[0].buffer._buf
     if isinstance(h, Part): return None
-    if isinstance(x, Tensor) and constant(x) is None and u.dtype in DTYPES and h.value is None:
+    if isinstance(x, Tensor) and constant(x) is None and u.dtype in DTYPES and h.value is None and h.bytes is not None:
       h.set(value=Value(upload(array(x).reshape(u.shape), DTYPES[u.dtype]), View(x.shape), u.dtype), stored=False)
     elif isinstance(x, Value) and x.whole() and x.t.shape != fold(u.shape):
       h.set(value=Value(materialize(Value(x.t, View(u.shape), x.dtype)).realize(), x.view, x.dtype), stored=False)
@@ -657,10 +658,11 @@ class Evaluator:
     if not on_baretile(target): note_host_work(); buf.allocator._copyin(buf._buf, memoryview(flat(data(), n, npd)))  # as tinygrad's _frompy
     elif isinstance(value, Value):
       # if the view is the tensor as stored, keep the tensor and its three axes. copy a tensor that's computed already,
-      # since a replay writes over its tensors in place. While TinyJit records, a captured buffer takes its turn
+      # since a replay writes over its tensors in place and another buffer may hold it, but not an upload this graph
+      # made, which is this buffer's alone. While TinyJit records, a captured buffer takes its turn
       t = value.t if value.whole() else materialize(value)
       if recording is not None and (into := turn(buf._buf, t, value)) is not None: t = into.assign(t)
-      else: t = (t + 0 if t.op is None else t).realize()
+      elif id(t) not in self.fresh: t = (t + 0 if t.op is None else t).realize()
       buf._buf.set(value=Value(t, View(value.shape), value.dtype))
     else: buf._buf.set(flat(data(), n, npd))
     return None

@@ -381,6 +381,20 @@ def test_tinygrad_cat(chip, monkeypatch):
   assert np.allclose(out[0].numpy(), np.concatenate([x * 2, y * 3, z * 4], 1), rtol=1e-6)
   assert np.allclose(out[1].numpy(), np.concatenate([x + 1, (y * z)[:, :64]], 1), rtol=1e-6)
 
+def test_tinygrad_uploads_once(chip, monkeypatch):
+  # A tensor made from NumPy on BARETILE is a copy stored into a new buffer. The copy uploads it, and the new buffer,
+  # which reads as zeros until the store, isn't laid out on the chip first. The buffer keeps the upload, which is its
+  # alone, rather than copying it as it would a tensor another buffer may hold: one upload, and no kernel.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor
+  ups, names, frombytes, launch = [], [], tensor.Tensor.frombytes.__func__, adapter.RT.launch
+  monkeypatch.setattr(tensor.Tensor, "frombytes", classmethod(lambda cls, *a, **k: ups.append(a[1:3]) or frombytes(cls, *a, **k)))
+  monkeypatch.setattr(adapter.RT, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
+  a = np.arange(64 * 256, dtype=np.float32).reshape(64, 256)
+  x = Tensor(a, device="BARETILE").realize()
+  assert ups == [(64, 256)] and names == [], (ups, names)  # an upload is sent, not launched, and there's no copy
+  assert np.array_equal(x.numpy(), a) and np.array_equal((x + 1).numpy(), a + 1)
+
 def test_tinygrad_middle_sum(chip, monkeypatch):
   # A sum over a middle axis moves that axis first. Moved to the front, as a leading dimension, the axes it keeps stay
   # rows and columns: x.sum(1) + y is a move and one kernel, and the result is stored 4 x 64, not as a column of 256
