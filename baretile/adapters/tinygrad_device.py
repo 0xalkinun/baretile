@@ -576,8 +576,11 @@ class Evaluator:
     if u.op is Ops.STACK and all(isinstance(v, Value) for v in srcs) and u.dtype in DTYPES: return self.stack(u, srcs)  # else on the host
     if u.op is Ops.BUFFER: return self.read(u)  # its contents before any STORE in this graph
     if u.op is Ops.COPY and on_baretile(u) and isinstance(v := srcs[0], Tensor) and u.dtype in DTYPES and v.ndim:
-      self.fresh.add(id((v := to_chip(v, u.dtype)).t))
-      return v
+      # fp32 read only as bf16 is rounded on the host, as tinygrad's CPU rounds it, and goes up in half the bytes, cast up
+      # for u, which the casts read through, so no kernel casts it
+      narrow = u.dtype is dtypes.float32 and self.narrowed(u)
+      self.fresh.add(id((v := to_chip(v.cast(dtypes.bfloat16), dtypes.bfloat16) if narrow else to_chip(v, u.dtype)).t))
+      return Value(v.t.float(), v.view, u.dtype) if narrow else v
     if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return srcs[0]
     if u.op is Ops.AFTER: return self.now(u.src[0])
     if u.op is Ops.STORE: return self.store(u.src[0], srcs[1])

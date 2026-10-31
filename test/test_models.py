@@ -393,7 +393,7 @@ def test_tinygrad_uploads_once(chip, monkeypatch):
   # which reads as zeros until the store, isn't laid out on the chip first. The buffer keeps the upload, which is its
   # alone, rather than copying it as it would a tensor another buffer may hold: one upload, and no kernel.
   adapter = adapter_on(chip)
-  from tinygrad import Tensor
+  from tinygrad import Tensor, dtypes
   ups, names, frombytes, launch = [], [], tensor.Tensor.frombytes.__func__, adapter.RT.launch
   monkeypatch.setattr(tensor.Tensor, "frombytes", classmethod(lambda cls, *a, **k: ups.append(a[1:3]) or frombytes(cls, *a, **k)))
   monkeypatch.setattr(adapter.RT, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
@@ -401,6 +401,13 @@ def test_tinygrad_uploads_once(chip, monkeypatch):
   x = Tensor(a, device="BARETILE").realize()
   assert ups == [(64, 256)] and names == [], (ups, names)  # an upload is sent, not launched, and there's no copy
   assert np.array_equal(x.numpy(), a) and np.array_equal((x + 1).numpy(), a + 1)
+  # fp32 that's only cast to bf16 is rounded on the host, as tinygrad's CPU rounds it, to nearest even where the chip's
+  # packer rounds half up, and goes up as bf16: one upload of half the bytes, and no cast kernel
+  a[0, :2] = 1 + 2**-8, 1 + 3 * 2**-8  # halfway between two bf16 values
+  ups.clear(), names.clear()
+  y = Tensor(a, device="BARETILE").cast(dtypes.bfloat16).realize()
+  assert ups == [(64, 256)] and names == [], (ups, names)
+  assert np.array_equal(y.float().numpy(), Tensor(a, device="CPU").cast(dtypes.bfloat16).float().numpy())
 
 def test_tinygrad_middle_sum(chip, monkeypatch):
   # A sum over a middle axis moves that axis first. Moved to the front, as a leading dimension, the axes it keeps stay
