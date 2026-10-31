@@ -4,7 +4,7 @@ import weakref, pytest
 from baretile import bh, pci, runtime
 from baretile.chip import check
 from baretile.hello import hello
-from baretile.runtime import DATA, KERNELS, MAILBOX, MCAST_STATE, Runtime, compile_kernel
+from baretile.runtime import DATA, KERNELS, MAILBOX, MCAST_STATE, Bound, Runtime, compile_kernel
 
 def test_layers():
   # Modules in baretile/ import only the standard library and the layers below their own. Layer 4, in baretile/models
@@ -493,6 +493,16 @@ def test_takeover(chip):
   for rt in (first, beside):
     rt.launch(me), rt.wait()
     assert [chip.read32(x, y, rt.args()) for x, y in rt.cores] == [x | y << 6 for x, y in rt.cores]
+
+def test_dram_free_plain(chip):
+  # jit gives a copy of an input it can't read in place an address Bound to the input's position. Freed, that address
+  # goes back plain: dram_alloc hands out what it gets back, so the next tensor there would carry the Bound, and a later
+  # replay would move that tensor to wherever its input is.
+  rt = Runtime(chip)
+  addr = rt.dram_alloc(64)  # the start of the first hole that fits, which the freed one becomes again
+  rt.dram_free(Bound(addr, 0))
+  again = rt.dram_alloc(64)
+  assert again == addr and type(again) is int, type(again)
 
 def test_runtime_shared_dram(chip):
   a = Runtime(chip, end=chip.tensix[1])

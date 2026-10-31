@@ -813,10 +813,11 @@ class Runtime:
 
   def dram_free(self, addr):
     """Release an allocation after the launches queued so far have finished, then merge adjacent free ranges.
-    Keep allocations made during recording, since replay uses the same addresses."""
+    Keep allocations made during recording, since replay uses the same addresses. A Bound address goes back plain:
+    dram_alloc hands out the addresses it gets back, so the next allocation there would carry the Bound."""
     if not self.resources.active: return  # closing released or stranded all of the runtime's allocations
     if addr in self.pinned: self.pinned_freed.add(addr); return
-    self.freed.append((self.launches, addr))
+    self.freed.append((self.launches, int(addr)))
     self.reclaim()
 
   def pin(self, addr):
