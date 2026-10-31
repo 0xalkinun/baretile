@@ -334,7 +334,7 @@ DEFER = object()  # a product that only sums read. the sum makes it a matmul, or
 
 class Evaluator:
   """Evaluate a tinygrad graph. Each UOp becomes a chip Value, a number or a tinygrad CPU tensor."""
-  def __init__(self, users): self.values, self.users = {}, users
+  def __init__(self, users): self.values, self.users, self.hots = {}, users, {}
 
   def summed(self, u):
     """True if u's uses are sums, maybe through a permute, so u is a matmul's product. A cast that widens it, as
@@ -345,6 +345,33 @@ class Evaluator:
 
   def narrowed(self, u):  # True if u's uses are casts to bf16, maybe through a reshape or permute, which keep its values
     return all(r.op is Ops.CAST and r.dtype is dtypes.bfloat16 or r.op in VIEWS and self.narrowed(r) for r in self.users[u])
+
+  def onehot(self, w):
+    """(ids, k) if WHERE w is where(ids == arange(n), x, 0), with the arange along axis k of w's shape and ids an int32
+    chip Value broadcast to that shape, else None. tinygrad writes == as (a != b) != True, and makes arange from
+    constants, so it's a host tensor here, the same on every call, which the adapter can read without host work. ids
+    from the host, like GPT-2's positions, are uploaded."""
+    if w in self.hots: return self.hots[w]
+    self.hots[w], c, moves, z = None, w.src[0], [], w.src[2]
+    while z.op in (Ops.EXPAND, Ops.RESHAPE, Ops.CAST): z = z.src[0]  # 0 in any dtype is 0
+    if not (z.op is Ops.CONST and z.arg == 0): return None
+    while c.op in (Ops.RESHAPE, Ops.EXPAND): c, moves = c.src[0], [c] + moves
+    if c.op is Ops.CMPNE and self.values.get(c.src[1]) is True and c.src[0].op is Ops.CMPNE: c = c.src[0]
+    elif c.op is not Ops.CMPEQ: return None
+    vals = [self.values.get(s) for s in c.src]
+    r, ids = vals if isinstance(vals[0], Tensor) and vals[0].ndim == 1 else vals[::-1]  # the arange is 1-D, and ids have its axis as 1
+    n = r.shape[0] if isinstance(r, Tensor) and r.ndim == 1 else 0
+    if isinstance(ids, Tensor) and ids.dtype is dtypes.int32:  # positions, an arange of the host's too, as the row a gather reads
+      ids = Value(upload(array(ids), "int32", (1, 1, ids.numel())), View(ids.shape), ids.dtype)
+    if not (n > 1 and isinstance(ids, Value) and ids.dtype is dtypes.int32 and np.array_equal(array(r), np.arange(n))): return None
+    hot, ids = View((1,) * (len(c.shape) - 1) + (n,)).expand(tuple(c.shape)), spread_to(ids, tuple(c.shape))
+    for mv in moves:  # the arange's axis is its view's only stride of 1, through the moves that ids takes too
+      hot, ids = hot.reshape(tuple(mv.shape)) if mv.op is Ops.RESHAPE else hot.expand(tuple(mv.shape)), self.movement(mv, ids)
+      if hot is None: return None
+    pad = len(w.shape) - len(hot.shape)
+    hot = View((1,) * pad + hot.shape, (0,) * pad + hot.strides).expand(tuple(w.shape))
+    self.hots[w] = spread_to(ids, tuple(w.shape)), hot.strides.index(1)
+    return self.hots[w]
 
   def ends(self, u):
     """The first ops after u that aren't elementwise, or a reshape or permute. A kernel can compute u with the
@@ -408,16 +435,22 @@ class Evaluator:
 
   def matmul(self, u):
     """Recognize REDUCE(ADD) u as a matmul, or return None. Its source must multiply a and b, optionally
-    through a PERMUTE. Both operands must span the reduced axes. Of the remaining axes, those spanned by
+    through a PERMUTE, or be where(ids == arange, x, 0), the one-hot times x, which is a gather when it sums along the
+    arange (onehot). Both operands must span the reduced axes. Of the remaining axes, those spanned by
     both become batch dimensions; those spanned by a become rows, and those spanned by b become columns, or the
     other way round when that's the order of u's axes."""
     bare = lambda x: bare(x.src[0]) if x.op is Ops.CAST else x  # without the widening casts that summed allows
     p = bare(u.src[0])
     order = p.arg if p.op is Ops.PERMUTE else tuple(range(len(p.shape)))
     m = bare(p.src[0]) if p.op is Ops.PERMUTE else p
-    if m.op is not Ops.MUL or not all(dtypes.is_float(s.dtype) and s.dtype in DTYPES for s in m.src): return None
-    lift = lambda s, v: to_chip(v, s.dtype) if isinstance(v, Tensor) and constant(v) is None else v  # upload a weight still on the host
-    a, b = (uncast(spread_to(lift(s, self.values.get(s)), m.shape)) for s in m.src)
+    lift = lambda s: to_chip(v, s.dtype) if isinstance(v := self.values.get(s), Tensor) and constant(v) is None else v  # a weight still on the host
+    hot = self.onehot(m) if m.op is Ops.WHERE and dtypes.is_float(m.dtype) and m.dtype in DTYPES else None
+    if hot is not None:  # where(ids == arange, x, 0) is x times the one-hot, which bf16 holds exactly
+      c = spread_to(lift(m.src[0]), m.shape)  # made on the host when ids are too
+      a, b = Value(c.t.cast("bf16"), c.view, dtypes.bfloat16), uncast(spread_to(lift(m.src[1]), m.shape))
+    elif m.op is Ops.MUL and all(dtypes.is_float(s.dtype) and s.dtype in DTYPES for s in m.src):
+      a, b = (uncast(spread_to(lift(s), m.shape)) for s in m.src)
+    else: return None
     if not (isinstance(a, Value) and isinstance(b, Value)) or a.view.mask or b.view.mask: return None
     shape, summed = m.shape, list(order[:u.arg[1]])
     full = lambda v, k: shape[k] == 1 or v.view.strides[k] != 0
@@ -427,6 +460,11 @@ class Evaluator:
     rows, cols = [k for k in free if full(a, k) and not full(b, k)], [k for k in free if full(b, k) and not full(a, k)]
     if len(batch) + len(rows) + len(cols) != len(free) or not (rows or cols): return None
     pick = lambda v, axes: View([shape[k] for k in axes], [v.view.strides[k] for k in axes], v.view.offset)
+    result = lambda out, made: Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)  # made's axes, in u's order
+    if hot is not None and summed == [hot[1]] and math.prod(shape[k] for k in batch) == 1:  # the one-hot picks rows of x: an Embedding
+      ids = materialize(Value(hot[0].t, pick(hot[0], batch + rows), hot[0].dtype), [[], [], list(range(len(batch + rows)))])
+      out = materialize(Value(b.t, pick(b, summed + cols), b.dtype), [[], [0], list(range(1, 1 + len(cols)))]).gather(ids)
+      return result(out if out.dtype == DTYPES[u.dtype] else out.cast(DTYPES[u.dtype]), batch + rows + cols)
     # b @ a is a @ b transposed. Take it when it's in u's order and moves fewer values: a @ b's result is then moved
     # into u's order, and an A that isn't the tensor as stored is moved too, while a B is read transposed in place
     size = lambda axes: math.prod(shape[k] for k in axes)
@@ -447,8 +485,7 @@ class Evaluator:
     if out.op == "matmul" and u.dtype is dtypes.float32 and A.dtype == B.dtype == "bf16" and self.narrowed(u):
       out = A.matmul(B, "bf16")
       out = (out.realize() if len(self.ends(u)) > 1 else out).float()
-    made = batch + rows + cols  # the result's axes as made, permuted below into free's order for u
-    return Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)
+    return result(out, batch + rows + cols)
 
   def movement(self, u, x):
     """Apply a movement operation as a view. Materialize x first if the requested reshape can't be represented
@@ -482,8 +519,8 @@ class Evaluator:
     if u.op in EMPTIABLE and 0 in u.shape: return Tensor.zeros(u.shape, dtype=u.dtype, device="CPU")
     if u.op is Ops.REDUCE and 0 in u.src[0].shape:
       return Tensor.full(u.shape, identity_element(u.arg[0], u.dtype), dtype=u.dtype, device="CPU")
-    if (defer and (u.op is Ops.MUL or u.op in (Ops.PERMUTE, Ops.CAST) and self.values.get(u.src[0]) is DEFER)
-        and self.summed(u)): return DEFER
+    product = u.op is Ops.MUL or u.op in (Ops.PERMUTE, Ops.CAST) and self.values.get(u.src[0]) is DEFER
+    if defer and (product or u.op is Ops.WHERE) and self.summed(u) and (product or self.onehot(u)): return DEFER
     srcs = [self.values.get(s) for s in u.src]
     if u.op is not Ops.REDUCE: srcs = [self.force(s) if v is DEFER else v for s, v in zip(u.src, srcs)]  # a REDUCE may make a matmul of them
     if u.op is Ops.CONST: return u.arg

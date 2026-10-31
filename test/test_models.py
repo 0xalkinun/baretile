@@ -303,6 +303,38 @@ def test_tinygrad_matmul_gradients(chip, monkeypatch):
   assert close(w.grad, a @ c)
 
 
+def test_tinygrad_embedding(chip, monkeypatch):
+  # tinygrad's Embedding sums where(ids == arange, table, 0) over the table's rows: a gather of each id's row, exact in
+  # any dtype, also for positions from Tensor.arange, which are the host's. The weight's gradient sums the same where
+  # over the tokens: the one-hot's transpose times the gradient, a matmul, as baretile's own gather's gradient is. No
+  # kernel holds the table broadcast over the tokens either way.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, nn, dtypes
+  from tinygrad.helpers import Context
+  rng = np.random.default_rng(93)
+  table, g = rng.standard_normal((256, 128)).astype(np.float32), rng.standard_normal((1, 64, 128))
+  ids = rng.integers(0, 256, (1, 64)).astype(np.int32)
+  names, launch = [], adapter.RT.launch
+  monkeypatch.setattr(adapter.RT, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
+  for dtype in (dtypes.float32, dtypes.bfloat16):
+    emb, x = nn.Embedding(256, 128), Tensor(ids, device="BARETILE").realize()
+    emb.weight = Tensor(table, device="BARETILE").cast(dtype).realize()
+    w = emb.weight.float().numpy()
+    with Context(DEV="BARETILE"): positions = Tensor.arange(64).reshape(1, 64)
+    names.clear()
+    y = (emb(x) + emb(positions)).realize()
+    assert sorted(names) == ["add", "gather", "gather"], names
+    assert np.allclose(y.float().numpy()[0], w[ids[0]] + w[:64], rtol=2**-8, atol=2**-8)
+    emb.weight.requires_grad = True
+    grad = Tensor(g.astype(np.float32), device="BARETILE").cast(dtype).realize()
+    (emb(x) * grad).sum().backward()
+    names.clear()
+    emb.weight.grad.realize()
+    assert "matmul" in names and not any("keep" in n or "sum" in n for n in names), names
+    want = np.zeros_like(table)
+    np.add.at(want, ids[0], grad.float().numpy()[0])
+    assert np.abs(emb.weight.grad.float().numpy() - want).max() <= 2**-7 * np.abs(want).max()
+
 def test_tinygrad_middle_sum(chip, monkeypatch):
   # A sum over a middle axis moves that axis first. Moved to the front, as a leading dimension, the axes it keeps stay
   # rows and columns: x.sum(1) + y is a move and one kernel, and the result is stored 4 x 64, not as a column of 256

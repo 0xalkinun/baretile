@@ -268,6 +268,13 @@ reads is computed once, on its own. A matmul that baretile cuts into parts
 along K, as it can for a single row of tiles, keeps the fp32 sum, since in bf16
 each part would round.
 
+A sum of `where(ids == arange, x, 0)`, as tinygrad's `Embedding` is, takes each
+id's row of `x` with one `gather` when it sums along the arange, so it never
+broadcasts the table over the tokens. An id outside the table reads what's
+there, where tinygrad's one-hot gives zeros. Summed along the ids, as the
+embedding's gradient is, it's a matmul of the one-hot's transpose, as the
+gradient of baretile's own `gather` is.
+
 You can run an existing tinygrad script through the adapter:
 
 ```sh
