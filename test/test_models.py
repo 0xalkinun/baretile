@@ -307,7 +307,8 @@ def test_tinygrad_embedding(chip, monkeypatch):
   # tinygrad's Embedding sums where(ids == arange, table, 0) over the table's rows: a gather of each id's row, exact in
   # any dtype, also for positions from Tensor.arange, which are the host's. The weight's gradient sums the same where
   # over the tokens: the one-hot's transpose times the gradient, a matmul, as baretile's own gather's gradient is. No
-  # kernel holds the table broadcast over the tokens either way.
+  # kernel holds the table broadcast over the tokens either way, and the positions' one-hot, made on the host, goes up
+  # as a matrix, not as a column that a move would turn.
   adapter = adapter_on(chip)
   from tinygrad import Tensor, nn, dtypes
   from tinygrad.helpers import Context
@@ -334,6 +335,12 @@ def test_tinygrad_embedding(chip, monkeypatch):
     want = np.zeros_like(table)
     np.add.at(want, ids[0], grad.float().numpy()[0])
     assert np.abs(emb.weight.grad.float().numpy() - want).max() <= 2**-7 * np.abs(want).max()
+    emb.weight.grad = None
+    (emb(positions) * grad).sum().backward()  # the positions' one-hot is the host's, uploaded as the matrix it is
+    names.clear()
+    emb.weight.grad.realize()
+    assert "matmul" in names and "move" not in names, names
+    assert np.abs(emb.weight.grad.float().numpy()[:64] - grad.float().numpy()[0]).max() <= 2**-7 * np.abs(grad.float().numpy()).max()
 
 def test_tinygrad_attention_heads(chip, monkeypatch):
   # GPT-2's attention splits a row of q, k and v into heads, as llm.c's model has it, and merges them back. Heads 64

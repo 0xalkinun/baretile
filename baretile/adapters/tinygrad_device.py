@@ -484,7 +484,10 @@ class Evaluator:
     p = bare(u.src[0])
     order = p.arg if p.op is Ops.PERMUTE else tuple(range(len(p.shape)))
     m = bare(p.src[0]) if p.op is Ops.PERMUTE else p
-    lift = lambda s: to_chip(v, s.dtype) if isinstance(v := self.values.get(s), Tensor) and constant(v) is None else v  # a weight still on the host
+    # a weight still on the host, uploaded as a matrix: a one-hot of (1, T, V, 1) is T x V, not a column of T * V
+    matrix = lambda shape: matrix(shape[:-1]) if len(shape) > 1 and shape[-1] == 1 else shape
+    lift = lambda s: Value(upload(array(v), DTYPES[s.dtype], fold(matrix(v.shape))), View(v.shape), s.dtype) \
+      if isinstance(v := self.values.get(s), Tensor) and constant(v) is None else v
     hot = self.onehot(m) if m.op is Ops.WHERE and dtypes.is_float(m.dtype) and m.dtype in DTYPES else None
     if hot is not None:  # where(ids == arange, x, 0) is x times the one-hot, which bf16 holds exactly
       c = spread_to(lift(m.src[0]), m.shape)  # made on the host when ids are too
