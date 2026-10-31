@@ -335,6 +335,25 @@ def test_tinygrad_embedding(chip, monkeypatch):
     np.add.at(want, ids[0], grad.float().numpy()[0])
     assert np.abs(emb.weight.grad.float().numpy() - want).max() <= 2**-7 * np.abs(want).max()
 
+def test_tinygrad_attention_heads(chip, monkeypatch):
+  # GPT-2's attention splits a row of q, k and v into heads, as llm.c's model has it, and merges them back. Heads 64
+  # wide are whole tiles, so each is a view of qkv, a matmul reads k's transposed in place, and the merge writes the
+  # heads' matmul side by side: no move or transpose.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor
+  rng = np.random.default_rng(94)
+  T, H, D = 64, 2, 64
+  a, b = rng.standard_normal((1, T, 3 * H * D)).astype(np.float32), rng.standard_normal((H * D, 32)).astype(np.float32)
+  qkv, w = Tensor(a, device="BARETILE").realize(), Tensor(b, device="BARETILE").realize()
+  names, launch = [], adapter.RT.launch
+  monkeypatch.setattr(adapter.RT, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
+  q, k, v = (x.reshape(1, T, H, D).transpose(1, 2) for x in qkv.split(H * D, dim=2))
+  y = (((q @ k.transpose(-2, -1)) @ v).transpose(1, 2).reshape(1, T, H * D) @ w).realize()
+  assert not any("move" in n or "transpose" in n for n in names), names
+  heads = [[a[0, :, (i * H + h) * D:(i * H + h + 1) * D] for h in range(H)] for i in range(3)]
+  want = np.concatenate([qh @ kh.T @ vh for qh, kh, vh in zip(*heads)], 1) @ b
+  assert np.abs(y.numpy()[0] - want).max() <= 1e-3 * np.abs(want).max()
+
 def test_tinygrad_middle_sum(chip, monkeypatch):
   # A sum over a middle axis moves that axis first. Moved to the front, as a leading dimension, the axes it keeps stay
   # rows and columns: x.sum(1) + y is a move and one kernel, and the result is stored 4 x 64, not as a column of 256

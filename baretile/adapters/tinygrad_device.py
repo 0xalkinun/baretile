@@ -115,18 +115,36 @@ def grouping(shape, shape3):  # split shape's axes into three consecutive groups
         return [list(range(i)), list(range(i, j)), list(range(j, len(shape)))]
   return None
 
+def tiled(v, m):
+  """v as a slice of whole tiles of its tensor, split into a batch of matrices side by side or one above another, when
+  merge's groups m make it one, as the heads tinygrad splits from a row of q, k and v are. Such a slice shares the
+  tensor's storage. None otherwise."""
+  t, C = v.t, v.t.cols
+  (nb, sb, _, _), (nr, sr, _, _), (nc, sc, _, _) = m
+  r0, c0 = divmod(v.view.offset, C)
+  if v.view.mask or t.batch != 1 or t.rep != 1 or t.runs or sc != 1 or nr > 1 and sr != C or r0 % 32 or c0 % 32 or nc % 32: return None
+  if (nb == 1 or sb == nc) and r0 + nr <= t.rows and c0 + nb * nc <= C: return t[r0:r0 + nr, c0:c0 + nb * nc].split(nb)
+  if sb == nr * C and nr % 32 == 0 and r0 + nb * nr <= t.rows and c0 + nc <= C: return t[r0:r0 + nb * nr, c0:c0 + nc].split(nb, 1)
+  return None
+
 def materialize(v, groups=None):
   """Convert v to a baretile tensor with three axes, grouping its axes as fold does by default. Try the
-  existing layout, a transpose, a single move over the three groups, one over up to five runs of axes, then
-  several moves to swap axis groups. Fall back to a host copy if none works."""
+  existing layout, a transpose, a merge of t's batch side by side, a view of whole tiles or its transpose, a single
+  move over the three groups, one over up to five runs of axes, then several moves to swap axis groups. Fall back to
+  a host copy if none works."""
   groups = groups or groups3(v.shape)
   shape3, t = tuple(math.prod(v.shape[k] for k in g) for g in groups), v.t
   if v.whole() and t.shape == shape3: return t
   if v.whole(): return t.reshape(*shape3)
+  (B, R, C), side = t.shape, v.view.reshape((t.shape[1], t.shape[0], t.shape[2]))  # as t's matrices side by side, if it is
+  if B > 1 and C % 32 == 0 and shape3 == (1, R, B * C) and side is not None and side.strides == (C, R * C, 1) and not side.offset and not side.mask:
+    return t.merge()  # which writes an unrealized t into the columns directly
   m = merge(v.view, groups)
   swapped = [shape3[1] * shape3[2], 1, shape3[1]]  # strides with t's last two axes swapped. a batch of 1 can have any
   if m is not None and all(n == 1 or s == w for n, (_, s, _, _), w in zip(shape3, m, swapped)) and v.view.offset == 0 and not v.view.mask \
      and t.shape == (shape3[0], *shape3[:0:-1]): return t.T
+  if m is not None and (p := tiled(v, m)) is not None: return p
+  if m is not None and (p := tiled(v, [m[0], m[2], m[1]])) is not None: return p.T  # which a matmul reads as B in place
   if m is not None:
     return t.move(shape3, v.view.offset, [s for _, s, _, _ in m], [lo for _, _, lo, _ in m], [hi for _, _, _, hi in m])
   if (p := runs_moved(v, groups)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)

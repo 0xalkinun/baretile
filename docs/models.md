@@ -252,9 +252,13 @@ The adapter translates tinygrad's graph into baretile tensors before tinygrad
 schedules kernels. Its tensors have three dimensions, with tinygrad's leading
 axes folded into the rows. A view that an operation needs as a tensor, like a
 permute or padding, is one move on the chip when its axes merge into at most
-five runs. A permute with more runs takes a move for each pair of axis groups
-it swaps, and anything else is copied through the host. `TinyJit` uses baretile
-recordings when the call can be recorded.
+five runs. A view of whole tiles, like the attention heads that GPT-2 splits
+from a row of q, k and v, is a view of the tensor, and a matmul reads its
+transpose in place. A tensor's matrices side by side, as the heads are merged
+back, are one `merge`, which writes an unrealized tensor there directly. A
+permute with more runs takes a move for each pair of axis groups it swaps, and
+anything else is copied through the host. `TinyJit` uses baretile recordings
+when the call can be recorded.
 
 The adapter recognizes a broadcast multiply followed by a reduction as a
 matmul, also when the products are cast to fp32 before the sum, as in
