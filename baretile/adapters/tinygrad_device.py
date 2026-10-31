@@ -347,7 +347,8 @@ def spread_to(v, shape):  # broadcast an operand of a binary op: a view on the c
   if isinstance(v, Tensor): return v.reshape((1,) * (len(shape) - v.ndim) + v.shape).expand(shape)
   return broadcast(v, shape) if isinstance(v, Value) else v
 
-DEFER = object()  # a product, or a one-hot's where, that only sums read. the sum makes it a matmul or a gather, or forces it
+DEFER = object()  # a product or a one-hot's where that only sums read, or a pad that only adds do. they make a matmul, a gather or
+# a cat of it, or force it
 
 class Evaluator:
   """Evaluate a tinygrad graph. Each UOp becomes a chip Value, a number or a tinygrad CPU tensor."""
@@ -390,6 +391,28 @@ class Evaluator:
     hot = View((1,) * pad + hot.shape, (0,) * pad + hot.strides).expand(tuple(w.shape))
     self.hots[w] = spread_to(ids, tuple(w.shape)), hot.strides.index(1)
     return self.hots[w]
+
+  def stack(self, u, vs):  # tinygrad's STACK of chip values: a batch of their matrices, each computed into its place
+    first = materialize(vs[0])
+    out = tensor.Tensor(runtime(), first.rows, first.cols, batch=len(vs), dtype=first.dtype)
+    for i, v in enumerate(vs): out[i].assign(first if i == 0 else materialize(v))
+    return Value(out, View(tuple(u.shape)), u.dtype)
+
+  def blocks(self, u):  # [(part, c0, c1)] for a deferred ADD of PADs or a PAD u, each part padded to columns c0 to c1
+    if u.op is Ops.ADD: return None if None in (bs := [self.blocks(s) for s in u.src]) else [b for p in bs for b in p]
+    m = self.marg(u)
+    return None if any(a or b for a, b in m[:-1]) else [(u.src[0], m[-1][0], u.shape[-1] - m[-1][1])]  # the last axis only
+
+  def concat(self, u):
+    """ADD u of deferred pads as one tensor that each part is written into, when they're disjoint blocks of whole
+    tiles along u's last axis that cover it, as tinygrad's cat and a split's gradient are. None otherwise."""
+    shape, parts = tuple(u.shape), self.blocks(u)
+    spans = sorted((c0, c1) for _, c0, c1 in parts or [])
+    if not parts or u.dtype not in DTYPES or [c0 for c0, _ in spans] != [0] + [c1 for _, c1 in spans[:-1]] or spans[-1][1] != shape[-1] \
+       or any(c0 % 32 for c0, _ in spans) or not all(isinstance(self.values.get(p), Value) for p, _, _ in parts): return None
+    out = tensor.Tensor(runtime(), math.prod(shape[:-1]), shape[-1], dtype=DTYPES[u.dtype])
+    for p, c0, c1 in parts: out[:, c0:c1].assign(materialize(self.values[p]))  # computed there, if unrealized
+    return Value(out, View(shape), u.dtype)
 
   def ends(self, u):
     """The first ops after u that aren't elementwise, or a reshape or permute. A kernel can compute u with the
@@ -539,10 +562,15 @@ class Evaluator:
       return Tensor.full(u.shape, identity_element(u.arg[0], u.dtype), dtype=u.dtype, device="CPU")
     product = u.op is Ops.MUL or u.op in (Ops.PERMUTE, Ops.CAST) and self.values.get(u.src[0]) is DEFER
     if defer and (product or u.op is Ops.WHERE) and self.summed(u) and (product or self.onehot(u)): return DEFER
+    if defer and u.op is Ops.PAD and all(r.op is Ops.ADD for r in self.users[u]): return DEFER  # a block of a sum of pads
     srcs = [self.values.get(s) for s in u.src]
+    if u.op is Ops.ADD and all(v is DEFER for v in srcs):  # pads summed, as a cat is
+      if defer and all(r.op is Ops.ADD for r in self.users[u]): return DEFER  # more of the sum is to come
+      if (v := self.concat(u)) is not None: return v
     if u.op is not Ops.REDUCE: srcs = [self.force(s) if v is DEFER else v for s, v in zip(u.src, srcs)]  # a REDUCE may make a matmul of them
     if u.op is Ops.CONST: return u.arg
-    if u.op is Ops.STACK and all(isinstance(v, (bool, int, float)) for v in srcs): return tuple(srcs)  # a shape. else values, stacked on the host
+    if u.op is Ops.STACK and all(isinstance(v, (bool, int, float)) for v in srcs): return tuple(srcs)  # a shape
+    if u.op is Ops.STACK and all(isinstance(v, Value) for v in srcs) and u.dtype in DTYPES: return self.stack(u, srcs)  # else on the host
     if u.op is Ops.BUFFER: return self.read(u)  # its contents before any STORE in this graph
     if u.op is Ops.COPY and on_baretile(u) and isinstance(v := srcs[0], Tensor) and u.dtype in DTYPES and v.ndim:
       return to_chip(v, u.dtype)

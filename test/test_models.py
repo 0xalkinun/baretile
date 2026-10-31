@@ -354,6 +354,33 @@ def test_tinygrad_attention_heads(chip, monkeypatch):
   want = np.concatenate([qh @ kh.T @ vh for qh, kh, vh in zip(*heads)], 1) @ b
   assert np.abs(y.numpy()[0] - want).max() <= 1e-3 * np.abs(want).max()
 
+def test_tinygrad_cat(chip, monkeypatch):
+  # tinygrad's cat of equal parts is a stack, which the adapter builds as a batch, each part computed into its matrix,
+  # and a cat of unequal ones, like a split's gradient, is pads summed, which it builds by writing each part into its
+  # columns. Neither goes through the host, so a TinyJit of both replays, and the pads take no moves.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, TinyJit
+  rng = np.random.default_rng(98)
+  a = [rng.standard_normal((64, 128)).astype(np.float32) for _ in range(3)]
+  calls, names, downloads, counting = [], [], [], [False]
+  launch, download = adapter.RT.launch, adapter.download
+  monkeypatch.setattr(adapter.RT, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
+  monkeypatch.setattr(adapter, "download", lambda v: (downloads.append(1) if counting[0] else None) or download(v))
+  @TinyJit
+  def f(x, y, z):
+    calls.append(1)
+    return Tensor.cat(x * 2, y * 3, z * 4, dim=1).realize(), Tensor.cat(x + 1, (y * z)[:, :64], dim=1).realize()
+  for i in range(4):
+    xs = [Tensor(v + i, device="BARETILE").realize() for v in a]
+    counting[0], names[:] = True, []
+    out = f(*xs)
+    counting[0] = False
+    if i == 1: assert "move" not in names, names  # the recording
+  x, y, z = (v + 3 for v in a)
+  assert len(calls) == 2 and not downloads, (len(calls), len(downloads))
+  assert np.allclose(out[0].numpy(), np.concatenate([x * 2, y * 3, z * 4], 1), rtol=1e-6)
+  assert np.allclose(out[1].numpy(), np.concatenate([x + 1, (y * z)[:, :64]], 1), rtol=1e-6)
+
 def test_tinygrad_middle_sum(chip, monkeypatch):
   # A sum over a middle axis moves that axis first. Moved to the front, as a leading dimension, the axes it keeps stay
   # rows and columns: x.sum(1) + y is a move and one kernel, and the result is stored 4 x 64, not as a column of 256

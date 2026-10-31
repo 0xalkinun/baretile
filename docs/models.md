@@ -254,7 +254,10 @@ axes folded into the rows. A view that an operation needs as a tensor stays a
 view of the tensor when it's whole tiles, like the attention heads that GPT-2
 splits from a row of q, k and v, and a matmul reads its transpose in place. A
 tensor's matrices side by side, as the heads are merged back, are one `merge`,
-which writes an unrealized tensor there directly. Another view, like a permute
+which writes an unrealized tensor there directly. A stack, which is tinygrad's
+`cat` of equal parts, is a batch with each part computed into its matrix, and
+pads summed, as a `cat` of other parts and a split's gradient are, write each
+part into its columns when they're whole tiles. Another view, like a permute
 or padding, is one move on the chip when its axes merge into at most five runs.
 A permute with more runs takes a move for each pair of axis groups it swaps,
 and anything else is copied through the host. `TinyJit` uses baretile
