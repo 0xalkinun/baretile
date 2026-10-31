@@ -139,13 +139,12 @@ def materialize(v, groups=None):
   (B, R, C), side = t.shape, v.view.reshape((t.shape[1], t.shape[0], t.shape[2]))  # as t's matrices side by side, if it is
   if B > 1 and C % 32 == 0 and shape3 == (1, R, B * C) and side is not None and side.strides == (C, R * C, 1) and not side.offset and not side.mask:
     return t.merge()  # which writes an unrealized t into the columns directly
-  m = merge(v.view, groups)
-  swapped = [shape3[1] * shape3[2], 1, shape3[1]]  # strides with t's last two axes swapped. a batch of 1 can have any
-  if m is not None and all(n == 1 or s == w for n, (_, s, _, _), w in zip(shape3, m, swapped)) and v.view.offset == 0 and not v.view.mask \
-     and t.shape == (shape3[0], *shape3[:0:-1]): return t.T
-  if m is not None and (p := tiled(v, m)) is not None: return p
-  if m is not None and (p := tiled(v, [m[0], m[2], m[1]])) is not None: return p.T  # which a matmul reads as B in place
-  if m is not None:
+  if (m := merge(v.view, groups)) is not None:
+    swapped = [shape3[1] * shape3[2], 1, shape3[1]]  # strides with t's last two axes swapped. a batch of 1 can have any
+    if all(n == 1 or s == w for n, (_, s, _, _), w in zip(shape3, m, swapped)) and v.view.offset == 0 and not v.view.mask \
+       and t.shape == (shape3[0], *shape3[:0:-1]): return t.T
+    if (p := tiled(v, m)) is not None: return p
+    if (p := tiled(v, [m[0], m[2], m[1]])) is not None: return p.T  # which a matmul reads as B in place
     return t.move(shape3, v.view.offset, [s for _, s, _, _ in m], [lo for _, _, lo, _ in m], [hi for _, _, _, hi in m])
   if (p := runs_moved(v, groups)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
   if (p := transposes(v)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
@@ -168,8 +167,8 @@ def runs_moved(v, groups):
 
 def transposes(v):
   """Convert an axis permutation, such as (B, T, H, D) to (B, H, T, D), into moves that swap two groups of
-  axes. Each move treats its source as row-major elements. Splitting attention heads out or merging them
-  back takes two moves. Return None for other views."""
+  axes. Each move treats its source as row-major elements. Splitting out or merging back attention heads that
+  aren't whole tiles takes two moves. Return None for other views."""
   axes = [k for k, n in enumerate(v.shape) if n > 1]
   order = sorted(axes, key=lambda k: -v.view.strides[k])  # the axes in the order the tensor stores them
   if v.view.offset or v.view.mask or [v.view.strides[k] for k in order] != list(View([v.shape[k] for k in order]).strides): return None
@@ -348,7 +347,7 @@ def spread_to(v, shape):  # broadcast an operand of a binary op: a view on the c
   if isinstance(v, Tensor): return v.reshape((1,) * (len(shape) - v.ndim) + v.shape).expand(shape)
   return broadcast(v, shape) if isinstance(v, Value) else v
 
-DEFER = object()  # a product that only sums read. the sum makes it a matmul, or forces it
+DEFER = object()  # a product, or a one-hot's where, that only sums read. the sum makes it a matmul or a gather, or forces it
 
 class Evaluator:
   """Evaluate a tinygrad graph. Each UOp becomes a chip Value, a number or a tinygrad CPU tensor."""
@@ -379,9 +378,10 @@ class Evaluator:
     vals = [self.values.get(s) for s in c.src]
     r, ids = vals if isinstance(vals[0], Tensor) and vals[0].ndim == 1 else vals[::-1]  # the arange is 1-D, and ids have its axis as 1
     n = r.shape[0] if isinstance(r, Tensor) and r.ndim == 1 else 0
+    if not (n > 1 and np.array_equal(array(r), np.arange(n))): return None
     if isinstance(ids, Tensor) and ids.dtype is dtypes.int32:  # positions, an arange of the host's too, as the row a gather reads
       ids = Value(upload(array(ids), "int32", (1, 1, ids.numel())), View(ids.shape), ids.dtype)
-    if not (n > 1 and isinstance(ids, Value) and ids.dtype is dtypes.int32 and np.array_equal(array(r), np.arange(n))): return None
+    if not (isinstance(ids, Value) and ids.dtype is dtypes.int32): return None
     hot, ids = View((1,) * (len(c.shape) - 1) + (n,)).expand(tuple(c.shape)), spread_to(ids, tuple(c.shape))
     for mv in moves:  # the arange's axis is its view's only stride of 1, through the moves that ids takes too
       hot, ids = hot.reshape(tuple(mv.shape)) if mv.op is Ops.RESHAPE else hot.expand(tuple(mv.shape)), self.movement(mv, ids)
@@ -478,14 +478,14 @@ class Evaluator:
     rows, cols = [k for k in free if full(a, k) and not full(b, k)], [k for k in free if full(b, k) and not full(a, k)]
     if len(batch) + len(rows) + len(cols) != len(free) or not (rows or cols): return None
     pick = lambda v, axes: View([shape[k] for k in axes], [v.view.strides[k] for k in axes], v.view.offset)
+    size = lambda axes: math.prod(shape[k] for k in axes)
     result = lambda out, made: Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)  # made's axes, in u's order
-    if hot is not None and summed == [hot[1]] and math.prod(shape[k] for k in batch) == 1:  # the one-hot picks rows of x: an Embedding
+    if hot is not None and summed == [hot[1]] and size(batch) == 1:  # the one-hot picks rows of x: an Embedding
       ids = materialize(Value(hot[0].t, pick(hot[0], batch + rows), hot[0].dtype), [[], [], list(range(len(batch + rows)))])
       out = materialize(Value(b.t, pick(b, summed + cols), b.dtype), [[], [0], list(range(1, 1 + len(cols)))]).gather(ids)
       return result(out if out.dtype == DTYPES[u.dtype] else out.cast(DTYPES[u.dtype]), batch + rows + cols)
     # b @ a is a @ b transposed. Take it when it's in u's order and moves fewer values: a @ b's result is then moved
     # into u's order, and an A that isn't the tensor as stored is moved too, while a B is read transposed in place
-    size = lambda axes: math.prod(shape[k] for k in axes)
     moved = lambda v, axes: 0 if Value(v.t, pick(v, axes), v.dtype).whole() else size(axes)  # as A
     if (batch + rows + cols != free and batch + cols + rows == free
         and moved(b, batch + cols + summed) < size(free) + moved(a, batch + rows + summed)): a, b, rows, cols = b, a, cols, rows
