@@ -1,10 +1,10 @@
 # Model, server, training, adapter and benchmark tests (layer 4). See conftest.py for simulator setup.
-import html, importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
+import gc, html, importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
 from baretile import pci, tensor
 from baretile.tensor import Tensor
-from baretile.runtime import Runtime
+from baretile.runtime import Bound, Runtime
 from conftest import bf16, value
 import benchmark, train
 from baretile.models import cost, gpt2, llama, qwen, serve
@@ -306,11 +306,14 @@ def test_tinygrad_matmul_gradients(chip, monkeypatch):
 def test_tinygrad_mse_training_replays(chip):
   # An SGD step on an MSE loss: its square is a POW, and its gradient a WHERE on whether the constant exponent is 0.
   # Both run on the chip, so a TinyJit replays the step, nothing comes back to the host, and the losses are the CPU's.
+  # The weight takes turns between two tensors, so a replay doesn't copy it back, also after it's assigned between calls.
+  # The Bound address that a turn writes through is a view's: freed with a tensor, the next tensor there would get it.
   adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit, nn
   from tinygrad.helpers import Context
   rng = np.random.default_rng(84)
-  weights, data = rng.standard_normal((40, 16)).astype(np.float32) * 0.2, rng.standard_normal((5, 2, 8, 40)).astype(np.float32)
+  weights, data = rng.standard_normal((40, 16)).astype(np.float32) * 0.2, rng.standard_normal((6, 2, 8, 40)).astype(np.float32)
+  restart = rng.standard_normal((40, 16)).astype(np.float32) * 0.2
   def run(device):
     layer, calls, losses = nn.Linear(40, 16, bias=False), [], []
     layer.weight = Tensor(weights.T.copy(), device=device).realize()
@@ -322,18 +325,26 @@ def test_tinygrad_mse_training_replays(chip):
         loss = ((layer(x) - y) ** 2).mean()
         opt.zero_grad(); loss.backward(); opt.step()
       return loss.realize()
-    for x, y in data:
-      counting[0] = True
+    for i, (x, y) in enumerate(data):
+      if i == 4: layer.weight.assign(Tensor(restart.T.copy(), device=device)).realize()
+      counting[0], start = True, adapter.RT.launches
       loss = step(Tensor(x, device=device), Tensor(y[:, :16], device=device))
       counting[0] = False
+      if device == "BARETILE" and i >= 2: copies.extend(n for name, n, _, _ in adapter.RT.profile(start) if name == "copy")
       losses.append(loss.item())  # which reads the loss back, after the step
     return losses, len(calls)
-  downloads, counting, real = [], [False], adapter.download
+  downloads, copies, counting, real = [], [], [False], adapter.download
+  freed, free = [], adapter.RT.dram_free
   adapter.download = lambda v: (downloads.append(1) if counting[0] else None) or real(v)
-  try: (got, calls), (want, _) = run("BARETILE"), run("CPU")
-  finally: adapter.download = real
-  assert calls == 2 and not downloads, ("replays" if calls == 2 else calls, f"{len(downloads)} downloads in the steps")
+  adapter.RT.dram_free = lambda addr: freed.append(addr) or free(addr)
+  try:
+    (got, calls), (want, _) = run("BARETILE"), run("CPU")
+    gc.collect()  # the step, its weight and its optimizer
+  finally: adapter.download, adapter.RT.dram_free = real, free
+  assert calls == 2 and not downloads and not copies, (calls, f"{len(downloads)} downloads and {sum(copies)} copies in the steps")
+  assert freed and not any(isinstance(a, Bound) for a in freed), [a.key for a in freed if isinstance(a, Bound)]
   assert np.allclose(got, want, rtol=1e-3), (got, want)
+
 
 def test_tinygrad_host_materialize(chip):
   # Padding on six axes takes six runs of axes, where a move maps five, so it goes through the host, and a TinyJit

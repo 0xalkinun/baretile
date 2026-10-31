@@ -290,9 +290,12 @@ bfloat16 storage use different conversions, and boolean results stay 0 or 1.
 third. A replay reads each input, and each BARETILE buffer the call captured,
 where it is at that call, so new inputs, a weight or learning rate assigned
 between calls, and buffers that another `TinyJit` updates all replay without
-recording again. What the call stores into a captured buffer is copied back
-into that buffer's storage, and an input that is a result of the recording is
-copied before the replay reads it. Results reuse their recorded storage on
+recording again. What the call stores into a captured buffer, like an
+optimizer's new weight, goes into a second tensor for that buffer, and the
+replays write the two in turn, so nothing is copied back. A second store into
+the buffer, or one laid out otherwise than the buffer was, is copied back into
+the buffer's storage. An input that is a result of the recording is copied
+before the replay reads it. Results reuse their recorded storage on
 subsequent calls. A call records again when a buffer the recording reads now
 has another layout, shape or dtype, or when a buffer the recording made or
 uploaded has changed. A mixed-device call discards the recording before running
