@@ -131,10 +131,9 @@ UNPACKERS = bh.UNPACK0 | bh.UNPACK1
 def counters(mask, n):  # resets the address counters of these units to 0, with each instruction moving n datums
   return [ins("SETADCXY", cnt_set_mask=mask, bit_mask=0b1111), ins("SETADCZW", cnt_set_mask=mask, bit_mask=0b1111),
           ins("SETADCXX", cnt_set_mask=mask, x_end2=n - 1)]
-SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem_sel=SEM_PACKED, max_value=15),
-                ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SEMINIT", sem_sel=SEM_UNPACKED, max_value=15),
-                *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS],
-                *counters(UNPACKERS, 1024)]
+SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2),
+                *[ins("SEMINIT", sem_sel=s, max_value=15) for s in (SEM_PACKED, SEM_L1, SEM_UNPACKED)],
+                *[ins("SEMINIT", sem_sel=s, init_value=1, max_value=1) for _, s in ACCS], *counters(UNPACKERS, 1024)]
 SETUP_PACK, PACK_RUNS = counters(bh.PACK, 16), record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
 # Puts v into the low field of word. v is a number, or a C expression whose value is added when the word is pushed at
 # run time.
@@ -448,31 +447,20 @@ INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cm
              "keep": "keep", "drop": "drop", "join": "join"}
 # the SFPU program for a cast
 CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}
+# The comparisons, after their operands load: bf16's as x + 0 and y + 0, and fp32's (f) through UNORDERED
+COMPARE = {"cmplt": [ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1)],
+           "cmple": [ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0), ins("SFPAND", vd=0, vc=ONE),
+                     sfp_store(0)],
+           "cmpne": [ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8),
+                     ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1)]}
+SFPU |= {f + name: ([], binary(*start, *words)) for name, words in COMPARE.items()
+         for f, start in (("", [mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO)]), ("f", UNORDERED))}
+# keep and drop's test of c: all ones in LReg 2 where c isn't +-0
+CHOSEN = [ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8)]
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
-  "cmplt": ([],
-            binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8),
-                   ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "cmple": ([],
-            binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=0, vc=1, mod1=8),
-                   ins("SFPNOT", vd=0, vc=0), ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
-  "cmpne": ([],
-            binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0),
-                   ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2),
-                   ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "fcmplt": ([], binary(*UNORDERED, ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "fcmple": ([],
-             binary(*UNORDERED, ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0),
-                    ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
-  "fcmpne": ([],
-             binary(*UNORDERED, ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
-                    ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE),
-                    sfp_store(1))),
-  "keep": ([],
-           binary(ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2),
-                  sfp_store(1, mod0=RAW))),
-  "drop": ([], binary(ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
-                      ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
+  "keep": ([], binary(*CHOSEN, ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
+  "drop": ([], binary(*CHOSEN, ins("SFPNOT", vd=2, vc=2), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   # The two disjoint masks of where combine without arithmetic, preserving a selected negative zero.
   "join": ([], binary(ins("SFPOR", vd=0, vc=1), sfp_store(0, mod0=RAW))),
   "fadd": ([], binary(mad(0, 0, ONE, 1), sfp_store(0))), "fsub": ([], binary(mad(0, 1, ONE, 0, neg=1), sfp_store(0))),
@@ -481,8 +469,8 @@ SFPU |= {
   # 1.0: 0 minus SFPGT's all ones, or for <=, x > y's all ones plus 1.
   "iadd": ([], binary(ins("SFPIADD", vd=0, vc=1, mod1=4), sfp_store(0, mod0=RAW))),
   "isub": ([], binary(ins("SFPIADD", vd=1, vc=0, mod1=6), sfp_store(1, mod0=RAW))),
-  "imax": ([],
-           binary(*integer_order(0, 1), ins("SFPSWAP", vd=1, vc=0, mod1=1), *integer_order(0), sfp_store(0, mod0=RAW))),
+  "imax": ([], binary(*integer_order(0, 1), ins("SFPSWAP", vd=1, vc=0, mod1=1), *integer_order(0),
+                      sfp_store(0, mod0=RAW))),
   "icmplt": ([], binary(*integer_order(0, 1), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPIADD", vd=1, vc=ZERO, mod1=6),
                         sfp_store(1, mod0=RAW))),
   "icmple": ([],

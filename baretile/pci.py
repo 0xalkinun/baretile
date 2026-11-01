@@ -16,6 +16,7 @@ DEV = "/dev/tenstorrent"  # tt-kmd's device files, one for each card it drives; 
 MODULE = "/sys/module/tenstorrent"  # tt-kmd's module, with its version; tests replace it too
 HUGEPAGES = "/sys/kernel/mm/hugepages/hugepages-2048kB"  # the kernel's pool of 2 MiB pages; tests replace it too
 DRIVER = "tenstorrent"  # tt-kmd's PCI driver, which Card unbinds and release binds again
+MAP_HUGETLB, MAP_LOCKED, MAP_HUGE_2MB = 0x40000, 0x2000, 21 << 26  # mmap flags: 2 MiB pages, even if not the default
 
 def tlb_config(**fields):
   """A 2 MiB TLB's 96-bit config from its fields (bh.TLB_FIELDS)."""
@@ -156,7 +157,6 @@ class Card:
     returns to the kernel's pool when the memoryview is no longer referenced. A Runtime keeps one for its
     status, ring, launch times and transfer staging."""
     if size > 1 << 21: raise ValueError("Card.alloc gives at most one 2 MiB hugepage")
-    MAP_HUGETLB, MAP_LOCKED, MAP_HUGE_2MB = 0x40000, 0x2000, 21 << 26  # 2 MiB pages, even if the host's default differs
     try: buf = mmap.mmap(-1, 1 << 21,
                          mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED
                          | MAP_HUGE_2MB)
@@ -296,7 +296,6 @@ class Kmd:
     a hugepage, physically contiguous, or with the IOMMU translating, ordinary pages, which it maps contiguously. The
     pages go back when the memoryview is no longer referenced."""
     if size > 1 << 21: raise ValueError("Kmd.alloc gives at most 2 MiB")
-    MAP_HUGETLB, MAP_HUGE_2MB = 0x40000, 21 << 26
     flags = mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE
     try: buf, pin = mmap.mmap(-1, 1 << 21, flags | MAP_HUGETLB | MAP_HUGE_2MB), KMD_PIN_CONTIGUOUS | KMD_PIN_NOC_DMA
     except OSError: buf, pin = mmap.mmap(-1, 1 << 21, flags), KMD_PIN_NOC_DMA  # contiguous only if the IOMMU translates

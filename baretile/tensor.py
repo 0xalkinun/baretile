@@ -480,8 +480,7 @@ class Tensor:
     if self.op is None: return self
     if self.op in ("lead", "spread"):  # a view of its source's matrices, with no launch, or a spread copied out
       x = self.srcs[0] if self.op == "lead" else self + 0
-      to = None if into is None else into._relabel(x.lead)
-      x = x.realize() if to is None else to.assign(x)
+      x = x.realize() if into is None else into._relabel(x.lead).assign(x)
       self._alias(x)
       self.op, self.srcs, self.rep, self.runs = None, (), x.rep, x.runs
       return self
@@ -587,13 +586,11 @@ class Tensor:
       x, out, tc = self.realize(), Tensor(self.rt, self.rows, self.cols, batch=self.batch), -(-self.cols // 32)
       out.lead, key = self.lead, ("storage", self.dtype, bool(self.runs))
       return out.run(key, lambda: storage_kernel(*key[1:]), out.addr, *x._where(True), tc, self.tiles // self.batch,
-                     self.rep,
-                     name="storage")._track("cast", (self,)).cast(dtype)
+                     self.rep, name="storage")._track("cast", (self,)).cast(dtype)
     if dtype != "bfp4":
       return _lead(Tensor(self.rt, self.rows, self.cols, "cast", (self,), self.batch, dtype), self.lead)
-    x, out, tc = (_plain(self.cast("bf16").realize()),
-                  Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), -(-self.cols // 32))
-    out.lead = self.lead
+    x, tc = _plain(self.cast("bf16").realize()), -(-self.cols // 32)
+    out = _lead(Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), self.lead)
     return out.run(("bfp4",), bfp4_kernel, out.addr, *x._where(), tc,
                    -(-self.rows // 32) * tc, name="bfp4")._track("cast", (self,))
   @_matrices
@@ -703,8 +700,7 @@ class Tensor:
     if labels is not None and not (labels.dtype == "int32" and labels.shape == self.shape and parts == 1):
       raise ValueError("topk's labels need int32, x's shape and parts=1")
     x, labels = _plain(self.realize()), None if labels is None else _plain(labels.realize())
-    values = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype=x.dtype)
-    ids = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype="int32")
+    values, ids = (Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype=d) for d in (x.dtype, "int32"))
     key = ("topk", k, cols, x.dtype, parts, labels is not None)
     return values.run(key, lambda: topk_kernel(*key[1:]), values.addr, ids.addr, *x._where(), x.rows,
                       *(labels._where() if labels is not None else ()), units=x.batch * parts * -(-x.rows // 32) * 32,
@@ -1120,13 +1116,8 @@ def _bf16s(tile, dtype):
   return out.tobytes()
 
 def _name(e):  # a kernel's name in profiles: its ops, operands first, each once
-  ops = []
-  def walk(e):
-    if not isinstance(e, tuple): return
-    for c in e[1:]: walk(c)
-    if e[0] not in ops: ops.append(e[0])
-  walk(e)
-  return " ".join(ops)
+  def walk(e): return [op for c in e[1:] for op in walk(c)] + [e[0]] if isinstance(e, tuple) else []
+  return " ".join(dict.fromkeys(walk(e)))
 
 def _expr(t, shape, inputs, kernel):
   """Build the unrealized expression under t for a kernel of t's shape. kernel holds [axis, sweep length in
@@ -1295,22 +1286,18 @@ def jit(f):
                                {i for i, t in enumerate(ins) if t.addr in written})
       # storage the recording makes, and captured storage f writes
       taken = rec.made | {a for a in written if not isinstance(a, Bound)}
-      for i in wrote:
-        if ins[i].owner is None: xs[i].assign(ins[i])  # a copy that f wrote
-      grads = [t.grad for t in ins]  # backward gave the gradients to the stand-ins
-      for x, g in zip(xs, grads):
-        if g is not None: x.grad = _on_input(g, ins)
-      return _on_input(out, ins)
-    if any(x.runs != r for x, r in zip(xs, runs)):
-      raise ValueError("a jit input by columns must keep the layout it was recorded with")
-    # Copy an input that the recording's own results overwrite, one that f only reads where this replay writes, and one
-    # a replay can't read in place
-    writes = taken | {xs[i].addr for i in wrote}
-    bound = [x if _bindable(x) and x.addr not in rec.made and (i in wrote or x.addr not in writes) else _copy(x)
-             for i, x in enumerate(xs)]
-    rec.send({i: t.addr for i, t in enumerate(bound)})
-    for i in wrote:
-      if bound[i] is not xs[i]: xs[i].assign(bound[i])
+      bound, grads = ins, [t.grad for t in ins]  # backward gave the gradients to the stand-ins
+    else:
+      if any(x.runs != r for x, r in zip(xs, runs)):
+        raise ValueError("a jit input by columns must keep the layout it was recorded with")
+      # Copy an input that the recording's own results overwrite, one that f only reads where this replay writes, and
+      # one a replay can't read in place
+      writes = taken | {xs[i].addr for i in wrote}
+      bound = [x if _bindable(x) and x.addr not in rec.made and (i in wrote or x.addr not in writes) else _copy(x)
+               for i, x in enumerate(xs)]
+      rec.send({i: t.addr for i, t in enumerate(bound)})
+    for i in wrote:  # a copy that f wrote goes back into the input: a stand-in that's no view, or a replay's copy
+      if bound[i] is not xs[i] and bound[i].owner is None: xs[i].assign(bound[i])
     for x, g in zip(xs, grads):
       if g is not None: x.grad = _on_input(g, bound)
     return _on_input(out, bound)

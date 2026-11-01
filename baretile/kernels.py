@@ -152,8 +152,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   around = (tt(repack(cfg, root_cfg)), tt(repack(root_cfg, cfg))) if out != dtype and len(ops) > 1 else ("", "")
   # op j's pack. The root's packs as out
   repacked = lambda j, words: f"{around[0]} {tt(words)} {around[1]}" if j == root else tt(words)
-  operands = lambda op: ([r for r in (op.get("x"), op.get("y")) if r not in (None, "zero")]
-                         if op["kind"] != "matmul" else [])
+  operands = lambda op: [r for r in (op.get("x"), op.get("y")) if r not in (None, "zero") and op["kind"] != "matmul"]
   reduced = lambda r: isinstance(r, tuple) and ops[r[1]]["kind"] in COMBINE
   axes = {FOLDS[op["kind"]] for op in ops if op["kind"] in COMBINE}
   assert len(axes) <= 1, "a kernel reduces along one axis"
@@ -372,7 +371,6 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     s = size(r)
     i, j = "i_" if ext(s, 1) > 1 else 0, "j" if ext(s, 2) > 1 else 0
     return f"{matrix(r, base)}{i} * a[{base + 2}] + {j} + a[{base + 3}]"
-  tile = lambda i: where(i, arg(i))
   B, U, M, P = range(4)  # the programs. BRISC moves tiles, and TRISC 0, 1 and 2 feed the unpack, math and pack threads
   # The math thread's last instructions for op j. In a tile at the edge, the root's padding in Dst is zeroed first.
   def math_end(j):
@@ -389,12 +387,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # BRISC's fetch of input r in pass p. It goes into the frame, or into its kept slot in the first pass that reads it,
   # once the line before is done with that slot. A single input comes with the first tile, which tiles already counts.
   def fetch(p, r):
-    get = "get16" if r in wide else "get"
-    if r in single: return f"if (tiles == 1) {get}(a[{arg(r)}], {tile(r)}, {single[r]});"
-    if r not in kept: return f"{get}(a[{arg(r)}], {tile(r)}, {slot(r)});"
+    get = f"{'get16' if r in wide else 'get'}(a[{arg(r)}], {where(r, arg(r))}, {slot(r)});"
+    if r in single: return f"if (tiles == 1) {get}"
+    if r not in kept: return get
     if p != passes_of(r)[0]: return ""
-    return (f"if (k == 0) {{ reached(narrow_done); {get}(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
-            f"reached(kept_done[k]); {get}(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
+    return f"if (k == 0) {{ reached(narrow_done); {get} }}" if narrow(r) else f"reached(kept_done[k]); {get}"
   if wide:  # a bf16 tile into an fp32 slot
     decls += ("static void get16(unsigned base, unsigned t, unsigned slot) "
               f"{{ noc_get(BANK(t), AT(base, t, {tile_bytes('bf16')}), SLOT(slot), {tile_bytes('bf16')}); }}\n")
@@ -1382,6 +1379,17 @@ void kmain(volatile unsigned *a) {{
   }}{end}
 }}""")
 
+def tile_read(dtype, runs, b, l1):
+  """C for readback_kernel and storage_kernel: where tile (b, i, j) of the tensor at a[3] is, and the reads that bring
+  it into L1 at l1. With runs, the tensor is by columns, and b is the matrix whose runs hold it."""
+  n = tile_bytes(dtype)
+  if not runs:
+    return "from = b / a[9] * a[4] + i * a[5] + j + a[6]", f"noc_get(BANK(from), AT(a[3], from, {n}), {l1}, {n});"
+  # tile m of tile column j's run, in bank j % 8, as columns_kernel lays it out
+  return (f"run = a[3] + ({b} * a[4] + j / {len(bh.DRAM)}) * a[5] * {n}, m = {b} * a[6] + i",
+          f"noc_get(BANK(j), run + 64 * m, {l1}, 64); noc_get(BANK(j), run + 64 * a[5] + {BFP[dtype]} * m, {l1} + 64, "
+          f"{BFP[dtype]});" if dtype in BFP else f"noc_get(BANK(j), run + m * {n}, {l1}, {n});")
+
 def readback_kernel(dtype, runs=False):
   """Copy a tensor's tiles into host memory (Runtime.back) for tobytes. Reading DRAM over the BARs would wait on PCIe
   for each load.
@@ -1396,12 +1404,7 @@ def readback_kernel(dtype, runs=False):
   With runs, the tensor is laid out by columns (Tensor.columns). Then the strides and offset describe its runs, and
   a block-float tile takes two reads."""
   n, item = tile_bytes(dtype), 0 if dtype in BFP else ITEMSIZE[dtype]
-  place, get = "from = b / a[9] * a[4] + i * a[5] + j + a[6]", f"noc_get(BANK(from), AT(a[3], from, {n}), l1, {n});"
-  if runs:  # tile m of tile column j's run, in bank j % 8, as columns_kernel lays it out
-    place = f"run = a[3] + (b * a[4] + j / {len(bh.DRAM)}) * a[5] * {n}, m = b * a[6] + i"
-    get = (f"noc_get(BANK(j), run + 64 * m, l1, 64); noc_get(BANK(j), run + 64 * a[5] + {BFP[dtype]} "
-           f"* m, l1 + 64, {BFP[dtype]});"
-           if dtype in BFP else f"noc_get(BANK(j), run + m * {n}, l1, {n});")
+  place, get = tile_read(dtype, runs, "b", "l1")
   return compile_kernel(f"""
 {BANKS}
 void kmain(volatile unsigned *a) {{
@@ -1497,14 +1500,7 @@ def storage_kernel(dtype, runs=False):
   args: [first unit, units, out, input address, batch stride, row stride, tile offset, tile columns,
   tiles per matrix, repeat]. With runs, the three layout fields describe column runs, as in readback_kernel.
   Decode sign-magnitude values exactly as the unpacker does, including its negative-zero encoding of -inf."""
-  n = tile_bytes(dtype)
-  place = "from = b / a[9] * a[4] + i * a[5] + j + a[6]"
-  get = f"noc_get(BANK(from), AT(a[3], from, {n}), IN, {n});"
-  if runs:
-    place = f"run = a[3] + (b / a[9] * a[4] + j / {len(bh.DRAM)}) * a[5] * {n}, m = b / a[9] * a[6] + i"
-    get = (f"noc_get(BANK(j), run + 64 * m, IN, 64); noc_get(BANK(j), run + 64 * a[5] + {BFP[dtype]} "
-           f"* m, IN + 64, {BFP[dtype]});"
-           if dtype in BFP else f"noc_get(BANK(j), run + m * {n}, IN, {n});")
+  place, get = tile_read(dtype, runs, "b / a[9]", "IN")
   value = ("((volatile unsigned char *)(IN + 64))[q]" if dtype == "bfp8" else
            "(((volatile unsigned char *)(IN + 64))[q / 2] >> (4 * (q % 2)) & 15) << 4")
   decode = f"""
@@ -1589,23 +1585,21 @@ def transpose_kernel(rows, cols):
   # ct is the result's tile columns. frame(f) gives the slots of x and of the result in frame f.
   ct, frame = -(-rows // 32), lambda f: (FRAMES + 2 * f, FRAMES + 2 * f + 1)
   per = ct * -(-cols // 32)  # tiles in a matrix
-  def loop(*per_frame):  # the loop over result tiles t that all four programs share, with the two frames taking turns
+  def loop(body):  # the loop over result tiles t that all four programs share, with frames f 0 and 1 taking turns
     return f"""  for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u;
-    if (u & 1) {{ {per_frame[1]} }} else {{ {per_frame[0]} }}
+    if (u & 1) {{ {body(1)} }} else {{ {body(0)} }}
   }}"""
   return compile_kernel(
-    brisc_program("a[1]",
-                  loop(*[f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} "
-                         f"* a[5] + t % {per} / {ct} + a[6], "
-                          f"{frame(f)[0]}); ready(); frame_done[{f}] = ++events;" for f in (0, 1)])),
-    unpack_program(loop(*[f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}" for f in (0, 1)]),
+    brisc_program("a[1]", loop(lambda f: f"reached(frame_done[{f}]); flipped(a[3], t / {per} * a[4] + t % {ct} "
+                                         f"* a[5] + t % {per} / {ct} + a[6], {frame(f)[0]}); ready(); "
+                                         f"frame_done[{f}] = ++events;")),
+    unpack_program(loop(lambda f: f"fetched(); {tt(unpack(frame(f)[0], ZERO_SLOT) + REPORT)}"),
                    kernel_config(transposing=True)),
     # padding stays 0
-    math_program({}, loop(*[tt(math_begin(False) + elementwise("add", {}) + MATH_END) + f" h ^= {DST_HALF};"] * 2)),
-    pack_program(loop(*[f"output({f}, {frame(f)[1]}, t); " + tt(pack("h", frame(f)[1], SEM_PACKED)) +
-                        f" h ^= {DST_HALF};"
-                   for f in (0, 1)])))
+    math_program({}, loop(lambda f: tt(math_begin(False) + elementwise("add", {}) + MATH_END) + f" h ^= {DST_HALF};")),
+    pack_program(loop(lambda f: f"output({f}, {frame(f)[1]}, t); {tt(pack('h', frame(f)[1], SEM_PACKED))} "
+                                f"h ^= {DST_HALF};")))
 
 # move_kernel caches x's tiles in L1, tile t in slot t % MOVE_SLOTS. A prime spreads out power-of-two strides.
 MOVE_SLOTS = 127
