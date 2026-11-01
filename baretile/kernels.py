@@ -15,6 +15,9 @@ from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_O
                              sfp_store, slot_base, step_unpack, table, tile_bytes, tile_of, tt, unpack, unpack_program,
                              walk, widen)
 
+def worker_block(rt, w, grid):  # each worker's block of a grid matmul's rt x w result tiles: bp rows by bq columns
+  return -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
+
 def grid_parts(rt, w, kt, grid, base, more=0):
   """Choose L1 buffers for a grid matmul (mc) producing rt x w tiles with kt tiles along K. Slots below base
   are already in use.
@@ -26,7 +29,7 @@ def grid_parts(rt, w, kt, grid, base, more=0):
 
   Choose the layout independently of B's format, so a block-float B and a bf16 B containing the same values
   produce bitwise-identical results."""
-  bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
+  bp, bq = worker_block(rt, w, grid)
   if base + (bp + 3) * kt <= UNPACKABLE: return None
   for least in (max(min(4, kt - 1), 1), 1):  # a part is a tile or more, so a K of one tile has none
     for q in range(bq, 0, -1):
@@ -209,7 +212,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   if (grid and len(matmuls) == 1 and ops[matmuls[0]]["ids"] is None and not reducing and nb == 1 and rt > 1 and
       ext(ops[matmuls[0]]["shape"], 2) == w):
     kt = ops[matmuls[0]]["kt"]
-    bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
+    bp, bq = worker_block(rt, w, grid)
     n_grid = (-(-w // bq), -(-rt // bp))
     parts = grid_parts(rt, w, kt, grid, base, inputs)
     if parts is not False and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B: mc = n_grid
