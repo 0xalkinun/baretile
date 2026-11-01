@@ -377,41 +377,45 @@ that on a P150a. fp32 matmuls take three bf16 products each, so training speed
 is work for the card.
 
 [test/train.py](../test/train.py) trains a small character-level GPT-2 on the
-README and these docs, with the same model code and Adam, which is AdamW without decay. It has 2 blocks
-64 wide, and reads 64 characters at a time. Every step runs as one recording
-(`jit`), so the host only uploads each step's inputs. At each step PyTorch
-computes the loss and gradients on baretile's current weights, and a separate
+README and these docs, written in tinygrad: llm.c's GPT from tinygrad's
+examples, with tinygrad's Adam, on baretile through the
+[adapter](#tinygrad-and-pytorch). It has 2 blocks 64 wide, and reads 64
+characters at a time. Every step replays under `TinyJit`, so the host only
+uploads each step's inputs. At each step PyTorch computes the loss and
+gradients on baretile's current weights with the same model, and a separate
 PyTorch run trains its own copy from the same starting weights:
 
 ```sh
 python3 test/train.py 300
 ```
 
-It needs PyTorch. On ttsim v1.11.5 a step takes about 1.3 seconds. In this run
-the loss stayed within 5e-4 of PyTorch's on the same weights, and the gradients
-within 3e-2 of PyTorch's largest. The mean loss over each 50 steps:
+It needs PyTorch, and a tinygrad checkout for llm.c's model. On ttsim v1.11.5 a
+step takes about 1.6 seconds, PyTorch's checks included, where training the same
+model with `baretile.models.train`'s code takes 1.4. In this run nothing went to
+tinygrad's CPU (`BARETILE_REPORT=1`), the loss stayed within 2e-4 of PyTorch's
+on the same weights, and the gradients within 1.1e-2 of PyTorch's largest. The
+mean loss over each 50 steps:
 
 | Steps | baretile | PyTorch, same weights | PyTorch, own run |
 | --- | --- | --- | --- |
-| 1-50 | 3.55 | 3.55 | 3.56 |
-| 51-100 | 3.34 | 3.34 | 3.36 |
-| 101-150 | 3.25 | 3.25 | 3.35 |
-| 151-200 | 3.18 | 3.18 | 3.31 |
-| 201-250 | 3.12 | 3.12 | 3.21 |
-| 251-300 | 3.05 | 3.05 | 3.12 |
+| 1-50 | 3.68 | 3.68 | 3.68 |
+| 51-100 | 3.28 | 3.28 | 3.26 |
+| 101-150 | 3.37 | 3.37 | 3.33 |
+| 151-200 | 3.27 | 3.27 | 3.25 |
+| 201-250 | 3.19 | 3.19 | 3.20 |
+| 251-300 | 3.24 | 3.24 | 3.26 |
 
 PyTorch's own run drifts away from baretile's. Adam's first updates follow each
 gradient's sign, which a matmul's rounding can flip for a gradient near zero, so
 the two runs take different paths to similar losses.
 
-To train with baretile, write the model with `Tensor`. Its operations have
-gradients (`backward`, `gradient`), `assign` updates a weight in place, and
-`jit` records a whole step, as `train.py` does with `adam`. tinygrad's
-optimizers and `TinyJit` also train through the [adapter](#tinygrad-and-pytorch),
-and so does PyTorch through tinygrad's torch frontend; `test_tinygrad` and
+To train your own model, write it in tinygrad, as `test/train.py` does, or in
+PyTorch through tinygrad's torch frontend; `test_tinygrad` and
 `test_torch_frontend` train small networks both ways. The adapter runs what it
-can't translate on the host, so check how much of a step stays on the chip with
-`baretile.viz`.
+can't translate on tinygrad's CPU, and `BARETILE_REPORT=1` says what and where.
+baretile's `Tensor` trains too: its operations have gradients (`backward`,
+`gradient`), `assign` updates a weight in place, and `jit` records a whole step,
+as `baretile.models.train` does.
 
 ## Estimating cost
 

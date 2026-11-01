@@ -138,8 +138,8 @@ moving onto tinygrad too, one at a time, as each matches their speed.
 
 To train, `python3 -m baretile.models.train` trains GPT-2 from scratch, by
 default GPT-2 124M on tokens such as FineWeb's, and `python3 test/train.py 300`
-in a checkout trains a small GPT-2 on baretile's docs and checks every step
-against PyTorch.
+in a checkout trains a small GPT-2 written in tinygrad on baretile's docs, and
+checks every step against PyTorch.
 [Training](https://github.com/baretile/baretile/blob/main/docs/models.md#training)
 shows how to get the tokens, its settings and the small model's loss curve.
 

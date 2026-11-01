@@ -11,11 +11,12 @@ from baretile.models import cost, gpt2, llama, qwen, serve
 from baretile.models import train as gpt2_train  # test/train.py is train
 
 def test_train(chip):
-  # Train a two-block GPT on a fixed counting sequence so documentation edits don't change the test data.
-  # Compare fp32 Adam steps with PyTorch on the same weights, allowing accumulated matmul error in gradients.
-  # The kernels don't all fit in L1, so replay must reload them in batches.
+  # Train a two-block GPT, tinygrad's llm.c model with tinygrad's Adam, on a fixed counting sequence, so documentation
+  # edits don't change the test data. Compare fp32 Adam steps with PyTorch on the same weights, allowing accumulated
+  # matmul error in gradients. The kernels don't all fit in L1, so replay must reload them in batches.
   pytest.importorskip("torch")
-  losses = train.train(Runtime(chip), 5, data=" ".join(map(str, range(3000))))
+  adapter_on(chip)
+  losses = train.train(5, data=" ".join(map(str, range(3000))))
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
