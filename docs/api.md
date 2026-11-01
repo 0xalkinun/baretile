@@ -38,7 +38,7 @@ a P150a.
 | `python3 -m baretile.models.serve` and its HTTP API | The OpenAI-compatible server | stable |
 | `python3 -m baretile.models.train` | Training GPT-2 from scratch | experimental |
 | `baretile.models` from Python: `llama`, `qwen`, `gpt2`, `serve`, `train`, `cost` | Loading, running and training models | experimental |
-| `baretile.adapters.tinygrad_device` | The tinygrad device | experimental, since it calls tinygrad's internals |
+| `baretile.adapters.tinygrad_device`, `BARETILE_REPORT` | The tinygrad device, and its report of what ran on tinygrad's CPU | experimental, since it calls tinygrad's internals |
 
 ## What you can rely on
 

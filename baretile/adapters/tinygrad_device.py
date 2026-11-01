@@ -1,11 +1,11 @@
 # Use baretile as a tinygrad device. This adapter compiles tinygrad graphs before scheduling.
 # Movement operations remain views until an operation needs their data. Unsupported operations,
 # including random-number generation and other dtypes, run on tinygrad's CPU device.
-# TinyJit records and replays launches through tensor.Recording.
+# TinyJit records and replays launches through tensor.Recording. BARETILE_REPORT=1 says at exit what ran on the CPU.
 #   import baretile.adapters.tinygrad_device, then DEV=BARETILE or Tensor(..., device="BARETILE")
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.adapters.tinygrad_device script.py [args]
 # PyTorch uses tinygrad's torch frontend (extra/torch_backend, the "tiny" device).
-import collections, dataclasses, math, os, runpy, sys, types
+import atexit, collections, dataclasses, math, os, runpy, sys, sysconfig, traceback, types
 import numpy as np
 import tinygrad, tinygrad.tensor, tinygrad.engine.jit
 from tinygrad.helpers import JIT
@@ -148,6 +148,7 @@ def materialize(v, groups=None):
     return t.move(shape3, v.view.offset, [s for _, s, _, _ in m], [lo for _, _, lo, _ in m], [hi for _, _, _, hi in m])
   if (p := runs_moved(v, groups)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
   if (p := transposes(v)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
+  report(f"a view of {v.shape} that no move on the chip makes")
   return upload(download(v), v.t.dtype, shape3)
 
 def runs_moved(v, groups):
@@ -273,6 +274,27 @@ HOST = object()  # a recorded read uploaded host bytes that cannot be rebound on
 def note_host_work():
   global hosted
   if recording is not None: hosted += 1
+
+# With BARETILE_REPORT=1, what left the chip for tinygrad's CPU, and why a TinyJit call didn't replay, printed at exit
+# with the line of the program that did it, and how many times
+REPORT, reports = os.environ.get("BARETILE_REPORT") == "1", collections.Counter()
+OURS = (os.path.dirname(tinygrad.__file__), os.path.dirname(os.path.dirname(os.path.abspath(__file__))), sysconfig.get_paths()["stdlib"])
+def report(why, site=None):
+  if not REPORT: return
+  if site is None:  # the innermost frame outside tinygrad, baretile and the standard library
+    frame = next((f for f in reversed(traceback.extract_stack()) if not os.path.abspath(f.filename).startswith(OURS)), None)
+    site = f"{os.path.relpath(frame.filename)}:{frame.lineno}" if frame else "?"
+  reports[why, site] += 1
+def print_report():
+  lines = [f"{n:6d}x {why}: {site}" for (why, site), n in reports.most_common()]
+  print("\n".join(["baretile: on tinygrad's CPU, and TinyJit calls that didn't replay"] + lines) if lines else
+        "baretile: everything ran on the chip, and every TinyJit call replayed", file=sys.stderr)
+if REPORT: atexit.register(print_report)
+def why_host(u):  # why u runs on tinygrad's CPU
+  if u.op is Ops.THREEFRY: return "random numbers"
+  if not all(isinstance(d, int) for d in u.shape): return f"{u.op.name} of a symbolic shape"
+  if u.dtype not in DTYPES: return f"{u.op.name} of {u.dtype} values"
+  return f"{u.op.name}, which has no chip version for this use"
 
 def noted(h, key=None):  # h's entry in recording. A replay binds the alias to h's tensor, or to input key's
   if h not in recording:
@@ -557,6 +579,7 @@ class Evaluator:
     def there(s, v):  # a source for tinygrad: a chip value is downloaded (host work), a host value stays
       if not isinstance(v, (Value, Tensor)): return s
       return (cpu(download(v), v.dtype) if isinstance(v, Value) else v).cast(s.dtype).uop
+    if REPORT and (u.op is Ops.THREEFRY or any(isinstance(v, Value) for v in srcs)): report(why_host(u))  # off the chip
     return Tensor(u.replace(src=tuple(there(s, v) for s, v in zip(u.src, srcs))))
 
   def eval(self, u, defer=True):
@@ -781,6 +804,11 @@ def tinyjit(self, *args, **kwargs):
   _, var_vals, names, info = (None, {}, None, None) if repeated else _prepare_jit_inputs(args, kwargs)
   holders = [on_chip(t) for t in ins]
   eligible = JIT and not repeated and None not in holders and not var_vals
+  why = ("an input buffer passed twice" if repeated else "an input not on BARETILE" if None in holders else
+         "symbolic variables" if var_vals else None)
+  code = getattr(self.fxn, "__code__", None)  # where the function is, for the report
+  site = f"{os.path.relpath(code.co_filename)}:{code.co_firstlineno} {code.co_name}" if code else repr(self.fxn)
+  if self.cnt >= 1 and why: report(f"a TinyJit call ran without replaying, for {why}", site)
   if self.cnt == 0 or not eligible: discard()
   elif self.replay:
     if (names, info) != self.inputs: raise JitError(f"args mismatch in JIT: {names, info} where it recorded {self.inputs}")
@@ -835,6 +863,9 @@ def tinyjit(self, *args, **kwargs):
     else: self.replay = bool(rec.launches) and replayable and (rec, ret, [(alias.addr.key, layout(old)) for _, old, _, alias in bound],
                                                                [(h, h.version) for h, (_, _, alias) in recording.items() if alias is None], turns)
     if not self.replay: rec.close()
+    why = ("host work in the call" if hosted else "a store into an input" if into_input else
+           "returning an input" if returns_input else None)
+    if not replayable and why: report(f"a TinyJit call won't replay, for {why}", site)
   finally: recording = None
   return ret
 tinygrad.engine.jit._TinyJit.__call__ = tinyjit

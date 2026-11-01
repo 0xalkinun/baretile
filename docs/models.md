@@ -298,6 +298,9 @@ that commit on `PYTHONPATH`, or in `TINYGRAD` for the tests.
 
 Unsupported operations fall back to tinygrad's CPU device. These include
 64-bit integers, bit operations, random-number generation and symbolic shapes.
+With `BARETILE_REPORT=1`, the adapter prints at exit what it ran on tinygrad's
+CPU and why, at the line of your program that ran it, and why a `TinyJit` call
+didn't replay. A program that stays on the chip gets one line that says so.
 Int32 multiplication and reductions also use the CPU to preserve exact integer
 results; baretile's tensor API computes those operations through fp32.
 The adapter preserves the logical dtype through fallback; uint16 values and

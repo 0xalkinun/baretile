@@ -516,6 +516,35 @@ def test_tinygrad_host_materialize(chip):
     assert runs == 2 or dict(adapter.RT.pinned) == pins, "discarded recordings release their pins"
 
 
+def test_tinygrad_report(chip, capsys):
+  # With BARETILE_REPORT=1, the adapter counts what leaves the chip for tinygrad's CPU, and why, at the line of the
+  # program that did it: here random numbers, and a pad on six axes that no move makes. A TinyJit call that won't replay
+  # says why, at the function. A program that stays on the chip reports nothing, and the exit report says so.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, TinyJit
+  here = os.path.relpath(__file__)
+  adapter.REPORT, before = True, dict(adapter.reports)  # as BARETILE_REPORT=1 sets it at import
+  try:
+    adapter.reports.clear()
+    x = Tensor(np.ones((2,) * 6, np.float32), device="BARETILE")
+    (x * 2 + 1).realize()
+    assert not adapter.reports, adapter.reports
+    adapter.print_report()
+    assert "everything ran on the chip" in capsys.readouterr().err
+    (x.reshape(8, 8) * Tensor.rand(8, 8, device="BARETILE")).realize()
+    padded = TinyJit(lambda x: (x.pad(((1, 0),) * 6) * 2).realize())
+    for _ in range(3): padded(Tensor(np.ones((2,) * 6, np.float32), device="BARETILE"))
+    whys = {why: site for why, site in adapter.reports}
+    assert whys["random numbers"].startswith(here + ":"), adapter.reports
+    assert any(w.startswith("a view of") and site.startswith(here + ":") for w, site in whys.items()), adapter.reports
+    assert whys["a TinyJit call won't replay, for host work in the call"].endswith("<lambda>"), adapter.reports
+    adapter.print_report()
+    assert "random numbers" in capsys.readouterr().err
+  finally:
+    adapter.REPORT = False
+    adapter.reports.clear(); adapter.reports.update(before)
+
+
 def test_tinygrad_fallback_dtypes(chip):
   adapter_on(chip)
   from tinygrad import Tensor, dtypes
