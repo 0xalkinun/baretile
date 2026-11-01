@@ -23,7 +23,7 @@ def bench(chip, m, k, n, weights="bf16", repeat=3):
   since, start = rt.launches, chip.pci.now()
   for _ in range(repeat): (a @ b).realize()  # queued back to back
   rt.wait()
-  seconds, read = (chip.pci.now() - start) / repeat, sum(n for *_, n in rt.profile(since)) / repeat if rt.counts else None
+  seconds, read = (chip.pci.now() - start) / repeat, sum(b for *_, b in rt.profile(since)) / repeat if rt.counts else None
   once = -(-m // 32) * -(-k // 32) * tile_bytes("bf16") + -(-k // 32) * -(-n // 32) * tile_bytes(weights)  # each input's tiles
   peak = len(rt.grid[0]) * len(rt.grid[1]) * bh.MVMUL_FLOPS * chip.aiclk * 1e6 / tensor.FIDELITY / 1e12  # a product takes FIDELITY phases
   return seconds, 2 * m * k * n / seconds / 1e12, once / seconds / 1e9, read and read / once, peak

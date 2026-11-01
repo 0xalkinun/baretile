@@ -1,6 +1,6 @@
 # PCIe access through ttsim (Sim), tt-kmd's device file (Kmd) or Linux sysfs (Card). Each backend exposes config space,
 # BAR0, TLB windows and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
-import array, ctypes, fcntl, gc, hashlib, mmap, os, pathlib, struct, time, urllib.request, weakref
+import array, ctypes, errno, fcntl, gc, hashlib, mmap, os, pathlib, struct, tempfile, time, urllib.request, weakref
 from baretile import bh
 
 # what baretile builds and downloads
@@ -118,22 +118,27 @@ class Card:
         and (kind := pathlib.Path(self.sys, "iommu_group/type").read_text().strip()) != "identity"):
       raise RuntimeError(f"the IOMMU translates DMA from {bdf} ({kind}), but Card gives the card physical addresses. "
                          f"Boot with iommu=pt")
-    # The lock on config space makes this the card's only Card, in any process. It goes when cfg closes
+    # The lock on config space makes this the card's only Card, in any process. It goes when cfg closes, which we do
+    # ourselves if opening fails, since the traceback holds self
     self.cfg = os.fdopen(os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC), "r+b", buffering=0)
-    _claim(lambda: _flock(self.cfg), bdf)
-    if os.path.exists(f"{self.sys}/driver"): _write(f"{self.sys}/driver/unbind", bdf)
-    _write(f"{self.sys}/enable", "1")
-    # Memory decode, and bus mastering so the device can reach host memory. Two bytes, since writing Status back would
-    # clear its error bits
-    os.pwrite(self.cfg.fileno(), (self.cfg_read(0x04) & 0xFFFF | 0x6).to_bytes(2, "little"), 0x04)
-    # Set Max Read Request Size in the PCI Express capability to 4 KiB, so the device reads host memory in requests of
-    # up to 4 KiB. kmd sets it up the same way.
-    if at := self.capability(0x10):
-      os.pwrite(self.cfg.fileno(), (self.cfg_read(at + 8) & 0x8FFF | 5 << 12).to_bytes(2, "little"), at + 8)
-    # Map only BAR0, which has the TLB windows and registers that baretile uses. BAR4 may not be all there.
-    fd = os.open(f"{self.sys}/resource0", os.O_RDWR | os.O_SYNC)
-    try: self.map = mmap.mmap(fd, os.fstat(fd).st_size)
-    finally: os.close(fd)
+    try:
+      _claim(lambda: _flock(self.cfg), bdf)
+      if os.path.exists(f"{self.sys}/driver"): _write(f"{self.sys}/driver/unbind", bdf)
+      _write(f"{self.sys}/enable", "1")
+      # Memory decode, and bus mastering so the device can reach host memory. Two bytes, since writing Status back
+      # would clear its error bits
+      os.pwrite(self.cfg.fileno(), (self.cfg_read(0x04) & 0xFFFF | 0x6).to_bytes(2, "little"), 0x04)
+      # Set Max Read Request Size in the PCI Express capability to 4 KiB, so the device reads host memory in requests
+      # of up to 4 KiB. kmd sets it up the same way.
+      if at := self.capability(0x10):
+        os.pwrite(self.cfg.fileno(), (self.cfg_read(at + 8) & 0x8FFF | 5 << 12).to_bytes(2, "little"), at + 8)
+      # Map only BAR0, which has the TLB windows and registers that baretile uses. BAR4 may not be all there.
+      fd = os.open(f"{self.sys}/resource0", os.O_RDWR | os.O_SYNC)
+      try: self.map = mmap.mmap(fd, os.fstat(fd).st_size)
+      finally: os.close(fd)
+    except BaseException:
+      self.cfg.close()
+      raise
     self.bar0 = ctypes.addressof(ctypes.c_char.from_buffer(self.map))
     # Zero the strided multicast words of TLBs 0-31, as kmd leaves them, so a multicast skips no tiles of its rectangle.
     # An earlier user may have set them.
@@ -175,14 +180,9 @@ class Card:
 # tt-kmd's ioctls, _IO(0xFA, n) in its ioctl.h, and their arguments as (C type, [(member, struct code)]), with the
 # padding the C compiler adds. PIN_PAGES asks for the extended output, which carries the NoC address. test_kmd_layouts
 # checks each member's offset against the header.
-KMD = {"GET_DEVICE_INFO": 0, "QUERY_MAPPINGS": 2, "PIN_PAGES": 7, "UNPIN_PAGES": 10, "ALLOCATE_TLB": 11, "FREE_TLB": 12,
-       "CONFIGURE_TLB": 13, "SMC_MSG": 17}
+KMD = {"QUERY_MAPPINGS": 2, "PIN_PAGES": 7, "UNPIN_PAGES": 10, "ALLOCATE_TLB": 11, "CONFIGURE_TLB": 13,
+       "SET_POWER_STATE": 15, "SMC_MSG": 17}
 KMD_ARGS = {
-  "GET_DEVICE_INFO": ("struct tenstorrent_get_device_info",
-                      [("in.output_size_bytes", "I"), ("out.output_size_bytes", "I"), ("out.vendor_id", "H"),
-                       ("out.device_id", "H"), ("out.subsystem_vendor_id", "H"), ("out.subsystem_id", "H"),
-                       ("out.bus_dev_fn", "H"), ("out.max_dma_buf_size_log2", "H"), ("out.pci_domain", "H"),
-                       ("out.reserved", "H")]),
   "QUERY_MAPPINGS": ("struct tenstorrent_query_mappings", [("in.output_mapping_count", "I"), ("in.reserved", "I")]),
   "MAPPING": ("struct tenstorrent_mapping",
               [("mapping_id", "I"), ("reserved", "I"), ("mapping_base", "Q"), ("mapping_size", "Q")]),
@@ -194,27 +194,32 @@ KMD_ARGS = {
   "ALLOCATE_TLB": ("struct tenstorrent_allocate_tlb",
                    [("in.size", "Q"), ("in.reserved", "Q"), ("out.id", "I"), ("out.reserved0", "I"),
                     ("out.mmap_offset_uc", "Q"), ("out.mmap_offset_wc", "Q"), ("out.reserved1", "Q")]),
-  "FREE_TLB": ("struct tenstorrent_free_tlb", [("in.id", "I")]),
   "CONFIGURE_TLB": ("struct tenstorrent_configure_tlb",
                     [("in.id", "I"), ("in.reserved", "I"), ("in.config.addr", "Q"), ("in.config.x_end", "H"),
                      ("in.config.y_end", "H"), ("in.config.x_start", "H"), ("in.config.y_start", "H"),
                      ("in.config.noc", "B"), ("in.config.mcast", "B"), ("in.config.ordering", "B"),
                      ("in.config.linked", "B"), ("in.config.static_vc", "B"), ("in.config.reserved0", "3s"),
                      ("in.config.reserved1", "8s"), ("out.reserved", "Q")]),
+  "SET_POWER_STATE": ("struct tenstorrent_power_state",
+                      [("argsz", "I"), ("flags", "I"), ("reserved0", "B"), ("validity", "B"), ("power_flags", "H"),
+                       ("power_settings", "14H")]),
   "SMC_MSG": ("struct tenstorrent_smc_msg",
               [("argsz", "I"), ("flags", "I"), ("queue_index", "I"), ("reserved0", "I"), ("message", "8I")]),
 }
 KMD_MAPPING_BAR0 = 1  # TENSTORRENT_MAPPING_RESOURCE0_UC: BAR0, uncached
 KMD_PIN_CONTIGUOUS, KMD_PIN_NOC_DMA = 1, 2  # the pages are physically contiguous; the card reaches them through the NoC
-KMD_SMC_POST, KMD_SMC_POLL = 1, 2
+KMD_SMC_POST, KMD_SMC_POLL, KMD_SMC_ABANDON = 1, 2, 4
+# TT_POWER_FLAG_*: the busy AI clock, the GDDR PHYs awake, Tensix and L2CPU not clock-gated. A validity of 4 says we
+# set these four, and kmd keeps the flags past them on
+KMD_POWER_BUSY, KMD_POWER_VALIDITY = 0xF, 4
 
 def _kmd_layout(name): return "<" + "".join(code for _, code in KMD_ARGS[name][1])
 
 class Kmd:
   """A card through tt-kmd's device file, /dev/tenstorrent/N, which any user can open. kmd maps DMA memory for the
   card, through the IOMMU when it translates, and hands out TLB windows, so this needs neither root nor iommu=pt, and
-  tt-smi can use the card at the same time. Opening the file without O_APPEND has kmd power the chip up for us.
-  Needs tt-kmd 2.0 or later, and 2.11 for arc_msg."""
+  tt-smi can use the card at the same time. Opening the file without O_APPEND has kmd power the chip up for us, but at
+  the minimum AI clock, so Kmd asks kmd for the busy one. Needs tt-kmd 2.0 or later, and 2.11 for arc_msg."""
   counts = True  # see Sim
   def __init__(self, bdf, path):
     self.fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
@@ -225,6 +230,11 @@ class Kmd:
       bar0 = next((m for m in self.mappings() if m["mapping_id"] == KMD_MAPPING_BAR0), None)
       if bar0 is None: raise RuntimeError(f"tt-kmd offers no BAR0 mapping for {bdf}")
       self.map = mmap.mmap(self.fd, bar0["mapping_size"], offset=bar0["mapping_base"])
+      # kmd ORs its clients' flags together, so the chip stays busy until we close the file. A kmd from before power
+      # states answers EINVAL, as for any ioctl it doesn't have, and we keep the clock we were given
+      try: self.call("SET_POWER_STATE", argsz=40, validity=KMD_POWER_VALIDITY, power_flags=KMD_POWER_BUSY)
+      except OSError as e:
+        if e.errno != errno.EINVAL: raise
     except BaseException:
       os.close(self.fd)
       raise
@@ -316,13 +326,16 @@ class Kmd:
   def message(self, header):
     """Send ARC a message through kmd, which shares ARC's queue among its clients, and return the 8-word response."""
     try: self.call("SMC_MSG", argsz=48, flags=KMD_SMC_POST, message=(header, *[0] * 7))
-    except OSError as e: raise RuntimeError(f"ARC messages through tt-kmd need tt-kmd 2.11 "
-                                            f"or later ({e.strerror})") from None
+    except OSError as e:  # an older kmd answers EINVAL, as for any ioctl it doesn't have. Others, such as EOPNOTSUPP
+      if e.errno != errno.EINVAL: raise  # from firmware too old to publish a queue, mean what they say
+      raise RuntimeError(f"ARC messages through tt-kmd need tt-kmd 2.11 or later ({e.strerror})") from None
     deadline = time.monotonic() + 1.0
     while True:
       try: return self.call("SMC_MSG", argsz=48, flags=KMD_SMC_POLL)["message"]
       except BlockingIOError:
         if time.monotonic() > deadline:
+          # this file may have one message outstanding, and kmd refuses the next POST until we give this one up
+          self.call("SMC_MSG", argsz=48, flags=KMD_SMC_ABANDON)
           raise TimeoutError(f"ARC did not answer message {header & 0xFF:#x} within 1.0s") from None
         time.sleep(0.001)
 
@@ -380,9 +393,14 @@ def fetch_ttsim():
   if (got := hashlib.sha256(data).hexdigest()) != TTSIM_SHA256:
     raise RuntimeError(f"{TTSIM_URL} has SHA-256 {got}, not {TTSIM_SHA256}")
   TTSIM_PATH.parent.mkdir(parents=True, exist_ok=True)
-  part = TTSIM_PATH.with_name(TTSIM_PATH.name + ".part")
-  part.write_bytes(data)
-  os.replace(part, TTSIM_PATH)  # whole or not at all, if two processes fetch it at once
+  # a file of our own, so a second fetch running at once can't rewrite it as we install it. whole or not at all
+  with tempfile.NamedTemporaryFile(dir=TTSIM_PATH.parent, prefix=TTSIM_PATH.name + ".", delete=False) as f:
+    part = pathlib.Path(f.name)
+    try:
+      f.write(data)
+      f.close()
+      os.replace(part, TTSIM_PATH)
+    finally: part.unlink(missing_ok=True)
   return TTSIM_PATH
 
 def simulator():
@@ -417,9 +435,8 @@ def preflight(bdf):
     found.append(("ok", "running as root") if os.geteuid() == 0 else
                  ("fail", "tt-kmd doesn't drive the card, and opening it through sysfs needs root. Install tt-kmd, "
                           "or run as root"))
-    found.append(("ok",
-                  "the IOMMU passes DMA "
-                  "addresses through" if kind else "no IOMMU group") if kind in (None, "identity") else
+    passes = "the IOMMU passes DMA addresses through" if kind else "no IOMMU group"
+    found.append(("ok", passes) if kind in (None, "identity") else
                  ("fail", f"the IOMMU translates DMA addresses ({kind}), but Card gives the card physical ones. "
                           f"Boot with iommu=pt"))
     found.append(("ok", f"{free} free 2 MiB hugepages; a Runtime takes one") if free else
@@ -467,7 +484,8 @@ def reset(bdf, timeout=10.0):
 
   PCI_COMMAND's parity bit marks the reset. Two config writes trigger the PCIe interface timer. Once the
   marker clears or the device leaves the bus and returns, remove and rescan it to restore config space. See
-  docs/bring-up.md."""
+  docs/bring-up.md. The rescan binds tt-kmd again if it's loaded: return its device file once that appears, so the
+  caller can open the card through it as open_device does, or None without tt-kmd."""
   if os.geteuid() != 0: raise PermissionError("reset needs root to write the card's config space and sysfs")
   path, deadline, gone = f"{SYS}/devices/{bdf}", time.monotonic() + timeout, False
   with os.fdopen(os.open(f"{path}/config", os.O_RDWR | os.O_SYNC), "r+b", buffering=0) as cfg:
@@ -489,3 +507,6 @@ def reset(bdf, timeout=10.0):
   _write(f"{path}/remove", "1")
   _write(f"{SYS}/rescan", "1")
   until(lambda: os.path.exists(f"{path}/config"), "a rescan")
+  if not os.path.exists(f"{SYS}/drivers/{DRIVER}"): return None
+  until(lambda: (dev := kmd_device(bdf)) and os.path.exists(dev), f"{DRIVER} binding it")
+  return kmd_device(bdf)

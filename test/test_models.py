@@ -3084,6 +3084,10 @@ def test_cost(tmp_path):
   llama_cost = lambda **keys: cost.report(str(tmp_path / "llama"), probe=probe, **keys)
   assert llama_cost() != llama_cost(launch=1e-3), "explicit settings override the probe"
   assert measured["bandwidth"] == 300e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
+  # a record that has the clock its cycles count, here half of 1,350 MHz, converts them with it
+  (tmp_path / "slow.json").write_text(json.dumps(json.loads((tmp_path / "probe.json").read_text()) | {"AI clock": 675.0}))
+  halved = cost.probed(card, str(tmp_path / "slow.json"))
+  assert math.isclose(halved["tflops"], measured["tflops"] / 2) and math.isclose(halved["launch"], 2 * measured["launch"]), halved
   slow, fast, long = (cost.prompt(c, s, use | {"kv": "bfp8", "context": n}, card, chunk) for n, chunk in ((4096, 256), (4096, 2048), (32768, 2048)))
   assert slow.rate * 6 < fast.rate and long.rate * 1.5 < fast.rate, (slow.rate, fast.rate, long.rate)
   # a chunk of 2,048 reads its activations again for each group of columns. 256 doesn't, since the accumulators fit

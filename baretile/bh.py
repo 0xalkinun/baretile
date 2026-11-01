@@ -102,7 +102,8 @@ NIU_REGS = {  # offsets from NIU
   "WR_ACKS": 0x204, "READS": 0x208, "WORDS": 0x20C,  # counts of write acks, read responses, and their 64-byte flits
   # requests in flight with transaction id 0, then a word for each of ids 1-15. The id is bits 10-13 of the packet tag.
   "OUTSTANDING": 0x240,
-  "OUTGOING": 0x280}  # writes with transaction id 0 whose data the NIU hasn't read out of L1 yet
+  # writes with transaction id 0 whose data the NIU hasn't read out of L1 yet, then a word for each of ids 1-15
+  "OUTGOING": 0x280}
 NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING counts them
            # a write to a rectangle: broadcast, path reserve, static VC
            "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,
@@ -124,7 +125,8 @@ TENSIX_CFG = 0xFFEF0000  # Tensix backend config bank 0, a word per register. on
 CFG_IC_INVALIDATE = 185  # RISCV_IC_INVALIDATE: bit 0 (BRISC) to bit 4 (NCRISC) drop that core's instruction cache
 
 # The Tensix coprocessor. Encodings come from ISA TensixCoprocessor/ and Diagrams/Src/Bits32.lua, and field names from
-# ttsim's data/bh/tensix_isa.json. A word is opcode << 24 | fields. TRISC t feeds thread t in one of two ways. It stores
+# ttsim's data/bh/tensix_isa.json, except REPLAY's and the SFPU's, which follow the ISA pages.
+# A word is opcode << 24 | fields. TRISC t feeds thread t in one of two ways. It stores
 # the word at TENSIX_PUSH, or it executes the word rotated left by 2 bits as an instruction (.ttinsn). Opcodes are
 # below 0xC0, so the low bits of the rotated word are never 0b11 and it can't be mistaken for RISC-V. Either way, a
 # full FIFO stalls the TRISC. BRISC can push to the threads too, at TENSIX_PUSH + 0x10000*t, but we leave that to the
