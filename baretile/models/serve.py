@@ -6,7 +6,7 @@
 # format (bf16, bfp8, bfp4, or "" for the mode's), and connections the most connections served at once, of which one
 # client address may hold a quarter (serve.server has the default).
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import codecs, collections, functools, json, math, os, queue, re, select, shutil, socket, sys, tempfile, threading, time, uuid
+import codecs, collections, functools, itertools, json, math, os, queue, re, select, shutil, socket, sys, tempfile, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
@@ -125,8 +125,9 @@ class Request:
       if not np.isfinite(logits).any(): break
       if self.fits(token := self.draw(logits)): return token
       logits[token] = -np.inf
+    # Then try the 4,096 likeliest in order: each try decodes the whole output again, on the thread that decodes every slot.
     # If no token fits, only a complete value may end successfully without an EOS token.
-    token = next((int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t))), None)
+    token = next((int(t) for t in np.argsort(-logits)[:4096] if logits[t] > -np.inf and self.fits(int(t))), None)
     if token is None and not self.fits(None): raise ValueError("no token can complete the requested output constraint")
     return token
 
@@ -212,6 +213,10 @@ class Request:
       text = text if cut < 0 else text[:cut]
       if self.shape and (end or cut >= 0) and self.shape(text) != 2:
         raise ValueError("generation stopped before the requested output constraint was complete")
+      if cut >= 0 and self.probs:  # keep the log probabilities of the tokens that spell the text, and not the stop string's
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        spelled = itertools.accumulate((len(decoder.decode(self.tok.bytes.get(t, b""))) for t in self.made), initial=0)
+        self.probs = self.probs[:next(n for n, k in enumerate(spelled) if k >= cut)]
       self.say(text)
       self.finish = "stop" if end or cut >= 0 else "length"
       return True
@@ -329,6 +334,7 @@ class Engine:
     the host when the device budget is too small. If a snapshot cannot fit, omit it without failing the request.
     After a rejected draft, save the recurrent state from before that draft."""
     key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32
+    if key in self.sessions: self.sessions.move_to_end(key)  # in use again, so it's evicted last
     if not key or not self.coherent[u] or key in self.sessions or not self.park + self.keep: return
     parts = [tuple(s[:2] if self.taken[u] else s[2:]) if llama.linear(self.c, l) else s[:, :rows, :]
              for l, s in enumerate(self.slot[u])]
@@ -538,13 +544,16 @@ def chat(template, messages, thinking=True, effort="medium", tools=None):
   if kind == "harmony":  # gpt-oss has a fixed system message. A first system message in the request goes as a developer message
     system = (f"You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: {time.strftime('%Y-%m-%d')}\n\n"
               f"Reasoning: {effort}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.")
+    if effort not in ("low", "medium", "high"): raise ValueError("reasoning_effort must be low, medium or high")
     head, turns = f"<|start|>system<|message|>{system}<|end|>", messages
     if messages and messages[0]["role"] in ("system", "developer"):
       head, turns = head + f"<|start|>developer<|message|># Instructions\n\n{words(messages[0])}\n\n<|end|>", messages[1:]
+    for m in turns:  # anything else would go to the model as something it said itself
+      if m["role"] not in ("user", "assistant"): raise ValueError(f"a {m['role']} message isn't allowed there")
     said = lambda m: "<|start|>user<|message|>" if m["role"] == "user" else "<|start|>assistant<|channel|>final<|message|>"
     return head + "".join(f"{said(m)}{words(m)}<|end|>" for m in turns) + "<|start|>assistant"
-  if kind == "llama":  # Llama 3
-    turn = lambda m: f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{words(m)}<|eot_id|>"
+  if kind == "llama":  # Llama 3, which trims each message as Hugging Face's template does
+    turn = lambda m: f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{words(m).strip()}<|eot_id|>"
     return "<|begin_of_text|>" + "".join(map(turn, messages)) + "<|start_header_id|>assistant<|end_header_id|>\n\n"
   if kind == "chatml":  # the SmolLM instruct models and Qwen. When Qwen3 isn't thinking, its reasoning is given empty
     prompt = "".join(f"<|im_start|>{m['role']}\n{words(m)}<|im_end|>\n" for m in messages) + "<|im_start|>assistant\n"
@@ -617,8 +626,9 @@ def described(tools):
   return tools
 
 def calls(text, tools=()):
-  """Parse Qwen XML tool calls into (preceding text, OpenAI tool_calls). Encode arguments as JSON. Keep
-  schema-declared strings as text; parse other values as JSON when possible. tools have the shapes that described checks."""
+  """Parse Qwen XML tool calls into (preceding text, OpenAI tool_calls). The text loses the whitespace at its end, as a
+  stream does. Encode arguments as JSON. Keep schema-declared strings as text; parse other values as JSON when possible.
+  tools have the shapes that described checks."""
   head, mark, rest = text.partition("<tool_call>")
   props = lambda f: (f.get("parameters") or {}).get("properties") or {}
   schema = {function(t)["name"]: props(function(t)) for t in tools or ()}
@@ -630,7 +640,7 @@ def calls(text, tools=()):
   found = [(name, {k: value(name, k, v) for k, v in re.findall(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", body, re.S)})
            for name, body in re.findall(r"<function=([^>\n]+)>(.*?)</function>", mark + rest, re.S)]
   call = lambda name, args: {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}
-  return head.strip(), [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": call(name, args)} for name, args in found]
+  return head.rstrip(), [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": call(name, args)} for name, args in found]
 
 def chosen(choice, tools):
   """Build a prefix validator for tool_choice, or None for auto. none disallows calls; required demands calls
@@ -650,6 +660,12 @@ def chosen(choice, tools):
   return fits
 
 NESTING = 32  # how deeply formatted lets schemas and generated arrays and objects nest. Its checks recurse at each level
+# The schema keywords formatted accepts: those it enforces, annotations, which constrain nothing (discriminator is pydantic's hint
+# beside a oneOf), and value bounds it doesn't enforce. A schema with any other is refused rather than silently loosened
+KEYWORDS = {"type", "properties", "required", "additionalProperties", "items", "minItems", "maxItems", "enum", "const", "anyOf", "oneOf",
+            "allOf", "$ref", "$defs", "definitions", "title", "description", "$schema", "$id", "examples", "default", "deprecated",
+            "readOnly", "writeOnly", "$comment", "discriminator", "pattern", "format", "minLength", "maxLength", "minimum", "maximum",
+            "exclusiveMinimum", "exclusiveMaximum", "multipleOf"}
 class Short(Exception): pass  # the text ends inside a value that could still fit
 class Bad(Exception): pass  # the text can't begin a value that fits
 
@@ -658,9 +674,12 @@ def formatted(form):
   object; json_schema requires a value matching the supported schema fields.
 
   Supported fields are type (one or a list), properties, required, additionalProperties, items, minItems,
-  maxItems, enum, const, anyOf, oneOf and nonrecursive local $ref into $defs or definitions. String patterns, formats and
-  numeric bounds aren't enforced. Sibling fields intersect, including siblings of $ref as in draft 2020-12.
-  Strings may use literal Unicode or equivalent JSON escapes, including in enum and const.
+  maxItems, enum, const, anyOf, oneOf, allOf and nonrecursive local $ref into $defs or definitions. String patterns,
+  formats and lengths (pattern, format, minLength, maxLength) and numeric bounds (minimum, maximum, exclusiveMinimum,
+  exclusiveMaximum, multipleOf) are accepted but not enforced, and annotations (title, description, $schema, $id,
+  examples, default, deprecated, readOnly, writeOnly, $comment, discriminator) change nothing. Any other keyword, such
+  as not, prefixItems or uniqueItems, is a ValueError that names it. Sibling fields intersect, including siblings of $ref
+  as in draft 2020-12. Strings may use literal Unicode or equivalent JSON escapes, including in enum and const.
 
   Allow at most one whitespace character between tokens and 32 characters per number to prevent unbounded
   generation. Allow commas only where another key or item can follow, so a valid prefix can still be
@@ -682,6 +701,7 @@ def formatted(form):
     if isinstance(sc, bool): return
     if depth >= NESTING: raise ValueError(f"schemas may nest at most {NESTING} levels")
     if not isinstance(sc, dict): raise ValueError("a schema must be an object or boolean")
+    if unknown := set(sc) - KEYWORDS: raise ValueError(f"unsupported schema keywords: {', '.join(sorted(unknown))}")
     if "$ref" in sc:
       ref = sc["$ref"]
       if ref in refs: raise ValueError("recursive schema references are not supported")
@@ -697,14 +717,14 @@ def formatted(form):
     for k in ("minItems", "maxItems"):
       if k in sc and (type(sc[k]) is not int or sc[k] < 0): raise ValueError(f"{k} must be a nonnegative integer")
     if sc.get("minItems", 0) > sc.get("maxItems", math.inf): raise ValueError("minItems exceeds maxItems")
-    for k in ("enum", "anyOf", "oneOf"):
+    for k in ("enum", "anyOf", "oneOf", "allOf"):
       if k in sc and (not isinstance(sc[k], list) or not sc[k]): raise ValueError(f"{k} must be a nonempty list")
     for v in [*sc.get("enum", []), *([sc["const"]] if "const" in sc else [])]:
       if depth + nested(v) > NESTING: raise ValueError(f"enum and const values may nest at most {NESTING} levels with their schema")
       try: json.dumps(v, allow_nan=False)
       except (TypeError, ValueError): raise ValueError("enum and const must contain finite JSON values") from None
     for child in [*sc.get("properties", {}).values(), sc.get("items", True), sc.get("additionalProperties", True),
-                  *sc.get("anyOf", []), *sc.get("oneOf", [])]: check(child, refs, depth + 1)
+                  *sc.get("anyOf", []), *sc.get("oneOf", []), *sc.get("allOf", [])]: check(child, refs, depth + 1)
   check(root)
   def fits(text, pending=b""):
     i = 0
@@ -802,10 +822,11 @@ def formatted(form):
       nonlocal i
       if sc is False: raise Bad
       if sc is True: sc = {}
-      key = next((k for k in ("$ref", "anyOf", "oneOf", "enum", "const") if k in sc), None)
+      key = next((k for k in ("$ref", "allOf", "anyOf", "oneOf", "enum", "const") if k in sc), None)
       if key:  # the value must fit key's alternatives and the schema's other fields. With no other fields, skip parsing them
         rest = {k: v for k, v in sc.items() if k != key}
         if key == "$ref": alternatives = lambda: value(target(sc[key]), depth)
+        elif key == "allOf": alternatives = lambda: combine([lambda part=part: value(part, depth) for part in sc[key]])
         elif key in ("enum", "const"):
           choices = sc["enum"] if key == "enum" else [sc["const"]]
           alternatives = lambda: combine([lambda v=v: literal(v, depth) for v in choices], "any")
@@ -886,9 +907,11 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   text when streamed.
 
   Usage includes prompt_tokens_details.cached_tokens. A stream ends with it in a separate chunk, with empty choices,
-  when stream_options.include_usage asks for it. End a request if no text arrives within wait seconds, or when its
-  client hangs up. Sampling defaults come from defaults, populated from generation_config.json for temperature,
-  top_k, top_p, min_p and repetition_penalty, then from the handler's built-in defaults.
+  when stream_options.include_usage asks for it. End a request if no text arrives within wait seconds, with a 504 or
+  a last chunk whose finish_reason is error, or when its client hangs up. A stream serves a client that shuts its
+  socket for writing after the request; a complete response takes that as a hangup, since until the server writes it
+  looks the same as a closed socket. Sampling defaults come from defaults, populated from generation_config.json for
+  temperature, top_k, top_p, min_p and repetition_penalty, then from the handler's built-in defaults.
 
   A connection has input_wait seconds to send its headers and a body of at most body_limit bytes, else it gets 408 or
   413. Each connection has a handler thread. At most connections of them run, 4 × (slots + 8) by default, and at
@@ -954,7 +977,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         if not isinstance(q, dict): raise ValueError("the request must be a JSON object")
         thinking = (q.get("chat_template_kwargs") or {}).get("enable_thinking", True) is not False
         tools = described(q.get("tools")) if is_chat else None
-        prompt = chat(template, q["messages"], thinking, q.get("reasoning_effort") or "medium", tools) if is_chat else q["prompt"]
+        effort = "medium" if q.get("reasoning_effort") is None else q["reasoning_effort"]
+        prompt = chat(template, q["messages"], thinking, effort, tools) if is_chat else q["prompt"]
         if not isinstance(prompt, str): raise ValueError("prompt must be a string")
         ids = engine.tok.encode(prompt, special=is_chat)
         if not ids: raise ValueError("a prompt must contain at least one token")
@@ -980,74 +1004,90 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       except OverflowError as e: return self.reply(413, {"error": {"message": str(e)}})
       except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:  # RecursionError: a body nested too deeply to parse
         return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
-      if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens, but a slot holds {engine.places - 2}"}})
-      # Reject immediately when all slots are busy, so the client can retry or use another provider.
+      # Reject immediately when all slots are busy, so the client can retry or use another provider. offer refuses a prompt too long for a slot
       try: offered = engine.offer(r)
       except RuntimeError as e: return self.reply(503, {"error": {"message": str(e), "code": 503}})
+      except ValueError as e: return self.reply(400, {"error": {"message": str(e)}})
       if not offered: return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})
-      head = {"id": f"baretile-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
-      seen = {"text": "", "reasoning_content": "", "content": ""}
-      called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the text and tool calls of the answer
-      def parts(text, final=True):  # splits a thinking model's text into reasoning and answer, and cuts the answer at its tool calls
-        out = dict(zip(("reasoning_content", "content"), answer(text, final))) if apart else {"content": text}
-        if tools and (not final or called(text)[1]):  # while more can come, hold back what may begin a call. at the end, cut at calls that parsed
-          shown = out["content"].partition("<tool_call>")[0]
-          out["content"] = shown if final else shown[:len(shown) - unsure(shown, ("<tool_call>",))]
-        return out
-      def delta(text, final):  # the next piece of a chat: what's new in each part
-        seen["text"] += text
-        new = parts(seen["text"], final)
-        out = {k: v[len(seen[k]):] for k, v in new.items() if len(v) > len(seen[k])}
-        seen.update(new)
-        return out
-      def piece(text, done):
-        return ({"index": 0, "delta": delta(text, done is not None)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
-      word, raw = lambda t: engine.tok.bytes.get(t, b"").decode("utf-8", "replace"), lambda t: list(engine.tok.bytes.get(t, b""))
-      def chances(made):  # log probabilities in OpenAI's format: a chat's under content, a completion's as lists
-        one = lambda t, p: {"token": word(t), "logprob": p, "bytes": raw(t)}
-        if is_chat: return {"content": [one(t, p) | {"top_logprobs": [one(a, b) for a, b in top]} for t, p, top in made]}
-        return {"tokens": [word(t) for t, _, _ in made], "token_logprobs": [p for _, p, _ in made],
-                "top_logprobs": [{word(a): b for a, b in top} for _, _, top in made]}
-      def logprobs(k=None):  # the log probabilities of all its tokens, or of those in its k-th piece
-        if r.logprobs is None: return {"logprobs": None}
-        return {"logprobs": chances(r.probs if k is None else r.probs[r.marks[k - 1] if k else 0:r.marks[k]])}
-      usage = lambda: {"prompt_tokens": len(ids), "completion_tokens": len(r.made), "total_tokens": len(ids) + len(r.made),
-                       "prompt_tokens_details": {"cached_tokens": r.cached}}
-      hangup = select.poll()
-      hangup.register(self.connection, select.POLLIN)  # after its request a client sends nothing, so input means it hung up
-      def next_text():  # the next piece of r's text. ConnectionError once the client hangs up, queue.Empty after wait seconds without any
-        end = time.monotonic() + wait
-        while not hangup.poll(0):
-          try: return r.out.get(timeout=min(1, wait))
-          except queue.Empty:
-            if time.monotonic() > end: raise
-        raise ConnectionError("the client hung up")
-      if q.get("stream"):
-        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
-        send = lambda body: (self.wfile.write(f"data: {json.dumps(body)}\n\n".encode()), self.wfile.flush())
-        head["object"] += ".chunk" if is_chat else ""
-        try:
-          if is_chat: send(head | {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-          for k, text in enumerate(iter(next_text, None)):  # each piece with the log probabilities of its tokens
-            send(head | {"choices": [piece(text, None) | logprobs(k)]})
-          if made := called(seen["text"])[1]:
-            calling = {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}
-            send(head | {"choices": [{"index": 0, "delta": calling, "finish_reason": None}]})
-          send(head | {"choices": [piece("", "tool_calls" if made else r.finish)]})
-          if counted: send(head | {"choices": [], "usage": usage()})
+      try:  # r holds a slot now. The finally gives it back unless r finished: when its client left, no text came, or the handler failed
+        head = {"id": f"baretile-{uuid.uuid4().hex}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()),
+                "model": name}
+        seen = {"text": "", "reasoning_content": "", "content": ""}
+        called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the text and tool calls of the answer
+        def parts(text, final=True):  # splits a thinking model's text into reasoning and answer, and cuts the answer at its tool calls
+          out = dict(zip(("reasoning_content", "content"), answer(text, final))) if apart else {"content": text}
+          # While more can come, hold back what may begin a call, and whitespace, which calls drops before one. At the end, cut at calls
+          # that parsed
+          if tools and (not final or called(text)[1]):
+            shown = out["content"].partition("<tool_call>")[0]
+            out["content"] = (shown if final else shown[:len(shown) - unsure(shown, ("<tool_call>",))]).rstrip()
+          return out
+        def delta(text, final):  # the next piece of a chat: what's new in each part
+          seen["text"] += text
+          new = parts(seen["text"], final)
+          out = {k: v[len(seen[k]):] for k, v in new.items() if len(v) > len(seen[k])}
+          seen.update(new)
+          return out
+        def piece(text, done):
+          return ({"index": 0, "delta": delta(text, done is not None)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
+        word, raw = lambda t: engine.tok.bytes.get(t, b"").decode("utf-8", "replace"), lambda t: list(engine.tok.bytes.get(t, b""))
+        def chances(made):  # log probabilities in OpenAI's format: a chat's under content, a completion's as lists
+          one = lambda t, p: {"token": word(t), "logprob": p, "bytes": raw(t)}
+          if is_chat: return {"content": [one(t, p) | {"top_logprobs": [one(a, b) for a, b in top]} for t, p, top in made]}
+          return {"tokens": [word(t) for t, _, _ in made], "token_logprobs": [p for _, p, _ in made],
+                  "top_logprobs": [{word(a): b for a, b in top} for _, _, top in made]}
+        def logprobs(k=None):  # the log probabilities of all its tokens, or of those in its k-th piece
+          if r.logprobs is None: return {"logprobs": None}
+          return {"logprobs": chances(r.probs if k is None else r.probs[r.marks[k - 1] if k else 0:r.marks[k]])}
+        usage = lambda: {"prompt_tokens": len(ids), "completion_tokens": len(r.made), "total_tokens": len(ids) + len(r.made),
+                         "prompt_tokens_details": {"cached_tokens": r.cached}}
+        # After its request a client sends nothing, so input can mean it hung up: a reset, or the end of its input, though not bytes,
+        # as some clients send a CRLF after a body. A closed socket reads its end as one shut for writing does, until a write draws a
+        # reset. So a stream, which writes, watches only for resets (poll always reports them) and serves a client that half-closes. A
+        # reply that waits can't tell the two apart, and takes the end of the input as a hangup
+        hangup = select.poll()
+        hangup.register(self.connection, 0 if q.get("stream") else select.POLLIN)
+        def hung():
+          for _, events in hangup.poll(0):
+            if events & (select.POLLHUP | select.POLLERR): return True
+            try: return not self.connection.recv(4096)  # past the request, which nothing else reads
+            except OSError: return True
+          return False
+        def next_text():  # the next piece of r's text. ConnectionError once the client hangs up, queue.Empty after wait seconds without any
+          end = time.monotonic() + wait
+          while not hung():
+            try: return r.out.get(timeout=min(1, wait))
+            except queue.Empty:
+              if time.monotonic() > end: r.gone = True; raise  # the slot goes before the client hears, so a retry finds it free
+          r.gone = True
+          raise ConnectionError("the client hung up")
+        if q.get("stream"):
+          self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+          send = lambda body: (self.wfile.write(f"data: {json.dumps(body)}\n\n".encode()), self.wfile.flush())
+          head["object"] += ".chunk" if is_chat else ""
+          try:
+            if is_chat: send(head | {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            for k, text in enumerate(iter(next_text, None)):  # each piece with the log probabilities of its tokens
+              part = piece(text, None) | logprobs(k)
+              if not is_chat or part["delta"] or part["logprobs"]: send(head | {"choices": [part]})  # a chat may hold all of a piece back
+            if made := called(seen["text"])[1]:
+              calling = {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}
+              send(head | {"choices": [{"index": 0, "delta": calling, "finish_reason": None}]})
+            send(head | {"choices": [piece("", "tool_calls" if made else r.finish)]})
+            if counted: send(head | {"choices": [], "usage": usage()})
+          except queue.Empty:  # no text came, so the stream ends with an error the client can see
+            send(head | {"choices": [piece("", "error")], "error": {"message": f"no text came in {wait}s: the chip may be hung"}})
           return self.wfile.write(b"data: [DONE]\n\n")
-        except (OSError, queue.Empty): r.gone = True  # the client left, or no text came, so let its slot go
-        return
-      try: text = "".join(iter(next_text, None))
-      except ConnectionError: r.gone = True; return  # nobody is waiting for it now, so let its slot go
-      except queue.Empty:
-        r.gone = True  # nobody is waiting for it now, so let its slot go
-        return self.reply(504, {"error": {"message": f"no text came in {wait}s: the chip may be hung"}})
-      if r.finish == "error": return self.reply(500, {"error": {"message": r.error or "the engine stopped on an error"}})
-      message, (content, made) = parts(text), called(text)
-      if made: message |= {"content": content or None, "tool_calls": made}
-      choice = ({"index": 0, "message": {"role": "assistant"} | message} if is_chat else {"index": 0, "text": text}) | logprobs()
-      self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}], "usage": usage()})
+        try: text = "".join(iter(next_text, None))
+        except queue.Empty: return self.reply(504, {"error": {"message": f"no text came in {wait}s: the chip may be hung"}})
+        if r.finish == "error": return self.reply(500, {"error": {"message": r.error or "the engine stopped on an error"}})
+        message, (content, made) = parts(text), called(text)
+        if made: message |= {"content": content or None, "tool_calls": made}
+        choice = ({"index": 0, "message": {"role": "assistant"} | message} if is_chat else {"index": 0, "text": text}) | logprobs()
+        self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}], "usage": usage()})
+      except OSError: pass  # the client left: a write failed, or next_text saw it hang up
+      finally:
+        if r.finish is None: r.gone = True  # nobody waits for it, so let its slot go
   class Server(ThreadingHTTPServer):
     def process_request(self, request, address):
       with self.lock:  # clients counts the handlers of each address
@@ -1133,17 +1173,17 @@ def fetch(model, cache=str(pci.CACHE / "hub")):
   with open(os.path.join(folder, ".done"), "w"): pass
   return folder
 
-def generation_defaults(config, generation):
+def generation_defaults(config, generation, named=()):
   """Resolve EOS and sampling defaults per field: generation_config.json, then config.json's text_config (a
-  multimodal model's text model), then config.json itself. An explicit null EOS disables automatic end tokens."""
+  multimodal model's text model), then config.json itself. Where none has an eos_token_id, the EOS is named: the id
+  of tokenizer_config.json's eos_token, if it's one token. An explicit null EOS disables automatic end tokens."""
   fields = config | (config.get("text_config") or {}) | generation
-  eos = fields.get("eos_token_id")
+  eos = fields.get("eos_token_id", list(named))
   defaults = {k: v for k, v in fields.items() if k in ("temperature", "top_k", "top_p", "min_p", "repetition_penalty")}
   return eos if isinstance(eos, list) else [] if eos is None else [eos], defaults
 
 def main():
   if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.models.serve model [port] [slots] [places] [mode] [kv] [connections]")
-  from baretile import pci
   from baretile.chip import Chip
   from baretile.runtime import Runtime
   folder, args = fetch(sys.argv[1]), sys.argv[2:] + [None] * 6
@@ -1155,11 +1195,17 @@ def main():
   c.precision = llama.precision(c, mode, kv)
   engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places)
   config = lambda f: llama.read_json(os.path.join(folder, f)) if os.path.exists(os.path.join(folder, f)) else {}
-  generation, name = config("generation_config.json"), os.path.basename(folder.rstrip("/"))
-  eos, defaults = generation_defaults(config("config.json"), generation)
+  generation, tokens, name = config("generation_config.json"), config("tokenizer_config.json"), os.path.basename(folder.rstrip("/"))
+  named = tokens.get("eos_token")
+  named = named.get("content") if isinstance(named, dict) else named  # older files give the added token's fields
+  named = engine.tok.encode(named, special=True) if isinstance(named, str) else []
+  eos, defaults = generation_defaults(config("config.json"), generation, named if len(named) == 1 else ())
   threading.Thread(target=engine.run, daemon=True).start()
   jinja = os.path.join(folder, "chat_template.jinja")  # where transformers 5 keeps it
-  template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
+  template = tokens.get("chat_template")
+  if isinstance(template, list):  # named templates, of which chat uses the default
+    template = next((t.get("template") for t in template if isinstance(t, dict) and t.get("name") == "default"), None)
+  template = template or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
   http = server(engine, name, template, eos, port, defaults=defaults, connections=connections)
   print(f"serving {name} on port {port}: on the chip after {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), "
         f"{slots} slots of {places} positions, prefilling {engine.chunk} tokens at a time, {http.connections} connections, "
