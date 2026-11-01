@@ -255,6 +255,20 @@ def test_tinygrad_jit_rebinds(chip):
     assert np.array_equal(x.numpy(), want), n
   assert len(calls) == 2
 
+def test_tinygrad_jit_unbound_input(chip):
+  # An input whose chip tensor the recording can't bind, here a repeat set by hand, as no adapter path leaves one in a
+  # buffer today, makes each call run, since a replay would read the recorded call's input. The values are the CPU's.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, TinyJit, dtypes
+  calls = []
+  double = TinyJit(lambda x: calls.append(1) or (x * 2).realize())
+  for n in range(4):
+    x = Tensor.zeros(2, 32, 32, device="BARETILE").contiguous().realize()
+    repeat = tensor.Tensor.full(adapter.RT, 32, 32, n, "fp32").repeat_interleave(2)
+    adapter.on_chip(x).set(value=adapter.Value(repeat, adapter.View((2, 32, 32)), dtypes.float32))
+    assert double(x).tolist() == (Tensor.full((2, 32, 32), float(n), device="CPU") * 2).tolist(), n
+  assert len(calls) == 4
+
 
 def test_tinygrad_bf16_matmul(chip, monkeypatch):
   # tinygrad's bf16 matmul sums its bf16 products in fp32, then casts the sum to bf16. That's one bf16 matmul kernel,
@@ -399,6 +413,27 @@ def test_tinygrad_cat(chip, monkeypatch):
   assert len(calls) == 2 and not downloads, (len(calls), len(downloads))
   assert np.allclose(out[0].numpy(), np.concatenate([x * 2, y * 3, z * 4], 1), rtol=1e-6)
   assert np.allclose(out[1].numpy(), np.concatenate([x + 1, (y * z)[:, :64]], 1), rtol=1e-6)
+
+def test_tinygrad_bool_cat(chip):
+  # A bool is stored as 1 or 0 in the dtype of the comparison that made it, so the parts of a cat or a stack of bools
+  # from fp32, int32 and bf16 are cast to one dtype. Both cats, of equal parts and of unequal ones, and the stack stay
+  # on the chip and give the CPU's values.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, dtypes
+  rng = np.random.default_rng(124)
+  x, i = rng.standard_normal((32, 32)).astype(np.float32), rng.integers(-5, 5, (32, 64)).astype(np.int32)
+  def run(device):
+    f, b, w = Tensor(x, device=device) > 0, Tensor(x, device=device).cast(dtypes.bfloat16) < 0, Tensor(i, device=device) > 0
+    return [t.numpy() for t in (Tensor.cat(f, b, w[:, :32], dim=1), Tensor.cat(f, w, b, dim=1), Tensor.stack(f, b, w[:, 32:]))]
+  adapter.REPORT, before = True, dict(adapter.reports)
+  try:
+    adapter.reports.clear()
+    got = run("BARETILE")
+    assert not adapter.reports, adapter.reports
+  finally:
+    adapter.REPORT = False
+    adapter.reports.clear(); adapter.reports.update(before)
+  for g, w in zip(got, run("CPU")): assert g.dtype == w.dtype and np.array_equal(g, w)
 
 def test_tinygrad_uploads_once(chip, monkeypatch):
   # A tensor made from NumPy on BARETILE is a copy stored into a new buffer. The copy uploads it, and the new buffer,
@@ -556,6 +591,39 @@ def test_tinygrad_report(chip, capsys):
     adapter.REPORT = False
     adapter.reports.clear(); adapter.reports.update(before)
 
+def test_tinygrad_report_recorded_again(chip):
+  # A TinyJit call that runs Python where a replay could have run says why, also when it records again: here since a
+  # buffer it reads was replaced from the host, or since its store went over host bytes, each before every call. One
+  # that launches nothing says so once, and runs normally from then on. The values are the CPU's.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, TinyJit
+  def run(device):
+    w, state, x = (Tensor.full(64, float(n), device=device).contiguous().realize() for n in (1, 0, 1))
+    scaled = TinyJit(lambda x: (x * w).realize())
+    @TinyJit
+    def step(x):
+      state.assign(state + x).realize()
+      return state
+    nothing, got = TinyJit(lambda x: Tensor.ones(4, device="CPU").contiguous().realize()), []
+    for n in range(4):
+      for t in (w, state):  # from the host, as test_tinygrad_jit_reset_host_state does
+        buf = t.uop.base.buffer
+        buf.allocator._copyin(buf._buf, memoryview(np.full(64, n, np.float32)))
+      got += [scaled(x).tolist(), step(x).tolist(), nothing(x).tolist()]
+    return got
+  adapter.REPORT, before = True, dict(adapter.reports)
+  try:
+    adapter.reports.clear()
+    got = run("BARETILE")
+    whys = {why: (site.split()[-1], n) for (why, site), n in adapter.reports.items()}
+  finally:
+    adapter.REPORT = False
+    adapter.reports.clear(); adapter.reports.update(before)
+  assert whys == {"a TinyJit call recorded again, for a buffer it reads that changed": ("<lambda>", 2),
+                  "the next TinyJit call records again, for a store over host bytes": ("step", 3),
+                  "a TinyJit call won't replay, for nothing launched on the chip": ("<lambda>", 1)}, whys
+  assert got == run("CPU")
+
 
 def test_tinygrad_fp16(chip):
   # fp16 values stay on the chip, as fp32 rounded to fp16 wherever tinygrad makes them, to nearest even as tinygrad's
@@ -614,7 +682,7 @@ def test_tinygrad_cache_put(chip):
 
 
 def test_tinygrad_fallback_dtypes(chip):
-  adapter_on(chip)
+  adapter = adapter_on(chip)
   from tinygrad import Tensor, dtypes
   x = Tensor([1, 256, 65535], dtype=dtypes.uint16, device="BARETILE")
   assert (x + x).tolist() == [2, 512, 65534] and x.max().item() == 65535
@@ -624,6 +692,13 @@ def test_tinygrad_fallback_dtypes(chip):
   assert (b + b).cast(dtypes.float32).tolist() == [1, 0, 1]
   assert ((b + b) == b).tolist() == [True, True, True]
   assert ((b + b) & b).cast(dtypes.int32).tolist() == [1, 0, 1]
+  def outcome(device, e):  # the values, or the error, which this tinygrad's CPU raises for an infinite or NaN power
+    try: return (Tensor([0.5, 1.0, 2.0], device=device) ** e).numpy()
+    except (OverflowError, ValueError) as error: return repr(error)
+  for e in (math.inf, -math.inf, math.nan):  # a power that's no whole number or fraction goes to the host
+    assert adapter.power(tensor.Tensor.full(adapter.RT, 1, 3, 2, "fp32"), e) is None
+    got, want = outcome("BARETILE", e), outcome("CPU", e)
+    assert got == want if isinstance(want, str) else np.array_equal(got, want, equal_nan=True), (e, got, want)
 
 
 @pytest.mark.parametrize("size", [4, 64])

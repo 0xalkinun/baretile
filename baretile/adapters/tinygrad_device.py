@@ -21,8 +21,8 @@ from baretile.chip import Chip
 from baretile.runtime import Bound, Runtime
 
 # A View is a shape, strides, an offset and a mask over a baretile tensor's elements in row-major order. When an op
-# needs the data, the View becomes a tensor of three axes: the tensor as stored, a transpose that a matmul reads in
-# place, one move, or several moves that swap axes.
+# needs the data, the View becomes a tensor of three axes, in place where it can be and by moves or the host otherwise
+# (materialize lists the ways).
 NP = {"fp32": np.float32, "bf16": np.uint16, "int32": np.int32}  # bf16 as raw bits
 
 RT = None  # all workers of the chip, unless you set it first. a device has one Chip at a time
@@ -214,7 +214,7 @@ def broadcast(v, shape):  # numpy broadcasting, as a view
 def common_groups(shape, values):  # fold an elementwise op the way an operand's tensor already is, else fold's way
   return next((g for v in values if isinstance(v, Value) and v.whole() and (g := grouping(shape, v.t.shape))), groups3(shape))
 
-def operand(v, shape, groups):
+def chip_operand(v, shape, groups):
   """Prepare v for an elementwise operation with the given shape and axis groups. Keep broadcast dimensions at
   size 1 when each group folds to either 1 or its full size. Otherwise materialize the broadcast."""
   whole = [not v.view.mask or v.view.mask[k] == (0, n) for k, n in enumerate(v.view.shape)]
@@ -229,7 +229,7 @@ def spread(t, shape, groups):  # expand an elementwise result to shape when all 
   shape3 = tuple(math.prod(shape[k] for k in g) for g in groups)
   return t if t.shape == shape3 else t.expand(*shape3)
 
-def reduce(x, n, op):
+def reduce_axes(x, n, op):
   """Reduce x over its first n axes using sum or max, as tinygrad's REDUCE does. Return a baretile tensor with the
   remaining axes in row-major order. Reduce directly when those axes are the tensor's first one or two dimensions
   as stored, or its last one or two once they're moved to the end. Otherwise move them to the front, as a leading
@@ -383,6 +383,7 @@ VIEWS = (Ops.RESHAPE, Ops.PERMUTE)  # movement ops that keep every value, in ano
 def power(x, e):
   """x ** e as tinygrad's POW, for a number e: products for a whole e up to 4, so a negative x keeps its sign, and
   exp2(e log2 x) for a fraction, which is NaN for a negative x, as pow is. None otherwise, for the host."""
+  if not math.isfinite(e): return None  # inf and NaN, which int() can't take
   if e == int(e) and 0 < abs(e) <= 4:
     p = x
     for _ in range(int(abs(e)) - 1): p = p * x
@@ -439,10 +440,14 @@ class Evaluator:
     self.hots[w] = spread_to(ids, tuple(w.shape)), hot.strides.index(1)
     return self.hots[w]
 
-  def stack(self, u, vs):  # tinygrad's STACK of chip values: a batch of their matrices, each computed into its place
+  def stack(self, u, vs):
+    """tinygrad's STACK of chip values: a batch of their matrices, each computed into its place. A bool is stored in the
+    dtype of the comparison that made it, so each part is cast to the first's."""
     first = materialize(vs[0])
     out = tensor.Tensor(runtime(), first.rows, first.cols, batch=len(vs), dtype=first.dtype)
-    for i, v in enumerate(vs): out[i].assign(first if i == 0 else materialize(v))
+    for i, v in enumerate(vs):
+      x = first if i == 0 else materialize(v)
+      out[i].assign(x if x.dtype == first.dtype else x.cast(first.dtype))
     return Value(out, View(tuple(u.shape)), u.dtype)
 
   def blocks(self, u):  # [(part, c0, c1)] for a deferred ADD of PADs or a PAD u, each part padded to columns c0 to c1
@@ -452,13 +457,15 @@ class Evaluator:
 
   def concat(self, u):
     """ADD u of deferred pads as one tensor that each part is written into, when they're disjoint blocks of whole
-    tiles along u's last axis that cover it, as tinygrad's cat and a split's gradient are. None otherwise."""
+    tiles along u's last axis that cover it, as tinygrad's cat and a split's gradient are. A bool is stored in the dtype
+    of the comparison that made it, so each part is cast to the first's. None otherwise."""
     shape, parts = tuple(u.shape), self.blocks(u)
     spans = sorted((c0, c1) for _, c0, c1 in parts or [])
     if not parts or u.dtype not in DTYPES or [c0 for c0, _ in spans] != [0] + [c1 for _, c1 in spans[:-1]] or spans[-1][1] != shape[-1] \
        or any(c0 % 32 for c0, _ in spans) or not all(isinstance(self.values.get(p), Value) for p, _, _ in parts): return None
-    out = tensor.Tensor(runtime(), math.prod(shape[:-1]), shape[-1], dtype=DTYPES[u.dtype])
-    for p, c0, c1 in parts: out[:, c0:c1].assign(materialize(self.values[p]))  # computed there, if unrealized
+    xs = [(materialize(self.values[p]), c0, c1) for p, c0, c1 in parts]
+    out = tensor.Tensor(runtime(), math.prod(shape[:-1]), shape[-1], dtype=DTYPES[u.dtype] or xs[0][0].dtype)
+    for x, c0, c1 in xs: out[:, c0:c1].assign(x if x.dtype == out.dtype else x.cast(out.dtype))  # computed there, if unrealized
     return Value(out, View(shape), u.dtype)
 
   def ends(self, u):
@@ -483,7 +490,7 @@ class Evaluator:
     if isinstance(x, Tensor):  # from the host: a number if it's a constant
       if (c := constant(x)) is not None: return int(c) if isinstance(c, bool) else c
       return up(x, "fp32" if dtypes.is_float(x.dtype) else "int32", tuple(math.prod(shape[k] for k in g) for g in groups))
-    return operand(x, shape, groups)
+    return chip_operand(x, shape, groups)
 
   def chip_op(self, u, srcs):
     """Run u on the chip, or return None if baretile can't."""
@@ -516,7 +523,7 @@ class Evaluator:
     return None
 
   def reduce(self, u, x):  # REDUCE(op, n) reduces the first n axes of x
-    t = reduce(x, u.arg[1], "sum" if u.arg[0] is Ops.ADD else "max")
+    t = reduce_axes(x, u.arg[1], "sum" if u.arg[0] is Ops.ADD else "max")
     return Value(typed(t, u.dtype), View(tuple(u.shape)), u.dtype)
 
   def matmul(self, u):
@@ -685,8 +692,9 @@ class Evaluator:
     return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape), v.dtype)
 
   def store(self, target, value):
-    """Store value into target, reshaping if needed. Writes through a view update part of the buffer on the
-    host and replace its bytes. Values read before that write retain the old contents."""
+    """Store value into target, reshaping if needed. Writes through a view update part of the buffer: whole rows with
+    a put on the chip (put_rows), other parts on the host, which replaces its bytes, so values read before such a write
+    keep the old contents."""
     chain = []
     while target.op is not Ops.BUFFER:
       ok = target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE) or target.op is Ops.STAGE and target.arg is None
@@ -727,11 +735,11 @@ class Evaluator:
 class Holder:  # contents of a BARETILE buffer: bytes from the host, or a chip Value
   def __init__(self): self.bytes, self.value, self.version = None, None, 0
   # new contents, noted while TinyJit records a call. stored is False when the same value is laid out again
-  def set(self, bytes=None, value=None, stored=True):
+  def set(self, data=None, value=None, stored=True):
     if recording is not None: noted(self)[1] |= stored
     self.version += 1
-    if bytes is not None: note_host_work()
-    self.bytes, self.value = bytes, value
+    if data is not None: note_host_work()
+    self.bytes, self.value = data, value
 
 def host(v, dtype):  # numpy in tinygrad's layout for dtype: bf16 as raw bits, a bool as a byte
   if isinstance(v, Value):
@@ -830,9 +838,11 @@ def tinyjit(self, *args, **kwargs):
   repeated = len({t.uop.base for t in ins}) != len(ins)
   _, var_vals, names, info = (None, {}, None, None) if repeated else _prepare_jit_inputs(args, kwargs)
   holders = [on_chip(t) for t in ins]
-  eligible = JIT and not repeated and None not in holders and not var_vals
+  # an input that noted can't bind, a repeat or one by columns, would be read where it was when the call recorded
+  unbound = any(h is not None and (h.value.t.rep != 1 or h.value.t.runs is not None) for h in holders)
+  eligible = JIT and not repeated and None not in holders and not unbound and not var_vals
   why = ("an input buffer passed twice" if repeated else "an input not on BARETILE" if None in holders else
-         "symbolic variables" if var_vals else None)
+         "an input that the recording can't bind" if unbound else "symbolic variables" if var_vals else None)
   code = getattr(self.fxn, "__code__", None)  # where the function is, for the report
   site = f"{os.path.relpath(code.co_filename)}:{code.co_firstlineno} {code.co_name}" if code else repr(self.fxn)
   if self.cnt >= 1 and why: report(f"a TinyJit call ran without replaying, for {why}", site)
@@ -854,6 +864,7 @@ def tinyjit(self, *args, **kwargs):
         h, was, other = turn
         h.value, turn[1:] = other, [other, was]
       return ret
+    report("a TinyJit call recorded again, for a buffer it reads that changed", site)
     discard()
   self.cnt += 1
   if self.cnt == 1 or not eligible or self.replay is False:
@@ -885,14 +896,16 @@ def tinyjit(self, *args, **kwargs):
         h.value = old
     # and a tensor of its layout for the next replay to write, as [holder, its tensor, the other]
     turns = [[h, h.value, Value(like(h.value.t), h.value.view, h.value.dtype)] for h in turning]
-    if any(old is HOST and stored for old, stored, _ in recording.values()):
+    if host_store := any(old is HOST and stored for old, stored, _ in recording.values()):
       self.replay = None  # a store over host bytes records again next call, when the stored value is on the chip
     else: self.replay = bool(rec.launches) and replayable and (rec, ret, [(alias.addr.key, layout(old)) for _, old, _, alias in bound],
                                                                [(h, h.version) for h, (_, _, alias) in recording.items() if alias is None], turns)
     if not self.replay: rec.close()
-    why = ("host work in the call" if hosted else "a store into an input" if into_input else
-           "returning an input" if returns_input else None)
-    if not replayable and why: report(f"a TinyJit call won't replay, for {why}", site)
+    why = ("host work in the call" if hosted else "a store into an input" if into_input else "returning an input" if returns_input
+           else "a store that lays a buffer out otherwise" if not replayable else None)
+    if why: report(f"a TinyJit call won't replay, for {why}", site)
+    elif host_store: report("the next TinyJit call records again, for a store over host bytes", site)
+    elif not rec.launches: report("a TinyJit call won't replay, for nothing launched on the chip", site)
   finally: recording = None
   return ret
 tinygrad.engine.jit._TinyJit.__call__ = tinyjit
