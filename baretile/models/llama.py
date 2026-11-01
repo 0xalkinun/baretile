@@ -61,8 +61,9 @@ def precision(c, mode="bf16", kv=None):
     bfp4         the MLP's gate and up in bfp4 and the rest in bfp8, at four phases
     tt           tt_transformers' performance mode at tt-metal 9f98dee9. The MLP's gate and up are bfp4 at one phase,
                  and the other matrices and the output layer bfp8 at two. Attention takes two phases in decode and
-                 four in prefill. For Llama-3.1-8B (32 blocks, 4096 wide) the last block's gate and up are bfp8 at two,
-                 as in its model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json.
+                 four in prefill. In a model of Llama-3.1-8B's shape, 32 blocks 4096 wide, the last block's gate and up
+                 are bfp8 at two, as in its model_params/Llama-3.1-8B-Instruct/performance_decoder_config.json. The
+                 rule goes by that shape alone, so it also applies to other models of that shape, such as Mistral-7B.
     experts      Qwen3.6-35B-A3B on one card. The MLP's matrices are bfp4 at one phase, which multiplies all the bits
                  of a bfp4 value. They're the gate, up and down of the experts and of the shared expert. The rest and
                  the output layer are bfp8 at two phases.
@@ -396,21 +397,29 @@ def model(**c): return SimpleNamespace(**DEFAULTS | c)  # a config with the give
 # The model_type of each family that config reads, or of a multimodal model's text_config. Another one, such as Gemma's,
 # may have weights of the same names but compute differently, so it's refused rather than run wrong.
 TYPES = ("llama", "mistral", "mixtral", "qwen2", "qwen2_moe", "qwen3", "qwen3_moe", "qwen3_5_text", "qwen3_5_moe_text", "gpt_oss")
+THETA = dict(mixtral=1e6, gpt_oss=150000.0)  # transformers' rope_theta when config.json has none, where it isn't 10000
 
 def config(folder, places=4096):
   """Read config.json, selecting the text config for a multimodal model. Cap places at the model's maximum when
-  sizing RoPE tables. Raise ValueError for a model type outside TYPES."""
+  sizing RoPE tables. Raise ValueError for a model type outside TYPES, and for what the model doesn't compute: MLP
+  biases, RoPE scaling other than llama3's and YaRN, and a Gated DeltaNet convolution of other than 4 taps. A missing
+  rope_theta or original_max_position_embeddings takes transformers' default."""
   j = read_json(os.path.join(folder, "config.json"))
   j = j.get("text_config", j)
   if (model_type := j.get("model_type")) not in TYPES:
     raise ValueError(f"{folder}: model type {model_type!r} isn't supported. baretile runs {', '.join(TYPES)}")
-  rope = j.get("rope_parameters") or (j.get("rope_scaling") or {}) | {"rope_theta": j["rope_theta"]}  # transformers 5, else the older two
-  theta, kind = rope.pop("rope_theta"), rope.pop("type", None)  # older configs say type instead of rope_type
+  if j.get("mlp_bias"): raise ValueError(f"{folder}: mlp_bias isn't supported. The model doesn't add biases to the MLP's gate, up and down")
+  if (conv := j.get("linear_conv_kernel_dim")) not in (None, 4):  # the chunked prompt path would run, then the first decode step fail
+    raise ValueError(f"{folder}: Gated DeltaNet's decode kernel needs a convolution of 4 taps, not {conv}")
+  default = THETA.get(model_type, 10000.0)  # Hugging Face's rope_theta for a config without one
+  rope = j.get("rope_parameters") or (j.get("rope_scaling") or {}) | {"rope_theta": j.get("rope_theta", default)}  # transformers 5, else older
+  theta, kind = rope.pop("rope_theta", default), rope.pop("type", None)  # older configs say type instead of rope_type
   partial = rope.pop("partial_rotary_factor", j.get("partial_rotary_factor"))
   for k in ("mrope_section", "mrope_interleaved"): rope.pop(k, None)  # Qwen3.5's. A text token's three positions are all the same
   qwen35 = model_type.startswith("qwen3_5")  # its RMSNorms scale by 1 + w (centered), and its attention is gated
   rope.setdefault("rope_type", kind or "default")
   if rope["rope_type"] not in ("default", "llama3", "yarn"): raise ValueError(f"RoPE scaling {rope} isn't supported")
+  if rope["rope_type"] != "default": rope.setdefault("original_max_position_embeddings", j["max_position_embeddings"])  # as Hugging Face has it
   experts, layers = j.get("num_experts") or j.get("num_local_experts") or 0, j["num_hidden_layers"]
   return model(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=layers, eps=j["rms_norm_eps"], theta=theta,
                places=min(j["max_position_embeddings"], places), vocab=j["vocab_size"], ffn=j.get("intermediate_size"), head_dim=j.get("head_dim"),
@@ -622,7 +631,9 @@ class Tokenizer:
       else: raise ValueError(f"Tokenizer does not support pre-tokenizer {p}")
     self.splits, self.pieces = [python_regex("(" + p + ")") for p in patterns], {}
     if any(p.groups != 1 for p in self.splits): raise ValueError("Tokenizer split patterns must not contain capturing groups")
-    self.nfc = (t.get("normalizer") or {}).get("type") == "NFC"  # Qwen composes the text first, so an e and its accent become one letter
+    normalizer = t.get("normalizer")
+    if normalizer is not None and normalizer.get("type") != "NFC": raise ValueError(f"Tokenizer does not support normalizer {normalizer}")
+    self.nfc = normalizer is not None  # Qwen composes the text first, so an e and its accent become one letter
 
   def bpe(self, piece):  # a piece's bytes as ids
     if (ids := self.pieces.get(piece)) is not None: return ids

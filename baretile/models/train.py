@@ -145,7 +145,9 @@ def main():
       if k not in GPT2: sys.exit(f"unknown setting {k}. Settings: {', '.join(GPT2)}")
       setattr(c, k, type(GPT2[k])(v))
   if c.dim % c.heads: sys.exit(f"dim={c.dim} must divide into heads={c.heads} heads")
+  if c.val_every < 1: sys.exit(f"val_every={c.val_every} must be at least 1")
   train, val = sequences(shard(paths[0]), c.ctx), shard(paths[1]) if len(paths) > 1 else None
+  if val is not None: next(sequences(val, c.ctx))  # a validation shard too short for a sequence fails now, not at the first validation
   trainer, log = Trainer(Runtime(Chip(pci.open_device())), c), open(c.log, "a") if c.log else None
   print(f"GPT-2, {c.layers} blocks {c.dim} wide, on {c.ctx}-token sequences: {c.accum * c.ctx:,} tokens a step for {c.steps:,} steps")
   for step in range(1, c.steps + 1):

@@ -56,7 +56,7 @@ def fns(x):  # adapt NumPy and baretile operations to the same model code
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))),
                            put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b))
-  if type(x).__module__ == "torch":  # the reference in test/train.py
+  if type(x).__module__ == "torch":  # the PyTorch references in test/train.py and test_models.py's test_train_gpt2
     import torch
     F = torch.nn.functional
     return SimpleNamespace(rows=lambda a, ids: a[list(ids)], softmax=lambda a: a.softmax(-1),

@@ -61,6 +61,17 @@ def test_train_gpt2(chip, tmp_path):
                                                                                    for n in ("attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj")}
   assert losses[-1] < losses[0] - 0.5, losses
 
+def test_train_settings(tmp_path, monkeypatch):
+  # baretile.models.train checks its settings and the validation shard before it opens the device, so a validation shard
+  # too short for a sequence, or val_every=0, fails at startup rather than at the first validation, val_every steps in.
+  from baretile import pci
+  monkeypatch.setattr(pci, "open_device", lambda: pytest.fail("opened the device before checking the settings"))
+  train_bin, val_bin = shard(tmp_path / "train.bin", np.arange(100) % 90), shard(tmp_path / "val.bin", np.arange(8))
+  monkeypatch.setattr(sys, "argv", ["train", str(train_bin), str(val_bin), "ctx=16"])
+  with pytest.raises(ValueError, match="8 tokens can't make a sequence of 16"): gpt2_train.main()
+  monkeypatch.setattr(sys, "argv", ["train", str(train_bin), "val_every=0"])
+  with pytest.raises(SystemExit, match="val_every"): gpt2_train.main()
+
 def test_adam_original_gradients(chip):
   # Updating a in place doesn't change b's gradient, which backward() computed from a's value before the update
   rt = Runtime(chip)
@@ -976,6 +987,23 @@ def test_llama_load(tmp_path):
   (tmp_path / "config.json").write_text(json.dumps(json.loads((tmp_path / "config.json").read_text()) | {"model_type": "gemma2"}))
   with pytest.raises(ValueError, match="'gemma2' isn't supported"): llama.load(str(tmp_path))
 
+def test_llama_config_checks(tmp_path):
+  # config refuses what the model doesn't compute: MLP biases, which it would load and never add, and a Gated DeltaNet
+  # convolution of other than 4 taps, which the decode kernel hard-codes. A missing rope_theta, and a missing
+  # original_max_position_embeddings for YaRN, take transformers' defaults rather than raise a KeyError.
+  base = {"model_type": "llama", "hidden_size": 64, "num_attention_heads": 2, "num_key_value_heads": 1, "num_hidden_layers": 1,
+          "rms_norm_eps": 1e-5, "max_position_embeddings": 2048, "vocab_size": 40, "intermediate_size": 96}
+  def config(**extra):
+    (tmp_path / "config.json").write_text(json.dumps(base | extra))
+    return llama.config(str(tmp_path))
+  assert (config().theta, config(model_type="mixtral").theta, config(rope_theta=5e5).theta) == (10000, 1e6, 5e5)
+  c = config(rope_scaling={"rope_type": "yarn", "factor": 4.0})
+  assert c.rope["original_max_position_embeddings"] == 2048 and np.isfinite(llama.frequencies(c)).all()
+  with pytest.raises(ValueError, match="mlp_bias"): config(mlp_bias=True)
+  assert config(mlp_bias=False).dim == 64
+  with pytest.raises(ValueError, match="4 taps"): config(model_type="qwen3_5_text", linear_conv_kernel_dim=3)
+  assert config(model_type="qwen3_5_text", linear_conv_kernel_dim=4).conv == 4
+
 def test_bpe_merge_order(tmp_path):
   # Vocabulary IDs need not order BPE merges. The whole piece only bypasses merges with ignore_merges; an explicit
   # empty list means no merges. Test both tokenizer.json encodings of a pair and the tie's leftmost occurrence.
@@ -1019,6 +1047,10 @@ def test_bpe_stages_and_missing_bytes(tmp_path):
   assert tok.encode("a?b") == tok.encode("a\x1db") == [2] and tok.encode("?") == []
   with pytest.raises(ValueError, match="unknown-token"): tokenizer(byte, dict(unk_token="<unk>"))
   with pytest.raises(ValueError, match="pre-tokenizer"): tokenizer(byte | dict(add_prefix_space=True))
+  # A normalizer other than NFC would change the text before BPE, so it's refused like those pre-tokenizers
+  for normalizer in (dict(type="NFKC"), dict(type="Sequence", normalizers=[dict(type="Prepend", prepend="▁")])):
+    (tmp_path / "tokenizer.json").write_text(json.dumps(dict(model=model, pre_tokenizer=byte, normalizer=normalizer)))
+    with pytest.raises(ValueError, match="normalizer"): llama.Tokenizer(str(tmp_path))
 
 def test_generation_defaults():
   # A nonempty generation config without EOS inherits the selected text model's token, even in a multimodal config.
@@ -1180,7 +1212,7 @@ def test_qwen3_moe(chip, tmp_path):
   want = llama.forward(ids, list(range(8)), llama.arrays(weights, c.precision), c, llama.kv_cache(c, 32, np.zeros), every=True)
   assert np.array_equal(got.argmax(-1), want.argmax(-1)) and np.abs(got - want).max() < 0.01 * np.ptp(want), np.abs(got - want).max() / np.ptp(want)
 
-FAMILIES = {"llama": ("Llama", {}), "qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mistral": ("Mistral", dict(sliding_window=None)),
+FAMILIES = {"llama": ("Llama", {}), "qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mistral": ("Mistral", dict(sliding_window=4)),
             "qwen2_moe": ("Qwen2Moe", dict(moe_intermediate_size=64, shared_expert_intermediate_size=96, num_experts=8, num_experts_per_tok=2)),
             "mixtral": ("Mixtral", dict(num_local_experts=8, num_experts_per_tok=2)),
             "gpt_oss": ("GptOss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=4,
@@ -1230,10 +1262,26 @@ def test_autonomous_generation(chip, tmp_path, monkeypatch):
   rt = Runtime(chip)
   report = generation.check(rt, str(tmp_path), steps=4)
   assert report["passed"] and [len(p["tokens"]) for p in report["prompts"]] == [4, 4, 4], report
+  assert set(report["versions"]) == {"torch", "transformers", "numpy", "baretile"} and report["kv"] == "bf16", report
+  assert report["reference"] == dict(dtype="float32 with bfloat16 weights", device="cpu"), report
   assert generation.check(rt, str(tmp_path), steps=3, mode="tt", prompts=generation.PROMPTS[:1])["passed"]
   monkeypatch.setattr(generation, "ERROR", 0)
   report = generation.check(rt, str(tmp_path), steps=2, prompts=generation.PROMPTS[:1])
   assert not report["passed"] and "chip_top" in report["prompts"][0]["steps"][0], report
+
+def test_generation_gate():
+  # argmax picks a NaN, or an infinity, in the chip's logits. Where that's among the reference's five best, the top-5
+  # gate alone would pass the step, so both gates also need every logit finite. Logits close to the reference pass both.
+  import generation
+  want = np.array([4.0, 3, 2, 1, 0, -1])
+  for bad in (np.nan, np.inf):
+    got = want.copy()
+    got[1] = bad
+    row = generation.compare(got, want, want)
+    assert row["token"] == 1 and row["in_top5"] and not row["finite"], row
+    assert not generation.meets(row, True) and not generation.meets(row, False), row
+  row = generation.compare(want + 0.01, want, want)
+  assert row["finite"] and generation.meets(row, True) and generation.meets(row, False), row
 
 def test_qwen3_5_moe(chip, tmp_path, monkeypatch):
   # Qwen3.5-MoE's language model (also Qwen3.6's) from Hugging Face's files, against transformers in float32 with
@@ -1656,6 +1704,17 @@ def test_bringup(tmp_path):
   assert out.returncode == 1 and set(results("down").values()) == {"failed", "not run"} and results("down")["preflight"] == "failed"
   assert "Install clang" in (tmp_path / "down" / "preflight.log").read_text()
   assert bringup.accurate("top-1 90.0%, top-5 98.0% (12s)") and not bringup.accurate("top-1 89.8%, top-5 99.0%") and not bringup.accurate("")
+
+def test_bringup_only(tmp_path):
+  # --only takes stage names, so a misspelled one is an error, and a stage it names whose files aren't given fails, where
+  # skipping it passed a run that never ran it. Neither opens the device.
+  import bringup, subprocess
+  run = lambda *args: subprocess.run([sys.executable, bringup.__file__, str(tmp_path / "record"), *args], capture_output=True, text=True, timeout=120)
+  out = run("--only", "preflight,smolm")
+  assert out.returncode == 2 and "no stage smolm" in out.stderr and not (tmp_path / "record").exists(), out.stdout + out.stderr
+  out = run("--only", "smollm")
+  results = {s["stage"]: s["result"] for s in json.loads((tmp_path / "record" / "record.json").read_text())["stages"]}
+  assert out.returncode == 1 and results.pop("smollm").startswith("failed") and set(results.values()) == {"not run"}, out.stdout + out.stderr
 
 def test_benchmark_bad_stack():
   # An unknown stack is a ValueError, also under python -O.

@@ -33,7 +33,7 @@ ACTIVATIONS = 4e6, 45e6
 # Estimate RISC-V overhead as (tokens per step, cycles). From each ttsim measurement, subtract the time its reads
 # would take at 265 bytes/cycle (358 GB/s at 1.35 GHz). Measure a block including its experts, and the remaining
 # operations separately. These counts use Qwen3.6 shapes and ttsim-chaos's read counter without injected latency.
-# past interpolates between them. This is a cost-model assumption, not a measured hardware overhead.
+# control_cycles interpolates between them. This is a cost-model assumption, not a measured hardware overhead.
 CONTROL = {"attention": ((1, 39300), (8, 25400), (32, 41600)), "deltanet": ((1, 36200), (8, 12900), (32, 15100)),
            "rest": ((1, 154200), (8, 731000), (32, 1641800)), "attention verify": ((2, 47300), (16, 38400), (64, 65600)),
            "deltanet verify": ((2, 63600), (16, 27200), (64, 22900)), "rest verify": ((2, 412000), (16, 1479000), (64, 5148200)),
@@ -44,7 +44,9 @@ WORKERS, GRID = 119, (tuple(range(12)), tuple(range(9)))
 # its share of the host at $0.15 a kWh.
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # 8 GDDR6 banks of 4 GiB, with a GiB kept for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # 512 GB/s, and the share of it that a decode step gets (a guess)
-            tflops=664e12, phases=None,  # one-phase peak; None derives phases per operation, a number overrides all of them
+            # The one-phase peak, by probed's formula with the step probe.py expects: a matmul step multiplies two 32 x 32
+            # tiles, 2 * 32^3 flops, in 16 cycles at one phase, on each of the 119 workers at 1.35 GHz. That's 658 TFLOPS
+            tflops=2 * 32**3 / 16 * WORKERS * bh.AICLK, phases=None,  # None derives phases per operation, a number overrides all of them
             launch=1e-6, pcie=25e9,  # a launch's seconds on the card (a guess), and PCIe 4.0 x16 in bytes/s
             price=1299, host=600, years=3, watts=300, host_watts=75, kwh=0.15)
 # context is the number of positions in a session's slot. They're all filled, so a step reads every row. kv is the KV
@@ -95,10 +97,10 @@ def shape(c, mode="bf16"):
     return sum(v * prec[op, l][1] for op, v in ops.items()) + (d * e * FIDELITY if mixture(l) else 0)
   head_work = c.vocab * d * prec["head", None][1]
   draft_head_work = c.vocab * d * prec.get(("draft head", None), prec["head", None])[1]
-  held = len(moe) + (c.mtp if e else 0)  # the blocks with experts, counting the multi-token prediction layer
+  expert_blocks = len(moe) + (c.mtp if e else 0)  # the blocks with experts, counting the multi-token prediction layer
   return SimpleNamespace(every=every, expert=expert, moe=len(moe), draft=draft, draft_values=draft_values,
-                         head=own or c.vocab * d * fmt("head"), bytes=every + held * e * expert + draft + own + c.vocab * d * BYTES["bf16"],
-                         values=values, held=values + draft_values + held * (e - c.k) * 3 * d * m + c.vocab * d * (0 if c.tied else 1),
+                         head=own or c.vocab * d * fmt("head"), bytes=every + expert_blocks * e * expert + draft + own + c.vocab * d * BYTES["bf16"],
+                         values=values, held=values + draft_values + expert_blocks * (e - c.k) * 3 * d * m + c.vocab * d * (0 if c.tied else 1),
                          work=sum(work(l) for l in range(c.layers)) + head_work,
                          draft_work=c.mtp * (work(t, draft=True) + 2 * d * d * FIDELITY) if c.mtp else 0,
                          head_work=head_work, draft_head_work=draft_head_work,
@@ -142,7 +144,7 @@ def attention(c, entries, queries, rows, kv):
   _, units, parts, kept = attention_plan(ht, -(-queries // 32), entries, wt, kt, WORKERS)
   return units * (2 * kt + max(0, kt - parts * kept)) * 32 * llama.head(c) * BYTES[kv]
 
-def past(kind, n): return float(np.interp(n, *zip(*CONTROL[kind])))  # CONTROL's cycles for kind at n tokens, flat past its counts
+def control_cycles(kind, n): return float(np.interp(n, *zip(*CONTROL[kind])))  # CONTROL's RISC-V cycles for kind at n tokens, flat past its counts
 
 def step(c, s, use, card, users, speculative=False, cards=1):
   """Estimate a decode step for users sessions. Return traffic bytes (including state writes), FLOPs, launches,
@@ -161,7 +163,7 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   work = 2 * n * s.work + attention_flops * s.decode_phases
   linear = c.layers - blocks
   launches = blocks * LAUNCHES["attention" + v] + linear * LAUNCHES["deltanet" + v] + s.moe * LAUNCHES["experts"] + LAUNCHES["rest" + v]
-  control = blocks * past("attention" + v, n) + linear * past("deltanet" + v, n) + past("rest" + v, n)
+  control = blocks * control_cycles("attention" + v, n) + linear * control_cycles("deltanet" + v, n) + control_cycles("rest" + v, n)
   if speculative:  # the drafting call runs the layer over two positions per user, and the output layer again
     reads += s.draft + c.mtp * (touched(c, 2 * users) * s.expert + ACTIVATIONS[0] + outputs(2 * users)) + s.head
     reads += c.mtp * attention(c, c.kv * users, 2 * c.heads // c.kv, use["context"], use["kv"])
@@ -169,7 +171,7 @@ def step(c, s, use, card, users, speculative=False, cards=1):
     flops += 2 * 2 * users * (s.draft_values + c.vocab * d) + attention_flops
     work += 2 * 2 * users * (s.draft_work + s.draft_head_work) + attention_flops * s.decode_phases
     launches += LAUNCHES["draft"]
-    control += c.mtp * past("draft", n)
+    control += c.mtp * control_cycles("draft", n)
   control /= bh.AICLK
   if card["phases"] is not None: work = flops * card["phases"]
   dram, compute = reads / (card["bandwidth"] * card["reach"] * cards), work / (card["tflops"] * cards)
@@ -225,7 +227,7 @@ def report(folder, mode="bf16", **keys):
   s = shape(c, mode)
   cards = math.ceil(s.bytes / (card["dram"] - card["reserve"]))
   room, hour = cards * (card["dram"] - card["reserve"]) - s.bytes, hourly(card) * cards
-  out = [f"{name}: {s.held / 1e9:.1f}B parameters, {s.values / 1e9:.2f}B active per token. In {mode} mode it takes "
+  out = [f"{name}: {s.held / 1e9:.2f}B parameters, {s.values / 1e9:.2f}B active per token. In {mode} mode it takes "
          f"{s.bytes / 1e9:.1f} GB on {cards} card{'s' * (cards > 1)}, {room / 1e9:.1f} GB free, ${hour:.3f} an hour"]
   out.append("  compute uses each operation's precision phases" if card["phases"] is None else
              f"  compute assumes {card['phases']:g} phases for every operation (override)")
