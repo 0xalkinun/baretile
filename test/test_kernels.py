@@ -111,6 +111,16 @@ def test_gather_shared_indices(chip):
     before = dict(rt.used), rt.launches
     with pytest.raises(ValueError, match="block-float"): packed.gather([0])
     assert (rt.used, rt.launches) == before
+  with pytest.raises(ValueError, match="int32 row"): x.gather(Tensor.of(rt, [[[[1, 2, 3], [4, 5, 6]]]], "int32"))  # two rows
+
+def test_block_float_from_integers_and_numbers(chip):
+  # An int32 tensor casts to a block float through fp32, which the block float packs from, and a block float with a
+  # number meets it as a bf16 tensor does, in fp32.
+  rt = Runtime(chip)
+  ints = Tensor.of(rt, [[1, 2, 3, -4]], "int32")
+  for dtype in ("bfp8", "bfp4"):
+    assert value(ints.cast(dtype).cast("bf16")).reshape(-1).tolist() == [1, 2, 3, -4]
+    assert np.all(value(Tensor.full(rt, 32, 32, 1.5).cast(dtype) + 1) == 2.5)
 
 def test_viz(chip, tmp_path):
   # viz.save records completed launches and compiler details. A shared subexpression gets one graph node,
@@ -313,16 +323,23 @@ def test_jit_returned_views(chip):
     assert add(Tensor.full(rt, 32, 32, n)).tolist() == [[n + 5] * 32] * 32
 
 def test_repeat_copies_preserve_storage(chip):
-  # Assigning a repeat copies its bits, -0 and block floats included, instead of computing x + 0.
+  # Assigning a repeat copies its bits, -0 and block floats included, instead of computing x + 0. So do slicing,
+  # relabelling and repeating a repeat, which copy it first, and merging matrices that are stored already.
   rt = Runtime(chip)
   raw = struct.pack("<2f", -0.0, 3.0)
   x = Tensor.frombytes(rt, 1, 2, raw, dtype="fp32").repeat_interleave(3)
   out = Tensor(rt, 1, 2, batch=3, dtype="fp32").assign(x)
   assert out.tobytes() == raw * 3
+  assert x[1:2, :, :].tobytes() == raw and x.reshape(3, 1, 1, 2).tobytes() == raw * 3
+  row = struct.pack("<32f", -0.0, *range(31))
+  assert x.repeat_interleave(2).tobytes() == raw * 6
+  assert Tensor.frombytes(rt, 1, 32, row, dtype="fp32").repeat_interleave(2).merge().tobytes() == row * 2
   for dtype in ("bfp8", "bfp4"):
     x = Tensor.full(rt, 32, 32, 1.5).cast(dtype).realize().repeat_interleave(3)
     out = Tensor(rt, 32, 32, batch=3, dtype=dtype).assign(x)
     assert out.tobytes() == x.tobytes()
+    assert x[0:1, :, :].tobytes() == x.reshape(3, 1, 32, 32)[0].tobytes() == x.tobytes()[:len(x.tobytes()) // 3]
+    assert x.merge().cast("bf16").tolist() == [[1.5] * 96] * 32
 
 def test_upload(chip, monkeypatch):
   # frombytes writes through the BAR below tensor.DMA_UPLOAD bytes, and through upload_kernel from there, in chunks
@@ -1726,6 +1743,13 @@ def test_leading_dimensions(chip):
   launches, views = rt.launches, [tiles.reshape(*s) for s in ((128, 40), (4, 32, 40), (2, 2, 32, 40))]
   assert rt.launches == launches and all(v.addr == tiles.addr for v in views), "no copy"
   assert all(value(v).tolist() == n.reshape(v.shape).tolist() for v in views)
+  # A reduction over a leading dimension that broadcasts along rows or columns into another tensor is computed apart,
+  # and the kernel that adds it doesn't sweep. A unit-step slice of an inner leading dimension, which is a view of
+  # evenly spaced matrices, takes its gradient back by its own ranges.
+  p, q = bf16(rng.uniform(-2, 2, (2, 1, 5, 7))), bf16(rng.uniform(-2, 2, (2, 3, 5, 1)))
+  close(Tensor.of(rt, p.tolist(), "fp32") + Tensor.of(rt, q.tolist(), "fp32").sum(1), p + q.sum(1, keepdims=True), 1e-5)
+  g = a[:, 0:1, :, :].sum().gradient(a)[0]
+  assert value(g).tolist() == np.pad(np.ones((2, 1, 5, 40)), ((0, 0), (0, 2), (0, 0), (0, 0))).tolist()
 
 def test_fp32(chip):
   # fp32 tensors have 4 KiB tiles. The math thread unpacks them into Dst, bypassing SrcA and SrcB, and the SFPU does
@@ -1760,7 +1784,8 @@ def test_fp32(chip):
     ts = Tensor.of(rt, s.tolist(), "fp32")
     with np.errstate(all="ignore"):
       for got, want in [(ts.exp(), np.exp(s)), (ts.exp2(), np.exp2(s)), (ts.log(), np.log(s)), (ts.sqrt(), np.sqrt(s)),
-                        (ts.reciprocal(), 1 / s), (ts.sin(), np.sin(s)), (ts.ne(ts), s != s), (ts < ts * 2, s < s * 2)]:
+                        (ts.reciprocal(), 1 / s), (ts.sin(), np.sin(s)), (ts.ne(ts), s != s), (ts < ts * 2, s < s * 2),
+                        (ts / 0, s / 0), (ts / -0.0, s / -0.0), (2 / ts, 2 / s)]:
         assert np.allclose(value(got), np.asarray(want, np.float32).reshape(got.shape), rtol=1e-6, atol=0, equal_nan=True), (value(got), want)
     b = bf16(x)
     assert value(tx.bfloat16()).tolist() == bf16(x, True).tolist() and value(Tensor.of(rt, b.tolist()).float()).tolist() == b.tolist()
