@@ -301,7 +301,10 @@ fp32, rounded to fp16 wherever tinygrad makes one (`Tensor.rounded`), to
 nearest even. That gives tinygrad's values in fp16's normal range, where
 smaller values keep more bits and larger ones don't overflow. tinygrad's CPU
 skips the rounding of a half product that its kernel casts up to fp32, and the
-adapter doesn't.
+adapter doesn't. A store into whole rows of a buffer, as a KV cache takes a new
+position, is one `put` on the chip. A store into other parts of a buffer goes
+through the host, and so does a row store while `TinyJit` records, so that call
+doesn't replay.
 
 Unsupported operations fall back to tinygrad's CPU device. These include
 64-bit integers, bit operations, random-number generation and symbolic shapes.

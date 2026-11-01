@@ -577,6 +577,31 @@ def test_tinygrad_fp16(chip):
     assert g.dtype == w.dtype and (np.array_equal(g, w) if exact else error <= 2**-10), (g.dtype, error)
 
 
+def test_tinygrad_cache_put(chip):
+  # A store into whole rows of a BARETILE buffer, as a KV cache takes its new positions, is a put on the chip. A store
+  # into part of each row still goes through the host, and the report says so. Both give the CPU's values.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor
+  rng = np.random.default_rng(117)
+  cache, new, cols = (rng.normal(0, 1, s).astype(np.float32) for s in ((2, 3, 16, 64), (2, 3, 2, 64), (2, 3, 16, 2)))
+  def run(device):
+    t = Tensor(cache, device=device).contiguous().realize()
+    t[:, :, 5:7, :].assign(Tensor(new, device=device) * 2).realize()
+    t[:, :, :, 3:5].assign(Tensor(cols, device=device)).realize()
+    return t.numpy()
+  adapter.REPORT, before, start = True, dict(adapter.reports), adapter.RT.launches
+  try:
+    adapter.reports.clear()
+    got = run("BARETILE")
+    whys = [why for why, _ in adapter.reports]
+  finally:
+    adapter.REPORT = False
+    adapter.reports.clear(); adapter.reports.update(before)
+  assert ("put", 1) in [(k, n) for k, n, _, _ in adapter.RT.profile(start)], adapter.RT.profile(start)
+  assert whys == ["a store into part of a buffer, through the host"], whys  # the columns, not the rows
+  assert np.array_equal(got, run("CPU"))
+
+
 def test_tinygrad_fallback_dtypes(chip):
   adapter_on(chip)
   from tinygrad import Tensor, dtypes

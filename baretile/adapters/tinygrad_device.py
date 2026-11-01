@@ -350,6 +350,26 @@ def up(x, dtype, shape3):
 
 def on_baretile(u): return isinstance(u.device, str) and u.device.startswith("BARETILE")
 
+positions = {}  # int32 rows of row ids for put, uploaded once, up to 256
+def put_rows(h, view, value):
+  """Write value into the elements of h's tensor that view picks, if they're whole rows, the same in each of its
+  matrices, in the view's order, as a KV cache's new positions are: one put. Return whether it did."""
+  if not (isinstance(value, Value) and isinstance(h.value, Value) and h.value.whole()) or view.mask: return False
+  t = h.value.t
+  (B, R, C), at = t.shape, indices(view).reshape(-1)
+  if at.size % (B * C) or t.dtype in tensor.BFP: return False
+  at = at.reshape(B, -1, C)
+  rows = at[:, :, 0] // C  # matrix * R + row
+  if not ((at == at[:, :, :1] + np.arange(C)).all() and (at[:, :, 0] % C == 0).all() and (rows // R == np.arange(B)[:, None]).all()
+          and (rows % R == rows[:1] % R).all()) or (groups := grouping(value.shape, (B, rows.shape[1], C))) is None: return False
+  if (key := tuple(rows[0] % R)) not in positions:
+    if len(positions) >= 256: del positions[next(iter(positions))]
+    positions[key] = upload(np.array(key, np.int32).reshape(1, 1, -1), "int32")
+  x = materialize(value, groups)
+  t.put(positions[key], x if x.dtype == t.dtype else x.cast(t.dtype))
+  h.set(value=h.value)  # changed in place
+  return True
+
 # elementwise ops. baretile's comparisons give 1 or 0 in the operands' dtype, which is how bools are stored
 UNARY = {Ops.EXP2: tensor.Tensor.exp2, Ops.LOG2: tensor.Tensor.log2, Ops.SIN: tensor.Tensor.sin, Ops.SQRT: tensor.Tensor.sqrt,
          Ops.RECIPROCAL: tensor.Tensor.reciprocal, Ops.NEG: lambda x: -x}
@@ -682,6 +702,8 @@ class Evaluator:
         view = view.reshape(tuple(u.shape)) if u.op is Ops.RESHAPE else view.permute(u.arg) if u.op is Ops.PERMUTE else view.shrink(self.marg(u))
       if not (view is not None and on_baretile(target) and isinstance(buf._buf, Holder)):
         raise NotImplementedError("a partial store needs a BARETILE buffer and a view")
+      # rows of a tensor take a put on the chip. While TinyJit records, the host's copy keeps the call from replaying
+      if recording is None and put_rows(buf._buf, view, value): return None
       report("a store into part of a buffer, through the host")
       a = np.frombuffer(contents(buf._buf) or bytes(buf.nbytes), npd).copy()
       a[indices(view)] = np.broadcast_to(host(value, target.dtype), view.shape)
