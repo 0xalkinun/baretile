@@ -198,7 +198,8 @@ each operand into a bf16 high part and a bf16 low part. We compute
 
 fp32 elementwise operations use the SFPU, a 32-lane vector unit working on Dst.
 It implements arithmetic and the polynomial approximations used for functions
-such as exp and log. Packing a bf16 result rounds half up, while host uploads
+such as exp and log. `rounded("fp16")` rounds fp32 values to fp16's precision,
+to nearest even, as integer arithmetic on their bits, and keeps them in fp32. Packing a bf16 result rounds half up, while host uploads
 use round-to-nearest-even. The two can differ by one bf16 step on the same input.
 
 Integer comparisons, minimum and maximum cover the full int32 range, including

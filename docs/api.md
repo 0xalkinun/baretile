@@ -32,6 +32,7 @@ a P150a.
 | `BARETILE_DUMP` and `runtime.PROGRAMS` | The C programs of each kernel, written to a folder or kept by image | experimental |
 | `tensor.Tensor`: its constructors, operations, movement, `cast`, `realize`, `assign`, `tolist`, `tobytes`, `backward` and `gradient` | Tensors | stable |
 | `Tensor.to`, `Tensor.columns`, `Tensor.run` | Moving to another chip, storage by tile columns, launching a kernel | experimental |
+| `Tensor.rounded` | fp32 values rounded to fp16, kept in fp32, for a framework's fp16 tensors | experimental |
 | `tensor.jit` | Recording and replaying a function's launches | stable |
 | `tensor.Recording`, `runtime.Bound` | Recordings by hand | experimental |
 | `baretile.tensix`, `baretile.kernels` | Tensix code generation and the kernels | experimental |

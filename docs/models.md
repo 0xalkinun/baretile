@@ -296,6 +296,13 @@ CI tests it on the tinygrad commit pinned in
 [.github/workflows/test.yml](../.github/workflows/test.yml). Put a checkout of
 that commit on `PYTHONPATH`, or in `TINYGRAD` for the tests.
 
+baretile has no fp16 storage, so the adapter keeps tinygrad's fp16 values in
+fp32, rounded to fp16 wherever tinygrad makes one (`Tensor.rounded`), to
+nearest even. That gives tinygrad's values in fp16's normal range, where
+smaller values keep more bits and larger ones don't overflow. tinygrad's CPU
+skips the rounding of a half product that its kernel casts up to fp32, and the
+adapter doesn't.
+
 Unsupported operations fall back to tinygrad's CPU device. These include
 64-bit integers, bit operations, random-number generation and symbolic shapes.
 With `BARETILE_REPORT=1`, the adapter prints at exit what it ran on tinygrad's

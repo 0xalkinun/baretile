@@ -508,6 +508,13 @@ SFPU |= {
   # result stays fp32
   "ftob": ([ins("SFPLOADI", vd=2, mod0=2, imm16=0x8000), *sfp_bits(3, 0xFFFF0000)],
            [sfp_load(), ins("SFPIADD", vd=0, vc=2, mod1=4), ins("SFPAND", vd=0, vc=3), sfp_store(0, mod0=RAW)]),
+  # rounds an fp32 value to fp16's 10 bits of mantissa, to nearest even: add 2^12 - 1 and the lowest kept bit, then
+  # clear the 13 below it. the result stays fp32, so values outside fp16's normal range keep fp32's range and bits
+  "ftoh": ([ins("SFPLOADI", vd=2, mod0=2, imm16=0xFFF), *sfp_bits(3, 0xFFFFE000),
+            ins("SFPLOADI", vd=4, mod0=2, imm16=1)],
+           [sfp_load(), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-13 & 0xFFF), ins("SFPAND", vd=1, vc=4),
+            ins("SFPIADD", vd=1, vc=2, mod1=4), ins("SFPIADD", vd=0, vc=1, mod1=4), ins("SFPAND", vd=0, vc=3),
+            sfp_store(0, mod0=RAW)]),
 }
 # Reductions along an axis. Axis 0 reduces the batch to a matrix, axis 1 the rows to a row, and axis 2 the columns to
 # a column. The tiles along the axis go into Dst as x + 0. The first lands in the reduction's accumulator, and the rest

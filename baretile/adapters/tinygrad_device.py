@@ -247,7 +247,12 @@ def reduce(x, n, op):
   for ax in along: t = t.sum(ax) if op == "sum" else t.max(ax)
   return t
 
-DTYPES = {dtypes.float32: "fp32", dtypes.bfloat16: "bf16", dtypes.int32: "int32", dtypes.bool: None}  # a bool is 0 or 1 in any dtype
+# a bool is 0 or 1 in any dtype. fp16 values are fp32 on the chip, rounded to fp16 wherever tinygrad makes them, which
+# keeps tinygrad's values in fp16's normal range
+DTYPES = {dtypes.float32: "fp32", dtypes.bfloat16: "bf16", dtypes.int32: "int32", dtypes.bool: None, dtypes.half: "fp32"}
+def typed(t, dtype):  # baretile tensor t with dtype's values
+  if dtype is dtypes.bool: return t.ne(0)
+  return t.float().rounded("fp16") if dtype is dtypes.half else t.cast(DTYPES[dtype])
 def npdtype(dt): return np.uint16 if dt is dtypes.bfloat16 else _to_np_dtype(dt)
 
 def cpu(a, dtype):  # only logical bf16 values use uint16 storage as raw bits
@@ -467,7 +472,7 @@ class Evaluator:
     if u.op is Ops.MUL and u.dtype is dtypes.int32: return None  # baretile's int32 products round through fp32
     shape = tuple(u.shape)
     groups = common_groups(shape, srcs)
-    as_u = lambda t: t.ne(0) if u.dtype is dtypes.bool else t.cast(DTYPES[u.dtype])  # baretile returns some int32 ops in fp32, like a product
+    as_u = lambda t: typed(t, u.dtype)  # baretile returns some int32 ops in fp32, like a product
     whole = lambda t: Value(spread(as_u(t), shape, groups), View(shape), u.dtype)
     if u.op in UNARY: return whole(UNARY[u.op](self.operand(srcs[0], shape, groups)))
     if u.op in BINARY: return whole(BINARY[u.op](*(self.operand(s, shape, groups) for s in srcs)))
@@ -485,16 +490,14 @@ class Evaluator:
     # matmul can read the cast's source in place. bf16 cast up to fp32 and back is the bf16 value
     if u.op is Ops.CAST:
       v = uncast(srcs[0]) if u.dtype is dtypes.bfloat16 else srcs[0]
-      if isinstance(v, Value) and v.covers() and DTYPES.get(u.dtype):
-        return Value(v.t.cast(DTYPES[u.dtype]), v.view, u.dtype)
+      if isinstance(v, Value) and v.covers() and DTYPES.get(u.dtype): return Value(typed(v.t, u.dtype), v.view, u.dtype)
       x = self.operand(v, shape, groups)
-      if not is_tensor(x): return None
-      return whole(x.ne(0) if u.dtype is dtypes.bool else x.cast(DTYPES[u.dtype]))
+      return whole(x) if is_tensor(x) else None
     return None
 
   def reduce(self, u, x):  # REDUCE(op, n) reduces the first n axes of x
     t = reduce(x, u.arg[1], "sum" if u.arg[0] is Ops.ADD else "max")
-    return Value(t.ne(0) if u.dtype is dtypes.bool else t, View(tuple(u.shape)), u.dtype)
+    return Value(typed(t, u.dtype), View(tuple(u.shape)), u.dtype)
 
   def matmul(self, u):
     """Recognize REDUCE(ADD) u as a matmul, or return None. Its source must multiply a and b, optionally
@@ -527,11 +530,12 @@ class Evaluator:
     if len(batch) + len(rows) + len(cols) != len(free) or not (rows or cols): return None
     pick = lambda v, axes: View([shape[k] for k in axes], [v.view.strides[k] for k in axes], v.view.offset)
     size = lambda axes: math.prod(shape[k] for k in axes)
-    result = lambda out, made: Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)  # made's axes, in u's order
+    # made's axes, in u's order
+    result = lambda out, made: Value(typed(out, u.dtype), View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)
     if hot is not None and summed == [hot[1]] and size(batch) == 1:  # the one-hot picks rows of x: an Embedding
       ids = materialize(Value(hot[0].t, pick(hot[0], batch + rows), hot[0].dtype), [[], [], list(range(len(batch + rows)))])
       out = materialize(Value(b.t, pick(b, summed + cols), b.dtype), [[], [0], list(range(1, 1 + len(cols)))]).gather(ids)
-      return result(out if out.dtype == DTYPES[u.dtype] else out.cast(DTYPES[u.dtype]), batch + rows + cols)
+      return result(out, batch + rows + cols)
     # b @ a is a @ b transposed. Take it when it's in u's order and moves fewer values: a @ b's result is then moved
     # into u's order, and an A that isn't the tensor as stored is moved too, while a B is read transposed in place
     moved = lambda v, axes: 0 if Value(v.t, pick(v, axes), v.dtype).whole() else size(axes)  # as A
@@ -678,6 +682,7 @@ class Evaluator:
         view = view.reshape(tuple(u.shape)) if u.op is Ops.RESHAPE else view.permute(u.arg) if u.op is Ops.PERMUTE else view.shrink(self.marg(u))
       if not (view is not None and on_baretile(target) and isinstance(buf._buf, Holder)):
         raise NotImplementedError("a partial store needs a BARETILE buffer and a view")
+      report("a store into part of a buffer, through the host")
       a = np.frombuffer(contents(buf._buf) or bytes(buf.nbytes), npd).copy()
       a[indices(view)] = np.broadcast_to(host(value, target.dtype), view.shape)
       buf._buf.set(a.tobytes())
@@ -709,7 +714,7 @@ class Holder:  # contents of a BARETILE buffer: bytes from the host, or a chip V
 def host(v, dtype):  # numpy in tinygrad's layout for dtype: bf16 as raw bits, a bool as a byte
   if isinstance(v, Value):
     a = download(v)
-    return a != 0 if v.dtype is dtypes.bool else a
+    return a != 0 if v.dtype is dtypes.bool else a.astype(npdtype(v.dtype), copy=False)  # fp16 from its fp32
   return array(v if isinstance(v, Tensor) else Tensor(v, dtype=dtype, device="CPU"))
 
 def contents(h):  # a holder's bytes in tinygrad's layout, or None

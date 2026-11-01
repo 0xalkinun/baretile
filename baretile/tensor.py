@@ -612,6 +612,9 @@ class Tensor:
     return out.run(("columns", self.dtype), lambda: columns_kernel(self.dtype), out.addr, x, tc, tr * tc, runs, tr,
                    name="columns")._track("columns", (self,))
   def float(self): return self.cast("fp32")
+  def rounded(self, dtype):  # fp32 values rounded to the nearest fp16, ties to even, kept in fp32. Its gradient passes
+    if self.dtype != "fp32" or dtype != "fp16": raise ValueError("rounded rounds fp32 values to fp16")
+    return self._unary("ftoh")
   def bfloat16(self): return self.cast("bf16")
   def exp2(self): return self._unary("exp2")
   def log2(self): return self._unary("log2")
@@ -963,7 +966,7 @@ def _backward(t, g):
            "log2": lambda: g * (x * math.log(2)).reciprocal(), "sin": lambda: g * x.cos(),
            "cos": lambda: -(g * x.sin()),
            "sqrt": lambda: g * (t * 2).reciprocal(), "recip": lambda: -(g * t * t), "relu": lambda: g * (x > 0),
-           "cast": lambda: g.cast("bf16" if x.dtype in BFP else x.dtype), "columns": lambda: g}
+           "cast": lambda: g.cast("bf16" if x.dtype in BFP else x.dtype), "columns": lambda: g, "ftoh": lambda: g}
   if op in unary: return (unary[op](),)
   if op == "spread": return (_unbroadcast(g, x.shape, t.shape),)  # each matrix's copies add their gradients up
   if op == "lead":  # the same matrices. a gradient that's one matrix for all of them, as a sum's is, stays one

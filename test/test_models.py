@@ -546,6 +546,37 @@ def test_tinygrad_report(chip, capsys):
     adapter.reports.clear(); adapter.reports.update(before)
 
 
+def test_tinygrad_fp16(chip):
+  # fp16 values stay on the chip, as fp32 rounded to fp16 wherever tinygrad makes them, to nearest even as tinygrad's
+  # CPU rounds. So a cast to half, math on halves, a half buffer from the host and one read back give the CPU's values,
+  # and nothing goes to the CPU.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor
+  rng = np.random.default_rng(103)
+  x, h = rng.normal(0, 3, (40, 70)).astype(np.float32), rng.normal(0, 3, (40, 70)).astype(np.float16)
+  def run(device):
+    a, b = Tensor(x, device=device), Tensor(h, device=device)
+    y = (a * 3).half()  # rounded where it's made
+    return [t.numpy() for t in (y, y + b, (y * b).float() + a, b.float().sum(1), (a @ b.float().T).half())]
+  adapter.REPORT, before = True, dict(adapter.reports)
+  try:
+    adapter.reports.clear()
+    got = run("BARETILE")
+    assert not adapter.reports, adapter.reports
+  finally:
+    adapter.REPORT = False
+    adapter.reports.clear(); adapter.reports.update(before)
+  # The elementwise results are the CPU's to the bit, except that the CPU skips rounding a product of halves that a
+  # kernel casts up to fp32, as numpy and fp16 hardware round it. The sum and the matmul differ by fp32 rounding, which
+  # the matmul's bf16 parts leave at about 2^-11 of its largest value, and its rounding to fp16 at 2^-11 more.
+  want = run("CPU")
+  y = (x * 3).astype(np.float16)
+  want[2] = (y * h).astype(np.float32) + x
+  for g, w, exact in zip(got, want, (True, True, True, False, False)):
+    error = np.abs(g.astype(np.float32) - w).max() / np.abs(w).max()
+    assert g.dtype == w.dtype and (np.array_equal(g, w) if exact else error <= 2**-10), (g.dtype, error)
+
+
 def test_tinygrad_fallback_dtypes(chip):
   adapter_on(chip)
   from tinygrad import Tensor, dtypes
