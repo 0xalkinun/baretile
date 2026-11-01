@@ -131,10 +131,10 @@ downloads in `~/.cache/baretile/hub`:
 python3 -m baretile.models.llama ~/.cache/baretile/hub/HuggingFaceTB/SmolLM-135M "The meaning of life is" 6
 ```
 
-tinygrad is the frontend for your own programs. They run on baretile through
+baretile has its own small frontend, `Tensor`, which the models above use.
+tinygrad programs also run on it, through
 [baretile/adapters/tinygrad_device.py](https://github.com/baretile/baretile/blob/main/baretile/adapters/tinygrad_device.py),
-and PyTorch runs through tinygrad's torch frontend. baretile's own models are
-moving onto tinygrad too, one at a time, as each matches their speed.
+and PyTorch programs through tinygrad's torch frontend.
 
 To train, `python3 -m baretile.models.train` trains GPT-2 from scratch, by
 default GPT-2 124M on tokens such as FineWeb's, and `python3 test/train.py 300`

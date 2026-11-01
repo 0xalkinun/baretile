@@ -419,13 +419,13 @@ PyTorch's own run drifts away from baretile's. Adam's first updates follow each
 gradient's sign, which a matmul's rounding can flip for a gradient near zero, so
 the two runs take different paths to similar losses.
 
-To train your own model, write it in tinygrad, as `test/train.py` does, or in
-PyTorch through tinygrad's torch frontend; `test_tinygrad` and
-`test_torch_frontend` train small networks both ways. The adapter runs what it
-can't translate on tinygrad's CPU, and `BARETILE_REPORT=1` says what and where.
-baretile's `Tensor` trains too: its operations have gradients (`backward`,
-`gradient`), `assign` updates a weight in place, and `jit` records a whole step,
-as `baretile.models.train` does.
+To train your own model, write it with `Tensor`, as `baretile.models.train` does:
+its operations have gradients (`backward`, `gradient`), `assign` updates a weight
+in place, and `jit` records a whole step. tinygrad programs train too, as
+`test/train.py` does, and so do PyTorch programs through tinygrad's torch
+frontend; `test_tinygrad` and `test_torch_frontend` train small networks both
+ways. The adapter runs what it can't translate on tinygrad's CPU, and
+`BARETILE_REPORT=1` says what and where.
 
 ## Estimating cost
 

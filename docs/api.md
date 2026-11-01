@@ -5,10 +5,9 @@ list, and names that start with an underscore, are internal and change freely.
 baretile is pre-alpha. Its first launches have run on a P150a, but nothing below
 is tested there yet, so everything is promised on ttsim only.
 
-To write programs, use tinygrad through the adapter, as baretile's own workloads
-will ([the roadmap](https://github.com/orgs/baretile/projects/1)). `tensor.Tensor`
-is the engine's API, which the adapter compiles to. It grows only for what the
-hardware can do and tinygrad can't express, like block-float weights.
+baretile has its own small frontend, `tensor.Tensor`, which its models are written
+in. tinygrad programs also run on baretile, through the adapter, which compiles
+tinygrad's graphs to `Tensor` operations.
 
 ## Stability
 
