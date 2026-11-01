@@ -7,8 +7,9 @@ the programs a kernel runs, and what to do when a kernel hangs.
 ## Running the tests
 
 Run these from the checkout with Python 3.12 or later, clang and ld.lld on
-`PATH`. They use the simulator that `python3 -m baretile.chip ttsim` downloads, or
-the `libttsim.so` that `TTSIM` names. You'll need NumPy and pytest for the tests.
+`PATH`. They use the simulator that `python3 -m baretile.chip ttsim` downloads,
+or the `libttsim.so` that `TTSIM` names. You'll need NumPy and pytest for the
+tests.
 
 ```sh
 python3 -m baretile.chip ttsim
@@ -34,6 +35,8 @@ tensor operations built from them. Models, the server, the adapters and the
 which runs the README's Python examples and checks what they print, and
 `test_doc_links`, which checks every link to a file of the repository and its
 anchor. `test_layers` checks that each module imports only the layers below it.
+Each test seeds `random` from its own id, so a failure repeats in any order or
+worker.
 
 If pytest exits without explaining why, run it with `-s` and without `-n`. ttsim
 stops the process on errors such as an invalid address or decrementing an empty
@@ -58,8 +61,9 @@ which turns a skip into a failure.
 
 CI's test job doesn't install these, so its `references` job does, at pinned
 versions, and runs the comparisons with `SKIPS=fail`: `test_train`,
-`test_llama_frequencies`, `test_tokenizer`, `test_hf_families`, `test_qwen3_moe`,
-`test_qwen3_5_moe`, `test_mxfp4` and `test_torch_frontend`. It downloads no
+`test_train_gpt2`, `test_llama_frequencies`, `test_tokenizer`,
+`test_hf_families`, `test_qwen3_moe`, `test_qwen3_5_moe`, `test_mxfp4`,
+`test_torch_frontend` and `test_autonomous_generation`. It downloads no
 checkpoints.
 
 To include pretrained checkpoint checks:
@@ -75,9 +79,10 @@ transformers, run `python3 test/generation.py /path/to/SmolLM-135M`.
 
 `LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` runs n
 random expressions in the kernel fuzz test instead of 30, when n is more.
-`TTSIM2=/path/to/libttsim.so` enables the two-chip test. ttsim's releases include
-that library as `libttsim_bh_x2.so`, or you can build ttsim's `release_bh_x2`
-target.
+`TTSIM2=/path/to/libttsim.so` enables the two-chip test. ttsim's releases
+include that library as `libttsim_bh_x2.so`, or you can build ttsim's
+`release_bh_x2` target.
+
 `KMD_IOCTL=/path/to/ioctl.h` checks the arguments of the ioctls that `pci.Kmd`
 sends against tt-kmd's header, compiled by clang for this host. CI uses the
 header from tt-kmd 2.11.0.
@@ -89,9 +94,10 @@ python3 -m baretile.models.llama /path/to/model /path/to/<model>.refpt [steps] [
 ```
 
 `numpy` runs the comparison on the host instead. Reading the reference file
-requires PyTorch. The usual reference procedure has a 512-token prompt and
-500 following steps. Top-1 counts how often baretile picks the reference's best
-token. Top-5 counts how often its pick is among the reference's five best tokens.
+requires PyTorch. The usual reference procedure has a 512-token prompt and 500
+following steps. Top-1 counts how often baretile picks the reference's best
+token. Top-5 counts how often its pick is among the reference's five best
+tokens.
 
 ## Benchmarks
 
@@ -114,11 +120,13 @@ have a separate 60-second limit.
 
 ## Where ttsim differs from a card
 
-Tensix instructions take no time in ttsim. NoC requests complete immediately.
+ttsim models a p150, the Blackhole board that the P150a is a version of. Tensix
+instructions take no time in ttsim. NoC requests complete immediately.
 `STALLWAIT` and `SEMWAIT` hold up the whole thread, whatever their block masks
 name, so a wait that names too few units still works there. Most of the cycles
-you see come from the RISC-V code that controls the kernel. A lower count can show that
-you've reduced that work, but it won't tell you how fast the kernel is on a card.
+you see come from the RISC-V code that controls the kernel. A lower count can
+show that you've reduced that work, but it won't tell you how fast the kernel is
+on a card.
 
 ttsim also decodes an unexpected `XMOV` in very long loops of inline Tensix
 instructions. We don't know why. The DeltaNet kernel calls SFPU functions to
@@ -129,10 +137,10 @@ only check on a card.
 
 ## ttsim-chaos
 
-[test/ttsim-chaos.patch](../test/ttsim-chaos.patch) adds NoC delays, FPU and SFPU
-latency, random pauses, a 140-tile option and the NIU counter for read bytes to
-ttsim v1.11.5 at commit `464814f`. Apply it to a separate ttsim checkout
-and build the Blackhole library there:
+[test/ttsim-chaos.patch](../test/ttsim-chaos.patch) adds NoC delays, FPU and
+SFPU latency, random pauses, a 140-tile option and the NIU counter for read
+bytes to ttsim v1.11.5 at commit `464814f`. Apply it to a separate ttsim
+checkout and build the Blackhole library there:
 
 ```sh
 git clone --branch v1.11.5 https://github.com/tenstorrent/ttsim ttsim-chaos
@@ -154,14 +162,15 @@ range. The RISC-V and Tensix settings give the probability of skipping a turn.
 Set `TTSIM_CHAOS_SEED` to repeat a run. `TTSIM_CHAOS_UNHARVESTED=1` enables all
 140 Tensix tiles, so you can check the code with a larger grid.
 
-CI builds ttsim-chaos this way for every push and pull request. With the four
-delay settings above and the run number as the seed, so each run tries other
-timings, it runs `test/test_device.py` and `test/test_kernels.py`, and the
-model-specific DeltaNet and MoE kernel checks (`test_delta_step`,
-`test_delta_pieces` and `test_moe`). The device tests cover the runtime's
-takeover, cancellation, shutdown and host memory, where timing bugs hide. None of
-them depends on exact simulated timing. CI also runs the whole suite with
-`TTSIM_CHAOS_UNHARVESTED=1`, beside the released ttsim's.
+CI builds ttsim-chaos this way for every push to main and every pull request
+that changes more than Markdown. With the four delay settings above and the run
+number as the seed, so each run tries other timings, it runs
+`test/test_device.py` and `test/test_kernels.py`, the model-specific DeltaNet
+and MoE kernel checks (`test_delta_step`, `test_delta_pieces` and `test_moe`),
+and the kernel ramp (`test_ramp[4_kernel.py]`). The device tests cover the
+runtime's takeover, cancellation, shutdown and host memory, where timing bugs
+hide. None of them depends on exact simulated timing. CI also runs the whole
+suite with `TTSIM_CHAOS_UNHARVESTED=1`, beside the released ttsim's.
 
 CI runs on boat.dev's runners, through its GitHub App, as few, large jobs, since
 boat's plans limit how many jobs start an hour and a day. It splits its runs
@@ -171,13 +180,15 @@ by the seconds each test took in [test/durations.json](../test/durations.json).
 suite with it after adding slow tests. The suite on each ttsim runs as two jobs,
 each in a pytest-xdist worker for each of its runner's 8 CPUs, and each lists
 its 20 slowest tests at the end. The noise runs as one job, a process for each
-CPU on its own part. A pull request that changes only Markdown runs the doc
-tests and the package checks, and skips the simulator jobs. A process's noise
-follows from the seed and the tests it runs, in order, so `TTSIM_CHAOS_SEED=s
-PART=i/n`, with the job's settings and tests, repeats a failed part, and the log
-shows all of them. A test that runs over ten minutes prints the stacks of its
-process's threads, pytest's `faulthandler_timeout`, so a test that hangs in CI
-says where.
+CPU on its own part. The checks job, which every run has, runs ruff once, then
+the README's examples, `test_size` and the link and website tests on ttsim with
+`SKIPS=fail`, then checks the wheel on Python 3.12 to 3.14. A pull request that
+changes only Markdown runs just that job, and skips the suite's jobs. A
+process's noise follows from the seed and the tests it runs, in order, so
+`TTSIM_CHAOS_SEED=s PART=i/n`, with the job's settings and tests, repeats a
+failed part, and the log shows all of them. A test that runs over ten minutes
+prints the stacks of its process's threads, pytest's `faulthandler_timeout`, so
+a test that hangs in CI says where.
 
 `TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
 runs a random lo to hi clocks after it leaves its thread, and the thread goes on
@@ -185,13 +196,13 @@ meanwhile. `STALLWAIT` and `SEMWAIT` then block only the instructions their
 block masks name, as the ISA's `STALLWAIT.md` describes. A configuration write,
 a `SEMPOST` or a pack that should wait for the math finds it unfinished unless a
 `STALLWAIT` holds it back. FPU and SFPU instructions keep their order, and each
-one uses the address modes it saw when it left its thread, since tt-llk relies on
-both. The unpackers, the packer and the configuration unit still finish at once,
-so this doesn't check the waits for them.
+one uses the address modes it saw when it left its thread, since tt-llk relies
+on both. The unpackers, the packer and the configuration unit still finish at
+once, so this doesn't check the waits for them.
 
 The patch also implements the NIU counter for bytes received by reads.
-`pci.Sim.counts` detects the patched library. Released ttsim doesn't support that
-counter, so profiles from it report `None` for bytes.
+`pci.Sim.counts` detects the patched library. Released ttsim doesn't support
+that counter, so profiles from it report `None` for bytes.
 
 ## Reading a kernel's programs
 
@@ -226,23 +237,23 @@ print("tile %u of %u: %#x\n", t, a[1], value);
 the core and the launch that printed it:
 
 ```
-(1, 2) BRISC, launch 3 (add-relu): tile 0 of 4: 0x3f80
+(1, 2) BRISC, launch 3 (add_relu): tile 0 of 4: 0x3f80
 ```
 
 The core leaves a record in a ring in its L1, and the host does the formatting.
-That keeps a call to a few dozen instructions, which store the format's address and
-the words. So the format must be a string literal, which the host reads from the
-kernel's image. Each argument is a 32-bit word: `%d` reads it as a signed int,
-`%u` and `%x` as an unsigned one, and `%f` as the bits of an fp32, so pass a
-float `x` as `*(unsigned *)&x`. There's no `%s`, and a line whose format doesn't
-match its words is shown raw.
+That keeps a call to a few dozen instructions, which store the format's address
+and the words. So the format must be a string literal, which the host reads from
+the kernel's image. Each argument is a 32-bit word: `%d` reads it as a signed
+int, `%u` and `%x` as an unsigned one, and `%f` as the bits of an fp32, so pass
+a float `x` as `*(unsigned *)&x`. There's no `%s`, and a line whose format
+doesn't match its words is shown raw.
 
 Lines come grouped by worker, then by core. Each core's lines are in the order
 it printed them, but its four cores run at once, so lines from different cores
 aren't in time order. Each core's ring keeps its last 127 lines. When a launch
 prints more, or several do before a `wait()`, a line says how many came before
-the lines shown. A kernel that doesn't call `print` compiles to
-the same bytes, and the runtime reads the rings only after a kernel that calls it.
+the lines shown. A kernel that doesn't call `print` compiles to the same bytes,
+and the runtime reads the rings only after a kernel that calls it.
 [test_print](../test/test_device.py) shows each case.
 
 ## When a launch hangs
@@ -264,10 +275,11 @@ For long checks, run one simulator at a time, or pass a longer timeout to
 If a worker never received `go`, check dispatch and multicast first. If the
 workers finished but the host is still waiting, check their atomic reports and
 the status write to host memory. A read ID that's still outstanding means a
-transfer hasn't finished. Use the [pipeline counters](compiler.md#unpack-math-and-pack) to
-see where a kernel is waiting.
+transfer hasn't finished. Use the
+[pipeline counters](compiler.md#unpack-math-and-pack) to see where a kernel is
+waiting.
 
-Creating a new runtime resets its worker cores, but not a Tensix coprocessor that a
-hung kernel left waiting. If the next runtime's kernels hang on those workers, or
-the NoC or ARC has hung, see [bring-up](bring-up.md#when-a-card-hangs) for the chip
-reset command.
+Creating a new runtime resets its worker cores, but not a Tensix coprocessor
+that a hung kernel left waiting. If the next runtime's kernels hang on those
+workers, or the NoC or ARC has hung, see
+[bring-up](bring-up.md#when-a-card-hangs) for the chip reset command.

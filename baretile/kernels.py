@@ -80,7 +80,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   one.
 
   bf16 arithmetic uses SrcA, SrcB and the FPU. fp32 and int32 elementwise kernels bypass the 19-bit
-  Src registers: the math thread loads operands into Dst, and the SFPU computes every operation.
+  Src registers for their own dtype: the math thread loads those operands into Dst, bf16 inputs through SrcA
+  (tensix.widen), and the SFPU computes every operation.
   These kernels contain no matmul; Tensor handles fp32 matmul through bf16 parts.
 
   Two L1 frames alternate between tiles. Each holds input slots and intermediate results. Packing

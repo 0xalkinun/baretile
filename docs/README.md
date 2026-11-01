@@ -9,7 +9,7 @@ now, and each page links to the files it covers.
 The ramps are scripts that teach baretile in order, from tensors down to Tensix
 instructions. Each one explains its steps in comments and checks its results,
 also under `python -O`, so you can change a step and see what breaks. Run them
-from the checkout with `TTSIM` set:
+from the checkout, after `python3 -m baretile.chip ttsim` or with `TTSIM` set:
 
 ```sh
 python3 ramps/1_tensors.py
@@ -28,8 +28,9 @@ python3 ramps/4_kernel.py
    BRISC and Tensix programs to a function tested against NumPy.
    [Writing a kernel](kernels.md) walks through it.
 
-After the ramps, [baretile/models/gpt2.py](../baretile/models/gpt2.py) is a whole
-model in under 200 lines. It runs the same code on baretile tensors and NumPy arrays.
+After the ramps, [baretile/models/gpt2.py](../baretile/models/gpt2.py) is a
+whole model in under 200 lines. It runs the same code on baretile tensors and
+NumPy arrays.
 
 ## Pages
 
@@ -43,22 +44,22 @@ model in under 200 lines. It runs the same code on baretile tensors and NumPy ar
 | [Testing and debugging](testing.md) | Running the tests, optional checks, ttsim-chaos and hung launches |
 | [Writing a kernel](kernels.md) | A tensor operation of your own, from its four programs to a tested function |
 | [Hardware reference](hardware.md) | PCIe, TLB windows, coordinates, DRAM, ARC, the RISC-V cores, NoC transfers and Ethernet, with sources |
-| [Bring-up on a card](bring-up.md) | Running on a p150 for the first time, measuring it, and what we still need to check |
+| [Bring-up on a card](bring-up.md) | Running on a P150a for the first time, measuring it, and what we still need to check |
 
 ## How the pieces fit
 
 Each module imports only the layers below it, and layers 0 to 3 need only the
 standard library. `bh.py` holds hardware constants, `pci.py` opens the device,
-and `chip.py` reads and writes through the network on chip (NoC). The runtime uses these
-modules to load and launch programs. The compiler builds kernels from Tensix
-instructions, and `Tensor` compiles expressions into those kernels. The models and
-adapters are layer 4, in `baretile/models/` and `baretile/adapters/`, and also use
-NumPy.
+and `chip.py` reads and writes through the network on chip (NoC). The runtime
+uses these modules to load and launch programs. The compiler builds kernels from
+Tensix instructions, and `Tensor` compiles expressions into those kernels. The
+models and adapters are layer 4, in `baretile/models/` and `baretile/adapters/`,
+and also use NumPy.
 
-`Tensor` builds an expression when you add, multiply or reduce. `realize()` turns
-that expression into kernels and queues them. `tolist()` also waits and copies
-the result back to Python. A matmul computes its input matrices first. It can
-combine operations on its output into the matmul kernel, as with the ReLU in
+`Tensor` builds an expression when you add, multiply or reduce. `realize()`
+turns that expression into kernels and queues them. `tolist()` also waits and
+copies the result back to Python. A matmul computes its input matrices first. It
+can combine operations on its output into the matmul kernel, as with the ReLU in
 the README.
 
 A Tensix tile has local memory and RISC-V cores that control data movement and
@@ -76,7 +77,7 @@ tile running a kernel; a tensor tile is the data it processes.
 | --- | --- | --- |
 | 0, device | [bh.py](../baretile/bh.py) | Blackhole's addresses, sizes and instruction encodings, as data |
 | | [pci.py](../baretile/pci.py) | The device: `Sim` wraps libttsim.so, `Kmd` opens a card through tt-kmd, and `Card` through sysfs; checking a card first, and giving it back to tt-kmd |
-| | [chip.py](../baretile/chip.py) | NoC reads and writes through TLB windows, ARC messages, telemetry, core reset and Ethernet links; `python3 -m baretile.chip [check \| release \| reset]` |
+| | [chip.py](../baretile/chip.py) | NoC reads and writes through TLB windows, ARC messages, telemetry, core reset and Ethernet links; `python3 -m baretile.chip [check \| ttsim \| release \| reset]` |
 | 1, runtime | [runtime.py](../baretile/runtime.py) | Builds device C with clang, loads firmware and kernels, queues launches, allocates DRAM and profiles |
 | 2, codegen | [tensix.py](../baretile/tensix.py) | Tensix instructions from the ISA, and the BRISC, unpack, math and pack programs of a kernel |
 | 3, kernels and tensors | [kernels.py](../baretile/kernels.py) | Fused elementwise, matmul and reduction kernels, attention, data movement and `topk` |

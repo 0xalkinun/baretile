@@ -1,7 +1,43 @@
 # Changelog
 
 baretile is pre-alpha. Everything below is tested on Tenstorrent's ttsim
-simulator; nothing has run on a P150a yet.
+simulator. A P150a has run the first bring-up stages, preflight, chip and
+transfers; nothing else is tested on a card yet.
+
+## Unreleased
+
+### Changed
+
+- Two `Chip`s on one device object raise `RuntimeError`, as a second opener of the device does, since they'd hand out
+  the same TLBs and DRAM.
+- The server refuses, with HTTP 400 naming them, JSON-schema keywords it doesn't know, such as `not`, `prefixItems`
+  and `uniqueItems`, where it ignored them. It enforces `allOf`, and accepts annotations like `title`.
+- gpt-oss chats refuse a system, developer or tool message after the first, and a `reasoning_effort` other than
+  `low`, `medium` or `high`.
+- `llama.config` refuses `mlp_bias` and a Gated DeltaNet convolution of other than 4 taps, and the tokenizer a
+  normalizer other than NFC, where they loaded and computed something else.
+
+### Fixed
+
+- A reduction over a leading dimension other than the first, fused with an input of the result's batch, read the
+  wrong matrices: `x.sum(1) * y` was off, and so were softmax's and layernorm's gradients over that dimension.
+- A matmul under a reduction kept its line of B in L1 when A's row changed along the line, so later passes used the
+  wrong row: `(A @ B).softmax(-2)` was off by 0.9.
+- `y + x.sum(1)` on 4D, with the sum broadcast along rows or columns, failed to compile.
+- A unit-step slice of an inner leading dimension, like `x[:, 0:1]`, had no gradient.
+- Casting int32 to a block float gave wrong values: `[1, 2, 3, -4]` came back `[0, 0, 0, nan]`.
+- Slicing, relabelling or repeating a block-float repeat, merging a block float, and a block float with a number
+  raised; for fp32, the same copies changed -0 and NaN payloads.
+- `x / 0` raised `ZeroDivisionError`. It's inf, -inf or NaN as in NumPy, and `number / x` works.
+- `gather` and `put` used only the first row of 4D ids of two rows; they refuse them now.
+- Through tt-kmd, the chip stayed at its minimum AI clock. `Kmd` asks kmd for the busy one.
+- `python3 -m baretile.chip reset` left the card with no driver. It binds tt-kmd again and opens the card through it.
+- An ARC message through tt-kmd that timed out made every later message fail.
+- A stream whose client left before its headers were written kept its slot, a stream that got no text in 600 seconds
+  ended without an error or `[DONE]`, and response ids repeated across requests.
+- In the tinygrad adapter, `x ** inf` and `x ** nan` crashed, and so did a `cat` or `stack` of bools from comparisons
+  of different dtypes. `BARETILE_REPORT` said every `TinyJit` call replayed when one recorded again or launched
+  nothing.
 
 ## 0.0.6
 

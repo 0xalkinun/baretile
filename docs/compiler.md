@@ -1,11 +1,11 @@
 # Compiler
 
-The compiler turns tensor expressions into kernels. [tensix.py](../baretile/tensix.py)
-encodes Tensix instructions and builds the four programs of a kernel.
-[kernels.py](../baretile/kernels.py) builds the kernels from them, and
-[tensor.py](../baretile/tensor.py) decides which kernels an expression needs.
-[ramps/3_tensix.py](../ramps/3_tensix.py) writes the unpack, math and pack
-programs of a small kernel by hand.
+The compiler turns tensor expressions into kernels.
+[tensix.py](../baretile/tensix.py) encodes Tensix instructions and builds the
+four programs of a kernel. [kernels.py](../baretile/kernels.py) builds the
+kernels from them, and [tensor.py](../baretile/tensor.py) decides which kernels
+an expression needs. [ramps/3_tensix.py](../ramps/3_tensix.py) writes the
+unpack, math and pack programs of a small kernel by hand.
 
 ## Tiles and storage
 
@@ -26,19 +26,20 @@ dimensions. Only the last two are tiles, so each matrix pads to whole tiles: a
 `(N, C, 7, 7)` tensor uses 49 of each tile's 1,024 values. Keep the last two
 dimensions large, and merge small ones into them. A reshape that changes only
 the leading sizes is a view, and so is a slice that picks evenly spaced
-matrices, as any slice of the first leading dimension does. So is a reshape
-that regroups whole tile rows into other matrices, like `(2, 64, cols)` into
-`(128, cols)` or `(4, 32, cols)`, when the matrices are stored one after
-another. Other movement over leading dimensions is one launch of the move
-kernel, which maps up to five axes.
+matrices, as any slice of the first leading dimension with a positive step does.
+So is a reshape that regroups whole tile rows into other matrices, like
+`(2, 64, cols)` into `(128, cols)` or `(4, 32, cols)`, when the matrices are
+stored one after another. Other movement over leading dimensions is one launch
+of the move kernel, which maps up to five axes.
 
 An operand whose leading sizes are one run of the result's, like `(2, 1)` or
 `(1, 3)` in `(2, 3)`, is read in place: for the result's matrix `b`, a kernel
 reads its matrix `(b / rep) % n`, as it reads `b / rep` of a repeat. Other
 patterns, like `(2, 1, 2)` in `(2, 3, 2)`, are expanded by a move first. A
-reduction over a leading dimension sweeps each result tile's line through the
-batch, from the first matrix that folds into it and a step of the dimensions
-after it at a time.
+reduction over a leading dimension walks each result tile's line through the
+batch: it starts at the first matrix that folds into the result and steps by the
+product of the dimensions after the reduced one.
+
 Tensor dimensions must be positive integers. `Tensor.of` accepts rectangular
 matrices of the same shape, and `Tensor.frombytes` checks the byte count before
 allocating memory. Operations require operands from the same runtime; use
@@ -90,13 +91,14 @@ along one axis. If the expression also reduces along another axis, that part
 is computed first. Inputs can stay in L1 across passes when there is room.
 
 Batch indexing, tile-aligned slices, `split` and `repeat_interleave` can share
-storage through a view's batch, strides and offset. A shape-changing `reshape`
-copies through `move_kernel`; an identical-shape reshape returns its input.
-Other movement also copies when it cannot use a view. `move` checks that the
-source positions it selects stay inside the input's logical shape, and its
-offset and strides must fit signed 32-bit integers. Padding outside the selected
-output bounds reads no source data. Negative `pad` widths crop, and the cropped
-elements get zero gradients. `pad` takes at most three integer pairs.
+storage through a view's batch, strides and offset. A `reshape` that can't be a
+view (see [tiles and storage](#tiles-and-storage)) copies through `move_kernel`;
+an identical-shape reshape returns its input. Other movement also copies when it
+cannot use a view. `move` checks that the source positions it selects stay
+inside the input's logical shape, and its offset and strides must fit signed
+32-bit integers. Padding outside the selected output bounds reads no source
+data. Negative `pad` widths crop, and the cropped elements get zero gradients.
+`pad` takes one integer pair for each of the last dimensions, up to all of them.
 
 Casting block floats to bf16 decodes them on the chip into ordinary tiles, and
 casting column storage to its own dtype restores ordinary tile order. Further
@@ -118,10 +120,11 @@ gradients. `backward()` queues the forward value and every leaf gradient before
 returning, so sequential parameter updates use the same forward values.
 `gradient()` returns lazy expressions; realize all of them before changing any
 forward operand. `test_autograd` checks gradients against numerical differences.
-[test/train.py](../test/train.py) compares a small GPT training run with PyTorch.
+[test/train.py](../test/train.py) compares a small GPT training run with
+PyTorch.
 
-A single-element tensor converts to `bool` by waiting and reading its value.
-The truth value of a larger tensor is ambiguous and raises `ValueError`, including
+A single-element tensor converts to `bool` by waiting and reading its value. The
+truth value of a larger tensor is ambiguous and raises `ValueError`, including
 in Python conditions and container membership checks. A scalar truth test is a
 host read and must stay outside a recorded function.
 
@@ -134,9 +137,9 @@ stream. Instructions with fields computed at runtime use stores instead.
 
 TRISC0 sets the backend registers, thread configuration and semaphores before
 marking the kernel ready. Each thread also sets its address counters. If BRISC
-and a TRISC submit a Tensix instruction in the same cycle, the TRISC's instruction
-can be dropped. That's why BRISC handles data movement and leaves Tensix to
-the TRISCs.
+and a TRISC submit a Tensix instruction in the same cycle, the TRISC's
+instruction can be dropped. That's why BRISC handles data movement and leaves
+Tensix to the TRISCs.
 
 The unpacker fills SrcA and SrcB. The math thread takes a free half of Dst,
 computes, and posts `SEM_DST`. The packer writes that result to L1 and signals
@@ -194,13 +197,17 @@ Four phases make bf16 products exact, but the sum is still rounded. The matrix
 unit aligns groups of products before adding them. A partial sum reloaded
 through SrcA loses bits in the conversion to TF32. For fp32 matmul, we split
 each operand into a bf16 high part and a bf16 low part. We compute
-`hi @ hi + hi @ lo + lo @ hi` and add those products in fp32.
+`hi @ hi + hi @ lo + lo @ hi` and add those products in fp32. Each part keeps
+about 16 of an fp32 operand's 24 bits, but the matrix unit adds each group of
+eight products at 12 bits, as ttsim models it, so an fp32 matmul is good to
+about 2^-11 of its largest terms, against bf16's 2^-8.
 
 fp32 elementwise operations use the SFPU, a 32-lane vector unit working on Dst.
 It implements arithmetic and the polynomial approximations used for functions
 such as exp and log. `rounded("fp16")` rounds fp32 values to fp16's precision,
-to nearest even, as integer arithmetic on their bits, and keeps them in fp32. Packing a bf16 result rounds half up, while host uploads
-use round-to-nearest-even. The two can differ by one bf16 step on the same input.
+to nearest even, as integer arithmetic on their bits, and keeps them in fp32.
+Packing a bf16 result rounds half up, while host uploads use
+round-to-nearest-even. The two can differ by one bf16 step on the same input.
 
 Integer comparisons, minimum and maximum cover the full int32 range, including
 `-2**31`. Integer addition and subtraction wrap; conversion to fp32 rounds to
@@ -212,6 +219,7 @@ Square root covers every positive normal fp32 input, including the smallest
 normal value and the largest finite value. Its iteration keeps every
 intermediate value near the root, its reciprocal or 1/2, so none underflows
 or overflows. Subnormal arithmetic flushes to zero.
+
 Sine and cosine support finite inputs with absolute value below `2**24`;
 inputs outside that range return NaN. Their range reduction splits both the
 integer turn count and pi to keep large-argument subtraction accurate.
@@ -228,17 +236,17 @@ exponentials and weighted values. Values are read on the second sweep. Keys
 stay in L1 between sweeps when they fit. Scores stay local instead of being
 written as a full attention matrix in DRAM.
 
-A unit handles up to 8 tile rows of one head's queries, and they share each
-key and value tile it reads, so larger units read K/V fewer times. Each row's
-maxima stay in fp32 in a quarter of a Dst accumulator tile, so Dst's two
-accumulators hold 8 rows. The SFPU spreads a row's maxima over a tile and
-subtracts them after the full scores have accumulated, which avoids overflow
-from rounding a large maximum or subtracting it too early. `attention_plan`
-gives units as many rows as still leave a unit for every worker, so a long
-prefill reads K/V once per 256 query rows and a short prompt still occupies the
-chip; `baretile/models/cost.py` uses the same plan. Heads whose frames do not fit in L1
-raise `ValueError` before allocation or launch. A supported frame with no space
-to retain keys streams them again for the second sweep.
+A unit handles up to 8 tile rows of one head's queries, and they share each key
+and value tile it reads, so larger units read K/V fewer times. Each row's maxima
+stay in fp32 in a quarter of a Dst accumulator tile, so Dst's two accumulators
+hold 8 rows. The SFPU spreads a row's maxima over a tile and subtracts them
+after the full scores have accumulated, which avoids overflow from rounding a
+large maximum or subtracting it too early. `attention_plan` gives units as many
+rows as still leave a unit for every worker, so a long prefill reads K/V once
+per 256 query rows and a short prompt still occupies the chip;
+`baretile/models/cost.py` uses the same plan. Heads whose frames do not fit in
+L1 raise `ValueError` before allocation or launch. A supported frame with no
+space to retain keys streams them again for the second sweep.
 
 Decoding often has too few heads to occupy the workers. The implementation
 splits the keys into up to eight parts and combines their maxima, sums and

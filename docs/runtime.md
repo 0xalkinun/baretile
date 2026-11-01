@@ -1,9 +1,9 @@
 # Runtime
 
-The runtime loads programs onto the workers and launches them. It also
-allocates DRAM, records launches for replay and profiles them. The code is in
-[runtime.py](../baretile/runtime.py), and [ramps/2_runtime.py](../ramps/2_runtime.py)
-runs C kernels through it.
+The runtime loads programs onto the workers and launches them. It also allocates
+DRAM, records launches for replay and profiles them. The code is in
+[runtime.py](../baretile/runtime.py), and
+[ramps/2_runtime.py](../ramps/2_runtime.py) runs C kernels through it.
 
 The runtime loads a kernel into L1, the local memory of each worker tile. It
 then puts a command in host memory and writes a doorbell on the dispatcher tile.
@@ -12,25 +12,27 @@ them and waits for their reports. The host sees completion in its own memory.
 
 ## Workers and the dispatcher
 
-`Runtime(chip)` uses the available Tensix tiles. You can restrict it with `start`
-and `end` coordinates. The last tile in that rectangle is the dispatcher. The
-others are workers. A new runtime closes any older runtime whose tiles overlap.
-The displaced runtime, its tensors and its recordings reject further work.
-Disjoint rectangles can run together and allocate from the same DRAM pool.
-Both endpoints must be available Tensix tiles. The runtime requires all eight
-DRAM banks. A custom command ring must be a power of two from 64 bytes through
-1 MiB, leaving room for status, timing records and tensor data in its 2 MiB host page.
+`Runtime(chip)` uses the available Tensix tiles. You can restrict it with
+`start` and `end` coordinates. The last tile in that rectangle is the
+dispatcher. The others are workers. A new runtime closes any older runtime whose
+tiles overlap. The displaced runtime, its tensors and its recordings reject
+further work. Disjoint rectangles can run together and allocate from the same
+DRAM pool. Both endpoints must be available Tensix tiles. The runtime requires
+all eight DRAM banks. A custom command ring must be a power of two from 64 bytes
+through 1 MiB, leaving room for status, timing records and tensor data in its 2
+MiB host page.
 
-Call `rt.close()` when finished, or use `with Runtime(chip) as rt:`. Closing stops
-all workers and cancels queued work; call `rt.wait()` first if it must finish.
-Closing first cancels the dispatcher, so no other launch starts, and gives the
-running launch two seconds to finish. A worker stopped inside a Tensix program
-would leave its coprocessor blocked, and the next runtime's kernels would queue
-behind it. Then closing requests cancellation from the workers and lets active
-multicasts finish their acknowledgements; the multicast helpers check for
-cancellation before issuing a new transfer. Closing then resets the cores and drains outstanding NoC requests
-before releasing host DMA and DRAM memory. Closing again is harmless, and process
-exit closes every runtime still running.
+Call `rt.close()` when finished, or use `with Runtime(chip) as rt:`. Closing
+stops all workers and cancels queued work; call `rt.wait()` first if it must
+finish. Closing first cancels the dispatcher, so no other launch starts, and
+gives the running launch two seconds to finish. A worker stopped inside a Tensix
+program would leave its coprocessor blocked, and the next runtime's kernels
+would queue behind it. Then closing requests cancellation from the workers and
+lets active multicasts finish their acknowledgements; the multicast helpers
+check for cancellation before issuing a new transfer. Closing then resets the
+cores and drains outstanding NoC requests before releasing host DMA and DRAM
+memory. Closing again is harmless, and process exit closes every runtime still
+running.
 
 Collecting a runtime without closing it doesn't touch the card, since a
 collection can interrupt another runtime's access to the shared TLB window. Its
@@ -38,24 +40,26 @@ cores keep running and its memory stays reserved until a safe point closes it:
 the next runtime on the chip, once Python has collected the dropped one, or an
 allocation of DRAM or of a host page that finds no room, which collects first. A
 dropped runtime is usually in a reference cycle through its cached number
-tensors, so call `close()` to release it promptly. If a multicast never finishes
-or the NoC never drains, closing resets the cores anyway and keeps the runtime's
-host page and DRAM for the rest of the process, so a new runtime can still take
-over a hung rectangle. One whose kernel hung inside a Tensix program may need a
-chip reset. If resetting the cores fails, the memory stays reserved
+tensors, so call `close()` to release it promptly. Under
+`python3 -m baretile.viz`, viz holds every runtime the script makes until it
+writes the page, so those aren't reaped when dropped. If a multicast never
+finishes or the NoC never drains, closing resets the cores anyway and keeps the
+runtime's host page and DRAM for the rest of the process, so a new runtime can
+still take over a hung rectangle. One whose kernel hung inside a Tensix program
+may need a chip reset. If resetting the cores fails, the memory stays reserved
 until a later close or takeover succeeds. Cleanup only stops its own rectangle.
 
 Custom kernels must use acknowledged reads, writes and atomics, and wait for
 completion before returning. Unacknowledged writes have no completion counter;
 shutdown cannot establish their destination memory's lifetime. Custom multicast
 code must drain earlier requests and call `mcast_begin()`. Then it reads
-`acks = NIU(WR_ACKS)` before issuing any packets, and calls `mcast_done(acks + n)`
-after issuing all of them, where `n` counts an acknowledgement for each packet
-and receiving tile. `mcast_done` waits for that counter value. `mcast` in
-`tensix.py` is an example. Only one core per
-tile may issue requests during that region. The dispatcher and generated kernels
-already use these helpers. Raw custom multicasts bypass cancellation tracking and
-can leave cleanup unable to establish completion.
+`acks = NIU(WR_ACKS)` before issuing any packets, and calls
+`mcast_done(acks + n)` after issuing all of them, where `n` counts an
+acknowledgement for each packet and receiving tile. `mcast_done` waits for that
+counter value. `mcast` in `tensix.py` is an example. Only one core per tile may
+issue requests during that region. The dispatcher and generated kernels already
+use these helpers. Raw custom multicasts bypass cancellation tracking and can
+leave cleanup unable to establish completion.
 
 Some kernels need a rectangular grid of workers. `Runtime.grid` keeps rows that
 contain every x coordinate still present among workers. In a multi-row runtime,
@@ -84,36 +88,38 @@ We divide a worker's L1 like this. The constants are in `runtime.py`.
 | `0x80000` | Kernel data |
 
 The dispatcher uses `0x1000` for its configuration and doorbell, and `0x1400`
-for outgoing messages. At `0x80000` it counts worker reports and read-data flits.
-It stages commands at `0x80040`, with room for 64 KiB.
+for outgoing messages. At `0x80000` it counts worker reports and read-data
+flits. It stages commands at `0x80040`, with room for 64 KiB.
 
 Kernel images start with four entry offsets. They can run at different L1
 addresses. The runtime loads an image once and reuses it until the kernel area
 fills. It then waits for queued work before evicting the loaded images.
 `compile_kernel` starts each program with a stub that clears its `.bss` at every
-launch. Initialized statics must be
-const. A static pointer to data or a function still contains an absolute address,
-so the compiler rejects it: use constant integer offsets into an array instead.
-The compiler checks the linked ELF relocations before caching the flat image.
+launch. Initialized statics must be const. A static pointer to data or a
+function still contains an absolute address, so the compiler rejects it: use
+constant integer offsets into an array instead. The compiler checks the linked
+ELF relocations before caching the flat image.
 
 ## Commands and memory
 
-A command has a 16-byte header: length, kernel address, argument length and worker
-count. Arguments follow, and the command is padded to 64 bytes. Commands never
-straddle the end of the host ring. A zero length marks unused space at the end.
+A command has a 16-byte header: length, kernel address, argument length and
+worker count. Arguments follow, and the command is padded to 64 bytes. Commands
+never straddle the end of the host ring. A zero length marks unused space at the
+end.
 
 `Runtime.send()` writes commands into the ring and updates the doorbell. A block
 of recorded commands uses one doorbell write when it fits with any wrap padding.
-Larger blocks are sent in pieces, split between commands. The dispatcher executes
-launches in order and alternates argument buffers so it can prepare the next
-launch while workers run. Work counts range from 1 through `2**32 - 1`; workers
-receive contiguous partitions whose total is exactly the requested count.
-Launch numbers wrap in the device status, while host launch numbers keep growing.
+Larger blocks are sent in pieces, split between commands. The dispatcher
+executes launches in order and alternates argument buffers so it can prepare the
+next launch while workers run. Work counts range from 1 through `2**32 - 1`;
+workers receive contiguous partitions whose total is exactly the requested
+count. Launch numbers wrap in the device status, while host launch numbers keep
+growing.
 
 Each worker reports completion with a NoC atomic increment. The dispatcher
 writes timing data before completion status, using ordered acknowledged writes.
-`Runtime.wait()` polls that status in host memory. `Runtime.wait(launch=n)` waits
-only until launch `n` is done.
+`Runtime.wait()` polls that status in host memory. `Runtime.wait(launch=n)`
+waits only until launch `n` is done.
 
 The rest of the host page, `Runtime.back`, holds tensor data that crosses PCIe.
 `tobytes` launches workers that write a tensor's tiles there. `frombytes` writes
@@ -122,8 +128,8 @@ it stages each bank's share there for `upload_kernel`, whose workers read it
 through the PCIe tile. It stages in two halves, filling one while the chip reads
 the other, and waits for the last chunk before it returns. A recording leaves
 those launches out, since their staged data is gone by the time it replays.
-`Tensor.zeros` sends nothing over PCIe: its workers write the 4 KiB tile of zeros
-in their L1 over the tensor's storage.
+`Tensor.zeros` sends nothing over PCIe: its workers write the 4 KiB tile of
+zeros in their L1 over the tensor's storage.
 
 Runtimes on one `Chip` share the free ranges of its eight DRAM banks. An
 allocation uses the same address range in every bank, taking the first hole
@@ -138,16 +144,16 @@ later calls.
 `tensor.jit(f)` runs the first call normally and records the second. Each input
 is recorded where it is, and its address in the launches is a `runtime.Bound`
 argument. Later calls resend the launches with the new inputs' addresses patched
-in. Inputs may be read more than once or written in place with `assign`, `put` or
-`realize(into=...)`. A replay copies an input first only when it is laid out
+in. Inputs may be read more than once or written in place with `assign`, `put`
+or `realize(into=...)`. A replay copies an input first only when it is laid out
 otherwise than a new tensor of its shape, such as a slice or a repeat, when it
 is storage that the recording's own results overwrite, or when f only reads it
 and it shares storage with an input or captured tensor that f writes; a written
 copy goes back to the caller's tensor afterwards. Keep two written inputs in
 distinct storage, and keep written inputs separate from captured tensors f only
-reads. Those aliases are not supported by replay. A tensor by columns can't be copied, so
-it must keep the recorded layout. If kernels have been evicted, the recording
-reloads them and rebuilds its commands.
+reads. Those aliases are not supported by replay. A tensor by columns can't be
+copied, so it must keep the recorded layout. If kernels have been evicted, the
+recording reloads them and rebuilds its commands.
 
 Keep the number of inputs, their runtime, shapes and dtypes fixed from the first
 call. A failed call can be retried; a failed recording releases its abandoned
@@ -184,14 +190,13 @@ script under it, or with `-m` a module, as `python3 -m` would:
 python3 -m baretile.viz -m baretile.models.llama /path/to/SmolLM-135M "The meaning of life is" 6
 ```
 
-The script runs as it would under `python3`. If it creates a runtime, the wrapper
-writes `viz.html` in the current directory when the script returns or raises an
-exception, including Ctrl-C. The page includes the completed launches of each
-runtime still open when the script ends. A runtime the script closed, or replaced
-with an overlapping one, has no records left.
-From Python, call `viz.save(path, rt, since=saved)`. Call `rt.wait()` first to
-include all queued work. `save` doesn't wait, so you can also call it after a
-launch times out.
+The script runs as it would under `python3`. If it creates a runtime, the
+wrapper writes `viz.html` in the current directory when the script returns or
+raises an exception, including Ctrl-C. The page includes the completed launches
+of each runtime still open when the script ends. A runtime the script closed, or
+replaced with an overlapping one, has no records left. From Python, call
+`viz.save(path, rt, since=saved)`. Call `rt.wait()` first to include all queued
+work. `save` doesn't wait, so you can also call it after a launch times out.
 
 Open the generated file in a browser with JavaScript enabled. File previews
 that don't run scripts can't display the launch data. The source file
@@ -199,11 +204,12 @@ that don't run scripts can't display the launch data. The source file
 
 The timeline shows each launch from `go` to its last report, using the
 dispatcher's clock. Scroll to zoom, drag to pan, and double-click to show the
-whole timeline. The table sorts kernels by total cycles. Input shapes help
-distinguish fused kernels that share a name such as `C matmul`.
-Tab to a kernel button and press Enter or Space to select it. With the timeline
-focused, Left and Right select launches, plus and minus zoom, and Home resets
-the view. The page announces the selected launch.
+whole timeline. The table sorts kernels by total cycles. It has a row for each
+kernel image, named after the first launch of it, where `profile` groups
+launches by name. Input shapes help distinguish fused kernels that share a name
+such as `C matmul`. Tab to a kernel button and press Enter or Space to select
+it. With the timeline focused, Left and Right select launches, plus and minus
+zoom, and Home resets the view. The page announces the selected launch.
 
 Select a kernel to highlight its launches and see its details. For a fused
 kernel, the page draws the compiled expression with inputs at the top. Each
@@ -211,10 +217,10 @@ distinct subexpression appears once in the graph. Reductions can still compute
 that subexpression on several passes. Comparing graphs can reveal repeated
 matmuls, but the page doesn't track shared tensors between kernels. A kernel
 made by `Tensor.run` shows its cache key. A kernel absent from the tensor cache,
-such as a custom C kernel, has no expression or key to show. Every kernel compiled
-in the same process also shows its C programs, one per core, as
+such as a custom C kernel, has no expression or key to show. Every kernel
+compiled in the same process also shows its C programs, one per core, as
 [`BARETILE_DUMP`](testing.md#reading-a-kernels-programs) writes them.
 
-The runtime keeps the last 1,024 launch records. The page includes the completed
-launches still in that history. Launch arguments are plain numbers, so the
+The page includes the completed launches still in the runtime's last 1,024
+records. Launch arguments are plain numbers, so the
 runtime can't tell which are the DRAM addresses a launch reads or writes.
