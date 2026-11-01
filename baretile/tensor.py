@@ -15,7 +15,7 @@ DIMS = 5  # a tensor's most dimensions: up to three leading ones, then its matri
 # takes a PCIe write for each word. A guess until the probe measures both on a card.
 DMA_UPLOAD = 1 << 16
 
-def _matrices(f):  # an op on a batch of matrices: a tensor with leading dimensions reshapes to three first
+def _matrices(f):  # an op on a batch of matrices: a tensor with leading dimensions must be reshaped to three first
   @functools.wraps(f)
   def op(self, *args, **kwargs):
     if len(self.shape) > 3: raise ValueError(f"{f.__name__} takes three dimensions, not {self.shape}")
@@ -213,7 +213,7 @@ class Tensor:
         raise IndexError(f"gather picks rows of a {self.rows}-row matrix: {list(ids)}")
       ids = Tensor.of(self.rt, [list(ids)], "int32")
     self._same_runtime(ids)
-    if not (self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1)):
+    if not (self.batch == 1 and ids.dtype == "int32" and (ids.batch, ids.rows) == (1, 1)):
       raise ValueError("gather needs batch 1, and ids as an int32 row")
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     addr, _, stride, offset = _plain(self.realize())._where()
@@ -225,7 +225,7 @@ class Tensor:
     """Write x into rows selected by ids, in place. Models use this to update KV caches without changing the
     shape of a decode step. For a block-float destination, x is bf16 and is rounded as in cast."""
     self._same_runtime(ids, x)
-    if not (ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows):
+    if not (ids.dtype == "int32" and (ids.batch, ids.rows) == (1, 1) and ids.cols == x.rows):
       raise ValueError("put needs ids as an int32 row, with one position for each row of x")
     if not ((x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype)):
       raise ValueError(f"put needs rows of the cache's batch and width, "
@@ -256,7 +256,7 @@ class Tensor:
     if lead == self.lead: return self
     if self.op == "lead": return self.srcs[0]._relabel(lead)
     if self.op == "T": return self.srcs[0]._relabel(lead).T
-    if self.op is None and self.rep > 1: return (self + 0)._relabel(lead)  # a repeat's matrices aren't all stored
+    if self.op is None and self.rep > 1: return _copy(self)._relabel(lead)  # a repeat's matrices aren't all stored
     if self.op is None: t = self._view(*self.shape[-2:], self.batch, 0, self.bstride, self.runs)._track("lead", (self,))
     else: t = Tensor(self.rt, self.rows, self.cols, "lead", (self,), self.batch, self.dtype)
     t.lead = lead
@@ -282,7 +282,7 @@ class Tensor:
     matrix edge, and step by 1. The batch may use any positive step. Slicing rows or columns down to
     size 1 needs copies across the tile. Other slices also copy. An unrealized sum of realized
     tensors, such as split-K results, is sliced term by term."""
-    if self.rep > 1: return (self + 0)[key]  # slice a copy of a repeat: the copy stores its matrices one after another
+    if self.rep > 1: return _copy(self)[key]  # slice a copy of a repeat: the copy stores its matrices one after another
     if len(self.lead) > 1: return self._lead_item(key)
     if isinstance(key, int):
       if not -self.batch <= key < self.batch: raise IndexError(f"batch index {key} outside a batch of {self.batch}")
@@ -324,7 +324,8 @@ class Tensor:
     steps = {b - a for a, b in zip(picked, picked[1:])}
     if self.op != "move" and len(steps) <= 1 and min(steps, default=1) > 0:
       batch = slice(picked[0], picked[-1] + 1, min(steps, default=1))
-      return self._relabel((self.batch,))[batch, key[-2], key[-1]]._relabel(tuple(map(len, ranges[:-2])))
+      t = self._relabel((self.batch,))[batch, key[-2], key[-1]]._relabel(tuple(map(len, ranges[:-2])))
+      return t._track("slice", (self,), ranges)  # the gradient by the slice's own ranges, not the batch's steps
     t = self._map(tuple(map(len, ranges)), range(n), [g.start for g in ranges], [g.step for g in ranges])
     return t._track("slice", (self,), ranges)
 
@@ -418,7 +419,7 @@ class Tensor:
   def repeat_interleave(self, n):
     """Repeat each matrix n times along the batch without copying: kernels read matrix b from the matrix stored at
     b // n. It's how grouped-query attention shares key and value heads."""
-    if self.rep > 1: return (self + 0).repeat_interleave(n)
+    if self.rep > 1: return _copy(self).repeat_interleave(n)
     v = self._view(self.rows, self.cols, self.batch * n, 0, self.bstride)
     v.rep = n
     return v._track("repeat", (self,), n)
@@ -447,12 +448,12 @@ class Tensor:
 
   @_matrices
   def merge(self):
-    """Place batch matrices side by side, reversing split: x.split(n).merge() is x. An unrealized expression
-    writes directly into the result columns. Otherwise, copy the matrices there."""
+    """Place batch matrices side by side, reversing split: x.split(n).merge() has x's values, bit for bit. An unrealized
+    expression writes directly into the result columns. Otherwise, copy the matrices there."""
     if self.cols % 32: raise ValueError(f"merge needs matrices a whole number of tiles wide, not {self.cols} columns")
     out = Tensor(self.rt, self.rows, self.batch * self.cols, dtype=self.dtype)
-    # + 0 copies a realized tensor, T or move in
-    (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))
+    if self.op in (None, "T", "move"): out.split(self.batch).assign(self)  # a copy, which keeps every bit
+    else: self.realize(out.split(self.batch))
     return out._track("merge", (self,))
 
   @property
@@ -572,7 +573,8 @@ class Tensor:
     """numpy broadcasting. A number becomes a 1 x 1 tensor of this dtype (fp32 for a float with int32). Mixed dtypes
     meet in fp32, and so does int32 for ops that have no int32 form, like mul, which is then exact below 2^24."""
     if not isinstance(x, Tensor):
-      x = self.number(x, "fp32" if self.dtype == "int32" and isinstance(x, float) else self.dtype)
+      d = "bf16" if self.dtype in BFP else self.dtype  # a block float meets a number in bf16, then both in fp32
+      x = self.number(x, "fp32" if d == "int32" and isinstance(x, float) else d)
     a, b = (x, self) if reverse else (self, x)
     if a.dtype != b.dtype or (a.dtype == "int32" and op not in INT32_OPS): a, b = a.float(), b.float()
     if (shape := _broadcast(a.shape, b.shape)) is None: raise ValueError(f"cannot broadcast {a.shape} with {b.shape}")
@@ -587,6 +589,7 @@ class Tensor:
       out.lead, key = self.lead, ("storage", self.dtype, bool(self.runs))
       return out.run(key, lambda: storage_kernel(*key[1:]), out.addr, *x._where(True), tc, self.tiles // self.batch,
                      self.rep, name="storage")._track("cast", (self,)).cast(dtype)
+    if dtype in BFP and self.dtype == "int32": return self.float().cast(dtype)  # a block float packs from floats
     if dtype != "bfp4":
       return _lead(Tensor(self.rt, self.rows, self.cols, "cast", (self,), self.batch, dtype), self.lead)
     x, tc = _plain(self.cast("bf16").realize()), -(-self.cols // 32)
@@ -640,7 +643,9 @@ class Tensor:
   def __mul__(self, x): return self._binop("mul", x)
   def __rsub__(self, x): return self._binop("sub", x, True)
   __radd__, __rmul__ = __add__, __mul__
-  def __truediv__(self, x): return self * (1 / x if isinstance(x, (int, float)) else x.reciprocal())
+  def __truediv__(self, x):  # by 0 is inf of 0's sign, so x / 0 is inf, -inf or NaN, as in numpy
+    return self * ((1 / x if x else math.copysign(math.inf, x)) if isinstance(x, (int, float)) else x.reciprocal())
+  def __rtruediv__(self, x): return self.reciprocal() * x
   # int32 subtracts exactly but multiplies through fp32
   def __neg__(self): return 0 - self if self.dtype == "int32" else self * -1
   def __lt__(self, x): return self._binop("cmplt", x)
@@ -740,9 +745,10 @@ class Tensor:
     """Multiply matrices by batch, repeating a batch of one. Products accumulate in fp32 Dst. With bf16 self, x
     may be bfp8 or bfp4 to reduce bytes read.
 
-    An fp32 operand is split into bf16 hi and lo. Three bf16 matmuls compute hi@hi, hi@lo and lo@hi in fp32, and
-    an add sums them, preserving about 16 of fp32's 24 bits. The FPU aligns groups of eight products before adding,
-    with error around 2^-11 of the largest terms. See docs/compiler.md, "Matmul precision".
+    An fp32 operand is split into bf16 hi and lo, which keep about 16 of its 24 bits. The bf16 matmuls hi@hi, hi@lo
+    and lo@hi (two of them when one operand is bf16) run in fp32, and an add sums them. The FPU aligns groups of eight
+    products before adding, so a result is good to about 2^-11 of the largest terms. See docs/compiler.md, "Matmul
+    precision".
 
     index is an int32 (rows, k) tensor. For batch entry b, index[b // k, b % k] selects a matrix from x.
     Indices are read on the chip so replay can select different experts. An index >= x.batch gives zero
@@ -868,15 +874,15 @@ class Tensor:
   # Autograd, like tinygrad's: a rule per op (_backward), made of the same lazy ops, so the backward fuses into kernels
   # too. It recomputes what the forward fused, since that wasn't stored.
   def gradient(self, *targets, gradient=None):
-    """Build d(self)/d(target) for each target as lazy tensor operations. Return None for a target that
-    self doesn't depend on. self must be scalar unless gradient supplies the derivative of the desired
-    output with respect to self. Realize all returned gradients before changing any forward operand;
-    backward() does this automatically."""
+    """Build d(self)/d(target) for each target as lazy tensor operations. Return None for a target that self
+    doesn't depend on, or that doesn't require a gradient. self must be scalar unless gradient supplies the
+    derivative of the desired output with respect to self. Realize all returned gradients before changing any
+    forward operand; backward() does this automatically."""
     if gradient is None and math.prod(self.shape) != 1:
       raise ValueError("self must be a single value, or pass gradient")
     if gradient is not None and gradient.shape != self.shape: raise ValueError("gradient must have the output's shape")
     if gradient is not None: self._same_runtime(gradient)
-    one = Tensor.full(self.rt, 1, 1, 1.0, self.dtype)._relabel(self.lead) if gradient is None else None
+    one = self.number(1.0, self.dtype)._relabel(self.lead) if gradient is None else None
     grads = {id(self): gradient if gradient is not None else one}
     wanted, found = {id(t) for t in targets}, {}
     for t in reversed(_graph(self)):
@@ -997,7 +1003,9 @@ def _backward(t, g):
     return (g.pad([(a, n - a - len(r)) for a, n, r in zip(lo, x.shape, args[0])]),)
   # sum each row's gradient into its source row: one-hot(ids)^T @ g, whose row i is 1 where ids are i
   if op == "gather":
-    return ((Tensor.of(t.rt, [[i] for i in range(x.rows)], "int32") == args[0]).bfloat16().matmul(g, x.dtype),)
+    if ("rows", x.rows) not in t.rt.numbers:  # the row numbers, made once a runtime, since a vocabulary has many
+      t.rt.numbers["rows", x.rows] = Tensor.of(t.rt, [[i] for i in range(x.rows)], "int32")
+    return ((t.rt.numbers["rows", x.rows] == args[0]).bfloat16().matmul(g, x.dtype),)
   raise NotImplementedError(f"no backward for {op}")
 
 def _fit(t):
@@ -1100,7 +1108,9 @@ def _tree(t, inputs):
   # the sweep is as long as t along the axis, or as the batch it folds. if t is a tile long there, its first reduction
   # sets it
   n = first.srcs[0].batch if sweep else ext(t._dims, axis)
-  return _expr(t, t._dims, inputs, [axis, n if n > 1 else None, set(), dtype, t, sweep]), dtype, sweep
+  kernel = [axis, n if n > 1 else None, set(), dtype, t, sweep]
+  e = _expr(t, t._dims, inputs, kernel)
+  return e, dtype, sweep if kernel[2] else None  # _expr may realize that reduction apart, and then nothing sweeps
 
 # A block-float tile's values as bf16, the way the unpacker converts them (ISA FormatConversion.md): normalized, with 7
 # bits per value. bfp4's 3 bits are shifted up to where bfp8's sit.
@@ -1121,10 +1131,10 @@ def _name(e):  # a kernel's name in profiles: its ops, operands first, each once
 
 def _expr(t, shape, inputs, kernel):
   """Build the unrealized expression under t for a kernel of t's shape. kernel holds [axis, sweep length in
-  tiles, reductions (at most two), dtype, root]. Realize dtype changes, casts, fp32 matmuls and values that
-  are constant along a kept axis separately. A reduction also runs separately if its axis or length differs,
-  or two reductions are already included. An fp32 kernel computes bf16 and casts between floats too: it reads
-  bf16 inputs as fp32, and rounds bf16 ops and casts to bf16 with ftob."""
+  tiles (matrices for a leading sweep), reductions (at most two), dtype, root, leading sweep]. Realize dtype
+  changes, casts, fp32 matmuls and values that are constant along a kept axis separately. A reduction also runs
+  separately if its axis or length differs, or two reductions are already included. An fp32 kernel computes bf16
+  and casts between floats too: it reads bf16 inputs as fp32, and rounds bf16 ops and casts to bf16 with ftob."""
   rounds = kernel[3] == "fp32" and t.dtype == "bf16" and t is not kernel[4]  # a bf16 value inside an fp32 kernel
   if t.op is None:
     assert t.dtype == kernel[3] or rounds, f"a {t.dtype} input to a {kernel[3]} kernel"
