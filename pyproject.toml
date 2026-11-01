@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # 1.27 is the first that writes a license expression (PEP 639)
 build-backend = "hatchling.build"
 
 [project]

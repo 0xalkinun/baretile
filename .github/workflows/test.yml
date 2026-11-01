@@ -1,5 +1,5 @@
-# For every pull request and every push to main: build and check the wheel on Python 3.12 to 3.14, run ruff and the
-# test suite on 120 and on 140 Tensix tiles, and alongside them the kernel tests on ttsim-chaos with timing noise. The
+# For every push to main and every pull request that changes more than Markdown: build and check the wheel on Python
+# 3.12 to 3.14, run the test suite on 120 and on 140 Tensix tiles, and alongside them the kernel tests on ttsim-chaos with timing noise. The
 # suite and the noise runs are split across runners, and each uses all of its runner's CPUs, with NumPy on one thread a
 # process. The suite includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints,
 # PyTorch, transformers or tiktoken skip themselves here. A test that takes over ten minutes prints the stacks of its
@@ -18,7 +18,9 @@ concurrency:
 permissions:
   contents: read
 jobs:
-  # whether the simulator jobs run: on a push to main, and on a pull request that changes anything but Markdown
+  # whether the simulator jobs run: on a push to main, and on a pull request that changes anything but Markdown. Only a
+  # file list that came back whole, every file of it Markdown (a rename's old name too), skips them; anything else runs
+  # them, so a failed call can't skip the tests.
   changes:
     runs-on: ubuntu-24.04
     outputs:
@@ -28,11 +30,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ github.event_name }}" != pull_request ]; then echo code=true >> "$GITHUB_OUTPUT"; exit; fi
-          others=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                   --jq '.[].filename' | grep -cv '\.md$' || true)
-          echo "code=$([ "$others" != 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-  # the links, the README's examples and the website, which a docs-only pull request runs alone
+          code=true
+          if [ "${{ github.event_name }}" = pull_request ] &&
+             files=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                     --jq '.[] | .filename, (.previous_filename // empty)') &&
+             [ -n "$files" ] && ! grep -qv '\.md$' <<< "$files"; then code=false; fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+  # ruff, and what a docs-only pull request can break: the links, the README's examples, which run on ttsim, the
+  # website's commands and the core's size as the README states it. SKIPS=fail, so a skip can't pass for a run.
   docs:
     runs-on: ubuntu-24.04
     steps:
@@ -40,8 +45,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install numpy pytest
-      - run: python -m pytest test/test_models.py -k "test_doc_links or test_readme_examples or test_website_matches_readme"
+      - name: Install clang, lld and the Python packages
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld
+          python -m pip install numpy pytest ruff
+      - run: ruff check
+      - run: python -m baretile.chip ttsim
+      - run: >-
+          python -m pytest -rs test/test_device.py::test_size test/test_models.py -k
+          "test_size or test_doc_links or test_readme_examples or test_website_matches_readme"
+        env:
+          SKIPS: fail
   package:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -94,7 +108,7 @@ jobs:
       - name: Install clang, lld and the Python packages
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
-          python -m pip install numpy pytest pytest-xdist ruff
+          python -m pip install numpy pytest pytest-xdist
       # The two-chip library that test_two_chips copies a tensor between. The one-chip library comes from
       # baretile.chip ttsim below, as it does for someone trying baretile
       - name: Download two-chip ttsim
@@ -129,7 +143,6 @@ jobs:
             kernels-
       - run: python -m baretile.chip ttsim
       - run: python -m baretile.chip check
-      - run: ruff check
       - run: |
           if [ ${{ matrix.tiles }} = 140 ]; then
             export TTSIM="$RUNNER_TEMP/ttsim-chaos/src/_out/release_bh/libttsim.so" TTSIM_CHAOS_UNHARVESTED=1
@@ -176,7 +189,7 @@ jobs:
           python -m pytest -n auto -rs --durations=20 -o faulthandler_timeout=600 test/test_models.py::test_train test/test_models.py::test_train_gpt2
           test/test_models.py::test_llama_frequencies test/test_models.py::test_tokenizer test/test_models.py::test_hf_families
           test/test_models.py::test_qwen3_moe test/test_models.py::test_qwen3_5_moe test/test_models.py::test_mxfp4
-          test/test_models.py::test_torch_frontend
+          test/test_models.py::test_torch_frontend test/test_models.py::test_autonomous_generation
         env:
           SKIPS: fail
           TINYGRAD: ${{ runner.temp }}/tinygrad
