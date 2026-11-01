@@ -513,7 +513,9 @@ class Tensor:
     # when only the result's rows matter, round the inputs' rows up to tiles, so the same kernel serves any row count
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
     reps = tuple((u.rep, u.cyc) if u.cyc else u.rep for u in inputs)
-    key = (e, shapes, dtype, self.dtype, self.rt.grid, reps, self.rt.readers, sweep)
+    wide = dtype == "fp32" and any(u.dtype == "bf16" for u in inputs)
+    formats = tuple(u.dtype for u in inputs) if wide else None  # an fp32 kernel's bf16 inputs
+    key = (e, shapes, dtype, self.dtype, self.rt.grid, reps, self.rt.readers, sweep, formats)
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
     if into is not None: self._alias(into)
     else: self.addr = self._alloc()
@@ -1020,8 +1022,9 @@ def _fit(t):
     for u in [u for u in _lazy(t, set()) if u.op == "matmul" and u.srcs[0].cols > 256]: u.realize()
     lazy = list(_lazy(t, set()))
     reads = collections.Counter(id(s) for u in lazy for s in u.srcs)
-    for x in [u.srcs[0] for u in lazy if u.op in COMBINE]:
-      if reads[id(x)] > 1 and all(u.op not in COMBINE and u.op != "matmul" for u in _lazy(x, set())): x.realize()
+    for x in [u.srcs[0] for u in lazy if u.op in COMBINE]:  # a cast of a realized tensor is only a read, though
+      if (reads[id(x)] > 1 and not (x.op == "cast" and x.srcs[0].op is None) and
+          all(u.op not in COMBINE and u.op != "matmul" for u in _lazy(x, set()))): x.realize()
   while _ops(t) > MAX_OPS:
     lazy = list(_lazy(t, set()))
     readers = collections.Counter(i for u in lazy for i in {id(s) for s in u.srcs})
@@ -1063,17 +1066,27 @@ def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (fi
   return (first, end) if first < end else (0, 0)
 
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are realized first, not fused into the same kernel
-# what a kernel for t computes with it: not the operands of a WHOLE op, unless it's a cast at the root
-def _below(t, root):  # the operands a kernel for t computes. a spread's is read in place, as an input
-  return t.srcs if t.op not in (*WHOLE, "spread") or root and t.op == "cast" else ()
-def _lazy(t, seen):  # the unrealized ops under t, t first
-  stack = [(t, True)]
+# what a kernel for t computes with it: not the operands of a WHOLE op, unless it's a cast at the root, or a cast
+# between floats in a kernel that computes in fp32
+def _below(t, root, wide):  # the operands a kernel for t computes. a spread's is read in place, as an input
+  return t.srcs if t.op not in (*WHOLE, "spread") or (root or wide and _floats(t)) and t.op == "cast" else ()
+def _floats(t): return t.dtype in ("bf16", "fp32") and t.srcs[0].dtype in ("bf16", "fp32")  # a cast's
+def _lazy(t, seen, wide=None):  # the unrealized ops under t, t first
+  stack, wide = [(t, True)], _computes(t) == "fp32" if wide is None else wide
   while stack:
     u, root = stack.pop()
     if u.op is None or id(u) in seen: continue
     seen.add(id(u))
     yield u
-    stack.extend((s, False) for s in reversed(_below(u, root)))
+    stack.extend((s, False) for s in reversed(_below(u, root, wide)))
+def _computes(t):
+  """The dtype a kernel for t computes in. bf16 that rounds an fp32 value it computes computes in fp32, with each
+  bf16 op rounded as its own kernel would round it, unless it has a matmul. Rounding an fp32 tensor that's realized,
+  or that a kernel of its own makes, like a move's, is a cast kernel of its own, so the bf16 runs on the FPU."""
+  dtype = t.srcs[0].dtype if t.op in ("cast", "matmul") else t.dtype
+  ops = list(_lazy(t, set(), False))[1:] if dtype == "bf16" else []
+  narrows = any(u.op == "cast" and _floats(u) and _bare(u.srcs[0]).op not in (None, "spread", *WHOLE) for u in ops)
+  return "fp32" if narrows and all(u.op != "matmul" for u in ops) else dtype
 
 def _ops(t): return sum(u.op not in ("lead", "spread") for u in _lazy(t, set()))  # the most ops a kernel for t holds
 
@@ -1081,7 +1094,7 @@ def _tree(t, inputs):
   """The expression that fused_kernel computes for t, with realized tensors as indices into inputs, and the dtype it
   computes in, and the first reduction's sweep through the batch, for a leading dimension. The kernel sweeps along
   that reduction's axis. Reductions along other axes, or the batch's other ways, are realized first."""
-  dtype = t.srcs[0].dtype if t.op in ("cast", "matmul") else t.dtype
+  dtype = _computes(t)
   if dtype in BFP: raise ValueError("a block float can only be a matmul's B")
   first = next((u for u in _lazy(t, set()) if u.op in COMBINE), None)
   axis, sweep = (FOLDS[first.op], first.sweep) if first is not None else (2, None)
@@ -1116,15 +1129,22 @@ def _expr(t, shape, inputs, kernel):
   """Build the unrealized expression under t for a kernel of t's shape. kernel holds [axis, sweep length in
   tiles, reductions (at most two), dtype, root]. Realize dtype changes, casts, fp32 matmuls and values that
   are constant along a kept axis separately. A reduction also runs separately if its axis or length differs,
-  or two reductions are already included."""
+  or two reductions are already included. An fp32 kernel computes bf16 and casts between floats too: it reads
+  bf16 inputs as fp32, and rounds bf16 ops and casts to bf16 with ftob."""
+  rounds = kernel[3] == "fp32" and t.dtype == "bf16" and t is not kernel[4]  # a bf16 value inside an fp32 kernel
   if t.op is None:
-    assert t.dtype == kernel[3], f"a {t.dtype} input to a {kernel[3]} kernel"
+    assert t.dtype == kernel[3] or rounds, f"a {t.dtype} input to a {kernel[3]} kernel"
     if t.runs: raise ValueError("cast a tensor by columns to bf16 for operations other than matmul's B or readback")
     return _input(t, inputs)
   if t.op == "lead": return _expr(t.srcs[0], shape, inputs, kernel)  # the same matrices
   if t is kernel[4] and t.op == "cast": return ("cast", _expr(t.srcs[0], shape, inputs, kernel))
-  if t is not kernel[4] and (t.dtype != kernel[3] or t.op == "cast" or (t.op == "matmul" and kernel[3] != "bf16")):
+  inside = kernel[3] == "fp32" and t.op == "cast" and _floats(t)
+  if t is not kernel[4] and (t.dtype != kernel[3] and not rounds or t.op == "cast" and not inside or
+                             (t.op == "matmul" and kernel[3] != "bf16")):
     return _expr(t.realize(), shape, inputs, kernel)
+  if inside:  # widening is exact, and narrowing rounds
+    e = _expr(t.srcs[0], shape, inputs, kernel)
+    return ("ftob", e) if rounds else e
   if t.op == "spread": return _input(_spread_view(t), inputs)  # read in place, like an input
   axis = kernel[0]
   if any(t._dims[ax] != shape[ax] for ax in range(3) if ax != axis): return _expr(t.realize(), shape, inputs, kernel)
@@ -1149,7 +1169,8 @@ def _expr(t, shape, inputs, kernel):
       b = (("I" + b[0], b[1], _input(picked[0].realize(), inputs)) if isinstance(b, tuple) else
            ("I", b, _input(picked[0].realize(), inputs)))
     return ("matmul", _expr(_operand(a), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
-  return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
+  e = (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
+  return ("ftob", e) if rounds else e
 
 def _bare(t):  # t without relabels, which matmul reads through, since its matrices are the same
   while t.op == "lead": t = t.srcs[0]

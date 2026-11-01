@@ -73,6 +73,17 @@ have at most fifteen operations. The compiler splits larger expressions, and
 also those with several indexed matmuls or with block-float weights in more than
 one format, which one kernel can't unpack.
 
+A kernel computes in one dtype, and a cast at its root is part of it: the
+packer writes the result in the cast's format. An fp32 kernel also computes
+casts between bf16 and fp32 inside itself. It reads a bf16 input as fp32,
+widening each tile through SrcA as a bf16 kernel loads one, since the unpacker
+can't write bf16 into an fp32 Dst. A cast to bf16 rounds as the packer would,
+and so does each bf16 op, as its own kernel would round its result. A bf16
+expression that rounds an fp32 value it computes, like an optimizer's update
+`w - (g.float() * lr).bfloat16()`, computes in fp32 for this, unless it has a
+matmul. Rounding an fp32 tensor that's already made, or that a move makes, is a
+cast kernel of its own, so the bf16 stays on the FPU. Other casts end a kernel.
+
 Reductions make passes over a line of tiles. Softmax first finds the maximum,
 then adds up the exponentials, then divides by that sum. A kernel can reduce
 along one axis. If the expression also reduces along another axis, that part

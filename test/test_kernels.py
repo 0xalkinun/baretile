@@ -23,6 +23,7 @@ def close(t, want, tol):  # checks t against numpy's answer, with tol as both th
 def bf(v): return float(bf16(v))  # rounds to bf16 the way uploads do
 
 def packed(v): return float(bf16(v, True))  # rounds to bf16 the way the packer does, half up
+def packed_all(a): return bf16(a, True).astype(np.float32)  # each value, as the packer and ftob round it
 
 def gelu(a): return 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3)))  # GPT-2's, in numpy
 
@@ -1018,6 +1019,27 @@ def test_fused_cast(chip):
     t = build()
     t.srcs[0].realize()
     assert fused.tobytes() == t.realize().tobytes()
+
+def test_casts_inside(chip):
+  # An fp32 kernel reads bf16 inputs, widening each tile through SrcA as it loads it (tensix.widen), and computes casts
+  # between floats inside itself: widening is exact, and narrowing rounds like the packer (ftob). A bf16 tree that rounds
+  # an fp32 value it computes runs in fp32 too, each bf16 op rounded as its own kernel would, unless it has a matmul.
+  # So bf16 with fp32, a bf16 update by an fp32 rate, an fp32 sum of bf16 products and a softmax of bf16 in fp32 are one
+  # kernel each, fp32's ops are numpy's float32, and sums are within its rounding. On one worker, and on many.
+  rng = np.random.default_rng(90)
+  for workers in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, end=workers)
+    a, b = (Tensor.of(rt, rng.normal(0, 2, (70, 100)).tolist()) for _ in range(2))
+    x, lr = Tensor.of(rt, rng.normal(0, 2, (70, 100)).astype(np.float32).tolist(), "fp32"), Tensor.of(rt, [[0.01]], "fp32")
+    A, B, X, LR = (value(t).astype(np.float32) for t in (a, b, x, lr))
+    e = np.exp(A - A.max(-1, keepdims=True))
+    for build, want, exact in [(lambda: a + x, A + X, True),
+                               (lambda: a - (b.float() * lr).bfloat16(), packed_all(A - packed_all(B * LR)), True),
+                               (lambda: (a * b).float().sum(-2), packed_all(A * B).sum(-2, keepdims=True), False),
+                               (lambda: a.float().softmax(-1), e / e.sum(-1, keepdims=True), False)]:
+      launches, got = rt.launches, value(build())
+      assert kernels(rt, launches) == 1 and got.shape == want.shape
+      assert np.array_equal(got, want) if exact else np.allclose(got, want, rtol=1e-5, atol=1e-6), np.abs(got - want).max()
 
 def test_assign(chip):
   # assign writes a new value into the tensor's DRAM, so views of it see the value and a jit call can update weights.

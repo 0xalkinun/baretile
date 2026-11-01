@@ -273,7 +273,10 @@ to bf16, so it's baretile's bf16 matmul, and the elementwise ops after it, like
 a bias and an activation, join its kernel. A matmul that more than one kernel
 reads is computed once, on its own. A matmul that baretile cuts into parts
 along K, as it can for a single row of tiles, keeps the fp32 sum, since in bf16
-each part would round.
+each part would round. tinygrad's casts between bf16 and fp32 don't end a kernel
+either ([the compiler](compiler.md#fusion-and-reductions) computes them inside
+an fp32 one), so a bf16 weight's update by tinygrad's fp32 learning rate is one
+kernel, and a bias's, with its gradient's sum in fp32.
 
 A sum of `where(ids == arange, x, 0)`, as tinygrad's `Embedding` is, takes each
 id's row of `x` with one `gather` when it sums along the arange, so it never

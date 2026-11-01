@@ -54,7 +54,7 @@ def config(**fields):  # backend config as {word index: value}. fields left out 
   return regs
 
 FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32, "int32": bh.INT32, "bfp8": bh.BFP8, "bfp4": bh.BFP4}
-def kernel_config(dtype="bf16", out="bf16", transposing=False):
+def kernel_config(dtype="bf16", out="bf16", transposing=False, wide=False):
   """Build the unpacker and packer configuration for a kernel.
 
   UNPACR reads 1024 values per tile. Its Z counter selects an L1 slot with a stride of one tile.
@@ -66,8 +66,10 @@ def kernel_config(dtype="bf16", out="bf16", transposing=False):
   slot with a stride of one output tile.
 
   Base addresses use 16-byte units minus 1. Unpacker 0's rows have a bias of 4 (64 values).
-  With transposing, unpacker 0 transposes each 16 x 16 face as it enters SrcA."""
+  With transposing, unpacker 0 transposes each 16 x 16 face as it enters SrcA. With wide, an fp32 kernel reads bf16
+  inputs too (widen), and unpacker 1 reads its zeros as bf16."""
   base, fmt, pack = slot_base(dtype) // 16 - 1, FORMAT[dtype], FORMAT[out]
+  zeros = FORMAT["bf16"] if wide else fmt  # unpacker 1's
   # The packer's own input format. Packing a block float from fp32 rounds each value once. From bfp8 it would round
   # twice.
   late = bh.FP32 if out in BFP else pack
@@ -85,8 +87,8 @@ def kernel_config(dtype="bf16", out="bf16", transposing=False):
                 SEC0_dest_addr=64, SEC0_tile_x_dim=1024, SEC0_offset=0, SEC0_Haloize_mode=int(transposing),
                 SEC0_uncompressed_1=1, SEC0_to_dst_1=1, SEC0_base_1=base, SEC0_dest_addr_1=64, SEC0_tile_x_dim_1=1024,
                 SEC0_offset_1=0,
-                SEC1_format=fmt, SEC1_x_dim=1024, SEC1_y_dim=1, SEC1_z_dim=1, SEC1_out_format=fmt, SEC1_uncompressed=1,
-                SEC1_base=base)
+                SEC1_format=zeros, SEC1_x_dim=1024, SEC1_y_dim=1, SEC1_z_dim=1, SEC1_out_format=zeros,
+                SEC1_uncompressed=1, SEC1_base=base)
 
 # Address modes of the math thread, as (SrcA step, SrcB step) and (Dst step, fidelity step). Modes 0-1 are for
 # elementwise ops, 2-3 for SFPU loads and stores (the store steps Dst by 2), and 4-7 for matmul. Each kind of op has its
@@ -150,9 +152,19 @@ def fill(slot, row):
   return [setadc(bh.UNPACK0, slot),
           field(ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=1, channel_index=1, value=0), row),
           ins("UNPACR", last=1, ovrd_thread_id=1)]
+# An fp32 kernel's math thread puts a bf16 tile into Dst as fp32, d rows past its aim, as a bf16 kernel loads one:
+# through SrcA, plus zeros in SrcB. Unpacker 0 can't widen bf16 into Dst (ISA FormatConversion.md), so it switches to
+# bf16 and to context 0 for the tile, with the thread config that unpacking into SrcA takes, and back once the tile is
+# in. A bf16 tile takes half an fp32 slot, so slot s is bf16 tile 2s.
+def widen(slots, slot, d):
+  fmt = lambda f: reconfigure(SEC0_format=f, SEC0_out_format=f)
+  srca = lambda on: [ins("SETC16", setc16_reg=bh.THREAD_CFG[r], setc16_value=v) for r, v in
+                     (("UNPACK_MISC", 1 - on), ("SRCA_SET", bh.SRCA_SET_BY_ADDR * on))]
+  z = 2 * slot if isinstance(slot, int) else f"2 * ({slot})"
+  return fmt(bh.BF16) + srca(1) + unpack(z, ZERO_SLOT) + fmt(bh.FP32) + srca(0) + elementwise("add", slots, dst=d)
 # the SFPU and the sync unit wait for the fills
 FILLED = [ins("STALLWAIT", stall_res=bh.STALL_SFPU | bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK0)]
-def reconfigure(**fields):  # rewrites config fields of the unpackers from thread 0, a byte at a time
+def reconfigure(**fields):  # rewrites config fields of the unpackers from the thread that unpacks, a byte at a time
   # RMWCIB keeps the rest of the word. The writes wait for unpacker 0 to finish its unpacks so far, or for both
   # unpackers when a field belongs to unpacker 1. The next unpack waits for the writes.
   writes = [ins(f"RMWCIB{b}", cfg_reg_addr=word, data=v << first >> 8 * b & 255,
@@ -642,14 +654,15 @@ def elementwise(op, slots, dst=0):
   fpu = {"add": "ELWADD", "sub": "ELWSUB"}[op]
   return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [release(ins(fpu, dst=dst))]
 
-def reduce_step(kind, slots, acc, first, edge=0, src=None):
+def reduce_step(kind, slots, acc, first, edge=0, src=None, wide=False):
   """Accumulate one tile of a reduction. Load bf16 through SrcA plus zeros in SrcB, or fill fp32 from L1 slot
-  src. Put the first tile in the accumulator after waiting for it to become free. Load subsequent tiles into
-  scratch and combine them with the SFPU. For a partial final tile, edge gives the number of valid rows or
-  columns along the reduction axis."""
+  src, or with wide widen bf16 from it. Put the first tile in the accumulator after waiting for it to become free.
+  Load subsequent tiles into scratch and combine them with the SFPU. For a partial final tile, edge gives the number
+  of valid rows or columns along the reduction axis."""
   row, sem = ACCS[acc]
   mask = lambda d: MASK[FOLDS[kind]](kind, edge, d) if edge else []
-  put = lambda d: fill(src, row + d) + FILLED if src is not None else elementwise("add", slots, dst=d)
+  from_slot = lambda d: widen(slots, src, d) if wide else fill(src, row + d) + FILLED
+  put = lambda d: from_slot(d) if src is not None else elementwise("add", slots, dst=d)
   if first: return take(sem) + aim(row) + put(0) + mask(0)
   return aim(row) + put(128) + mask(128) + SFPU_START + runs(slots, kind, 32)
 # folds across the tile and runs the SFPU ops on the result, before MATH_END
@@ -949,14 +962,16 @@ static unsigned landed_chunk(unsigned m, unsigned n) {{
   while (relayed < needed) relay();  // takes the remaining reports, whichever thread unpacked
 }}"""
 
-# TRISC1. With dst, it does the unpacking into Dst, so it waits for BRISC's fetches too.
-def math_program(slots, body, dst=False, decls=""):
+# TRISC1. With dst, it does the unpacking into Dst, so it waits for BRISC's fetches too. With wide, it also unpacks
+# bf16 inputs into SrcA and zeros into SrcB (widen).
+def math_program(slots, body, dst=False, decls="", wide=False):
+  units = UNPACKERS if wide else bh.UNPACK0
   return TRISC + decls + f"""
 static unsigned needed;
 // waits for BRISC to fetch the next tiles
 static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}
 {KMAIN}
-  {tt(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + [CC_OFF])} {_pushes(math_runs(slots))}
+  {tt(thread(dst) + (counters(units, 1024) if dst else []) + [CC_OFF])} {_pushes(math_runs(slots))}
   while (!peek(READY)) {{}}  // waits for TRISC0 to set up the backend config and the semaphores
   unsigned tiles = 0, h = 0;  // h: the first row of the Dst half that the next op gets
 {body}

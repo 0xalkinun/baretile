@@ -467,6 +467,36 @@ def test_tinygrad_mse_training_replays(chip):
   assert np.allclose(got, want, rtol=1e-3), (got, want)
 
 
+def test_tinygrad_bf16_sgd(chip):
+  # A bf16 SGD step as tinygrad writes it: the learning rate is fp32, so each update is bf16(fp32(g) * lr), and a bias's
+  # gradient sums bf16 in fp32. An fp32 kernel computes casts between floats inside itself, so each parameter's update
+  # is one kernel, a bias's with its sum, and no kernel only casts. The weights stay within bf16's rounding of the CPU's.
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, TinyJit, dtypes, nn
+  from tinygrad.helpers import Context
+  rng = np.random.default_rng(90)
+  w, b = rng.standard_normal((16, 40)).astype(np.float32) * 0.2, rng.standard_normal(16).astype(np.float32) * 0.1
+  data = rng.standard_normal((4, 2, 8, 40)).astype(np.float32)
+  def run(device):
+    layer, names = nn.Linear(40, 16), []
+    layer.weight, layer.bias = (Tensor(a, device=device).cast(dtypes.bfloat16).realize() for a in (w, b))
+    opt = nn.optim.SGD([layer.weight, layer.bias], lr=0.1)
+    @TinyJit
+    def step(x, y):
+      with Context(TRAINING=1):
+        loss = ((layer(x) - y) ** 2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+      return loss.realize()
+    for x, y in data:
+      start = adapter.RT.launches
+      step(*(Tensor(a, device=device).cast(dtypes.bfloat16) for a in (x, y[:, :16])))
+      if device == "BARETILE": names = [(name, n) for name, n, _, _ in adapter.RT.profile(start)]
+    return layer.weight.float().numpy(), layer.bias.float().numpy(), names
+  (gw, gb, names), (ww, wb, _) = run("BARETILE"), run("CPU")
+  assert {("mul ftob add", 1), ("sum1 ftob mul add", 1)} <= set(names) and all(n != "cast" for n, _ in names), names
+  for got, want in ((gw, ww), (gb, wb)): assert np.allclose(got, want, rtol=2**-6, atol=2**-8), np.abs(got - want).max()
+
+
 def test_tinygrad_host_materialize(chip):
   # Padding on six axes takes six runs of axes, where a move maps five, so it goes through the host, and a TinyJit
   # can't replay that frozen upload: each call runs. Padding on two of three axes is one move on the chip, over the

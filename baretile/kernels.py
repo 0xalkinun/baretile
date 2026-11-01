@@ -13,7 +13,7 @@ from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_O
                              mask_columns, mask_rows_at, math_begin, math_program, matmul, pack, pack_program,
                              reconfigure, reduce_finish, reduce_step, reload, repack, setadc, sfpu, sfp_bits, sfp_load,
                              sfp_store, slot_base, step_unpack, table, tile_bytes, tile_of, tt, unpack, unpack_program,
-                             walk)
+                             walk, widen)
 
 def grid_parts(rt, w, kt, grid, base, more=0):
   """Choose L1 buffers for a grid matmul (mc) producing rt x w tiles with kt tiles along K. Slots below base
@@ -38,7 +38,7 @@ def grid_parts(rt, w, kt, grid, base, more=0):
           return -(-kt // -(-kt // kp)), q, acc  # make the parts as even as possible
   return False
 
-def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None, leading=None):
+def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None, leading=None, formats=None):
   """Compile an expression into one kernel. Return (image, work units).
 
   Expressions use nested tuples. An integer refers to an input by its index in shapes:
@@ -62,6 +62,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   spread over the result's leading dimensions has (rep, n) there, and matrix b reads (b // rep) % n. leading, for a
   reduction over the batch, is (K, S): result matrix b folds K matrices S apart, from b // S * K * S + b % S on, as
   for a leading dimension of K with S matrices to each step of it. Without it, the batch folds into one matrix.
+  formats gives each input's dtype, by default dtype: an fp32 kernel can read bf16 inputs, which it widens as it loads.
 
   Kernel arguments:
   - a[0:2]: first work unit and unit count.
@@ -106,6 +107,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       count(c)
   count(expr)
   out, dst = out or dtype, dtype != "bf16"  # dst: the math thread fills Dst from L1 and the SFPU does all the math
+  wide = {r for r, f in enumerate(formats or ()) if f != dtype}  # the bf16 inputs of an fp32 kernel
+  assert not wide or dtype == "fp32" and {formats[r] for r in wide} == {"bf16"}, "only fp32 kernels widen, and bf16"
   # ops is a list of dicts with kind, x, y, posts and shape. A matmul's also has ids, bt, wt, bc, kt and phases.
   # refs maps each subexpression to its input number or ("op", j).
   ops, refs = [], {}
@@ -144,7 +147,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     return refs[e]
   root = visit(expr)[1]
   # If the root packs as another dtype, the packer switches for the root's pack and back. A lone op needs no switch.
-  cfg, root_cfg = kernel_config(dtype, out if len(ops) == 1 else dtype), kernel_config(dtype, out)
+  cfg, root_cfg = (kernel_config(dtype, out if len(ops) == 1 else dtype, wide=bool(wide)),
+                   kernel_config(dtype, out, wide=bool(wide)))
   around = (tt(repack(cfg, root_cfg)), tt(repack(root_cfg, cfg))) if out != dtype and len(ops) > 1 else ("", "")
   # op j's pack. The root's packs as out
   repacked = lambda j, words: f"{around[0]} {tt(words)} {around[1]}" if j == root else tt(words)
@@ -189,8 +193,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   assert not (dst and matmuls), "only bf16 kernels have matmuls"
   base = FRAMES + 2 * frame + len(ops)  # the first slot past the frames and the narrow ops
   rows_at, top = [], base  # where each matmul keeps its row of A in L1, or None if it doesn't fit and A streams too
-  if not (top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS):
-    raise ValueError("too many tiles in a kernel")
+  if not (top <= UNPACKABLE // (2 if wide else 1) and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS):
+    raise ValueError("too many tiles in a kernel")  # tensix.widen reads a bf16 input's slot s at 2s
   for j in matmuls:
     fits = top + ops[j]["kt"] <= UNPACKABLE
     rows_at.append(top if fits else None)
@@ -315,11 +319,12 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # twice.
   kept, passes_of, narrow = ({}, lambda r: [p for p in range(last + 1) if r in reads[p]],
                              lambda r: ext(shapes[r], axis) == 1)
-  # the slots an unpacker reads, below the outputs
+  # the slots an unpacker reads, below the outputs, and below half of them for a bf16 input of an fp32 kernel
   room = min(UNPACKABLE, (OUTS - slot_base(dtype)) // tile_bytes(dtype))
+  fits = lambda r, n: top + n <= (min(room, UNPACKABLE // 2) if r in wide else room)  # n slots of input r, from top
   for r in range(inputs) if reducing else ():
-    if narrow(r) and passes_of(r) and top < room: kept[r], top = top, top + 1
-    elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= room: kept[r], top = top, top + L
+    if narrow(r) and passes_of(r) and fits(r, 1): kept[r], top = top, top + 1
+    elif not narrow(r) and len(passes_of(r)) > 1 and fits(r, L): kept[r], top = top, top + L
   # the last pass that reads a kept input: of the narrow inputs if keep is True, of the others if not
   last_read = lambda keep: max([passes_of(r)[-1] for r in kept if narrow(r) == keep], default=None)
   # In passes, a matmul computed in several passes, like the scores under a softmax, keeps the line's tiles of B in L1
@@ -337,7 +342,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # past A's rows and B's buffers
   elif kept_b is not None: top = max(top, kept_b + (3 if mc else 1) * ops[matmuls[0]]["kt"])
   for r in range(inputs) if not reducing else ():
-    if all(ext(shapes[r], ax) == 1 for ax in range(3)) and top < room: single[r], top = top, top + 1
+    if all(ext(shapes[r], ax) == 1 for ax in range(3)) and fits(r, 1): single[r], top = top, top + 1
   if long: rows_at, top = [top], top + ops[matmuls[0]]["kt"]  # past the singles, which stay below slot 256
   # a block-float B goes past it, or at B8
   b8_at = slot_base(dtype) + top * tile_bytes(dtype) if long or parts and b8 else None
@@ -384,11 +389,15 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # BRISC's fetch of input r in pass p. It goes into the frame, or into its kept slot in the first pass that reads it,
   # once the line before is done with that slot. A single input comes with the first tile, which tiles already counts.
   def fetch(p, r):
-    if r in single: return f"if (tiles == 1) get(a[{arg(r)}], {tile(r)}, {single[r]});"
-    if r not in kept: return f"get(a[{arg(r)}], {tile(r)}, {slot(r)});"
+    get = "get16" if r in wide else "get"
+    if r in single: return f"if (tiles == 1) {get}(a[{arg(r)}], {tile(r)}, {single[r]});"
+    if r not in kept: return f"{get}(a[{arg(r)}], {tile(r)}, {slot(r)});"
     if p != passes_of(r)[0]: return ""
-    return (f"if (k == 0) {{ reached(narrow_done); get(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
-            f"reached(kept_done[k]); get(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
+    return (f"if (k == 0) {{ reached(narrow_done); {get}(a[{arg(r)}], {tile(r)}, {kept[r]}); }}" if narrow(r) else
+            f"reached(kept_done[k]); {get}(a[{arg(r)}], {tile(r)}, {kept[r]} + k);")
+  if wide:  # a bf16 tile into an fp32 slot
+    decls += ("static void get16(unsigned base, unsigned t, unsigned slot) "
+              f"{{ noc_get(BANK(t), AT(base, t, {tile_bytes('bf16')}), SLOT(slot), {tile_bytes('bf16')}); }}\n")
   if kept: decls += "static unsigned narrow_done;  // events once the line before has last read a kept slot\n"
   if any(not narrow(r) for r in kept): decls += f"static unsigned kept_done[{L}];\n"
   picked = [ops[j]["ids"] for j in matmuls if ops[j]["ids"] is not None]  # the int32 tensor that picks B's matrices
@@ -585,8 +594,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
       x, y = slot(op["x"]), slot(op["y"])
       prog = sfpu([sfpu_name(op)], slots) if sfpu_op(op) else []
-      if dst:  # the math thread fills x into the op's Dst half and y 128 rows on, then runs the SFPU
-        fills = fill(x, "h") + (fill(y, "h + 128") if op["y"] != "zero" else []) + FILLED
+      if dst:  # the math thread fills or widens x into the op's Dst half and y 128 rows on, then runs the SFPU
+        load = lambda r, s, d: widen(slots, s, d) if r in wide else fill(s, f"h + {d}" if d else "h")
+        fills = load(op["x"], x, 0) + (load(op["y"], y, 128) if op["y"] != "zero" else []) + FILLED
         math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], slots))
         c[M].append(f"{cond}{{ {drain}{math} {math_end(j)} h ^= {DST_HALF};{posted} }}")
         continue
@@ -606,8 +616,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       end = f"k == {L - 1}" if swept(x) else "k == 0"  # the line's last tile. A narrow operand is one tile a line
       src = slot(x) if dst else None
       def step(first):  # the last tile's padding must not count
-        plain, cut = (tt(reduce_step(kind, slots, acc, first, 0, src)),
-                      tt(reduce_step(kind, slots, acc, first, edge, src)))
+        plain, cut = (tt(reduce_step(kind, slots, acc, first, 0, src, x in wide)),
+                      tt(reduce_step(kind, slots, acc, first, edge, src, x in wide)))
         return f"if ({end}) {{ {cut} }} else {{ {plain} }}" if edge else plain
       finish, posted = (f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}',
                         "" if j == root else " posted++;")
@@ -723,7 +733,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   brisc = brisc_program(total, first + program(B), dtype, out, decls + indices, tail, b8, wt, b8_at=b8_at,
                         near=bool(local))
   image = compile_kernel(brisc, unpack_program(program(U), cfg, indices + ours),
-                         math_program(slots, program(M), dst, indices + ours), pack_program(program(P), decls=ours))
+                         math_program(slots, program(M), dst, indices + ours, bool(wide)),
+                         pack_program(program(P), decls=ours))
   return image, (nb * rt * w // L if reducing else nb * br * bc)  # and the number of units in the result
 
 def attention_l1(ht, R, wt, parts):
