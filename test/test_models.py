@@ -1136,6 +1136,9 @@ def test_generation_defaults():
   assert serve.generation_defaults({"eos_token_id": 1, "text_config": {"top_p": 0.9}}, {"temperature": 0.5}) == \
     ([1], dict(top_p=0.9, temperature=0.5))
   assert serve.generation_defaults({}, {}) == ([], {})
+  # With no eos_token_id anywhere, the EOS is tokenizer_config.json's eos_token. An explicit null still means none.
+  assert serve.generation_defaults({}, {}, [7]) == ([7], {}) and serve.generation_defaults(model, {}, [7])[0] == [2]
+  assert serve.generation_defaults({"eos_token_id": None}, {}, [7])[0] == []
 
 def test_tokenizer(tmp_path):
   # llama.Tokenizer must encode like tiktoken over the same tokenizer.json, and decode back, with the pre-tokenizers of
@@ -2034,7 +2037,7 @@ def test_batched_decode(chip):
 @pytest.mark.skipif(pci.simulator() is None, reason="the server opens the device itself, and a card can't be open in two processes")
 def test_serve_command(tmp_path):
   # python3 -m baretile.models.serve serves a model folder, which is what fetch makes of a Hugging Face ID, as in the
-  # README. A small random Llama answers a completion over HTTP.
+  # README. A small random Llama answers a completion over HTTP, and a chat in the default of its named chat templates.
   import socket, subprocess, urllib.request
   rng, dim, ffn, vocab = np.random.default_rng(5), 64, 128, 256
   w = lambda *shape: (rng.normal(0, 0.1, shape).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
@@ -2047,6 +2050,9 @@ def test_serve_command(tmp_path):
                                                     "num_hidden_layers": 1, "rms_norm_eps": 1e-5, "rope_theta": 1e4, "max_position_embeddings": 64,
                                                     "vocab_size": vocab, "intermediate_size": ffn}))
   bytes_tokenizer(tmp_path)
+  # Some checkpoints keep named chat templates. chat uses the default
+  (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": [{"name": "tool_use", "template": "{{ tools }}"},
+                                                                               {"name": "default", "template": "<|im_start|>"}]}))
   with socket.socket() as s:
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -2060,50 +2066,76 @@ def test_serve_command(tmp_path):
     ask = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions", json.dumps({"prompt": "Hi", "max_tokens": 3, "temperature": 0}).encode())
     reply = json.load(urllib.request.urlopen(ask, timeout=600))
     assert reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 3, reply
+    ask = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                                 json.dumps({"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 2, "temperature": 0}).encode())
+    reply = json.load(urllib.request.urlopen(ask, timeout=600))
+    assert reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 2, reply
   finally:
     server.kill()
     server.wait()
 
 def test_serve_timeout(tmp_path):
-  # A non-streaming request that receives no text within wait seconds must get HTTP 504 and release its slot.
-  # The stand-in engine accepts requests without answering.
+  # A request that receives no text within wait seconds must release its slot. A complete response gets HTTP 504, and a
+  # stream ends with a chunk whose finish_reason is error, then [DONE]. The stand-in engine accepts requests without answering.
   import queue, urllib.error, urllib.request
   class Hung:
-    tok, places, waiting, room = bytes_tokenizer(tmp_path), 64, queue.Queue(), threading.BoundedSemaphore(1)
+    tok, places, waiting, room = bytes_tokenizer(tmp_path), 64, queue.Queue(), threading.BoundedSemaphore(2)
     lock, failed, busy = threading.Lock(), False, [None]
     offer = serve.Engine.offer
   hung = Hung()
   http = serve.server(hung, "hung", port=0, wait=0.2)
   threading.Thread(target=http.serve_forever, daemon=True).start()
-  with pytest.raises(urllib.error.HTTPError) as e:
-    urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/completions",
-                                                  json.dumps({"prompt": "Hi"}).encode(), {"Content-Type": "application/json"}), timeout=60)
-  http.shutdown()
+  post = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/completions",
+                                                                    json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=60)
+  with pytest.raises(urllib.error.HTTPError) as e: post({"prompt": "Hi"})
   assert e.value.code == 504 and hung.waiting.get_nowait().gone, "the engine should drop a request that timed out"
+  data = post({"prompt": "Hi", "stream": True}).read().decode()
+  http.shutdown()
+  last = json.loads(data.split("\n\n")[-3].removeprefix("data: "))
+  assert data.endswith("data: [DONE]\n\n") and last["choices"][0]["finish_reason"] == "error" and "no text came" in last["error"]["message"], data
+  assert hung.waiting.get_nowait().gone
 
 def test_serve_hangup(tmp_path):
-  # A client that hangs up before its answer is done lets its slot go within a second, streamed or not. The stand-in
-  # engine sends a piece every 10 ms until the request is gone.
-  import socket
+  # A client that hangs up before its answer is done lets its slot go within a second, streamed or not, and so does one
+  # that resets the connection before the stream's headers are written. Bytes after a request's body, as some clients
+  # send a CRLF, are no hangup, and a client that shuts its socket for writing still gets its stream. The stand-in
+  # engine sends a piece every 10 ms until the request is gone or has max_tokens pieces.
+  import socket, struct
   class Chatty:
-    tok, places, busy, made = bytes_tokenizer(tmp_path), 64, [None], []
+    tok, places, busy, made, pause = bytes_tokenizer(tmp_path), 64, [None], [], 0
     def offer(self, r):
       self.made.append(r)
       def run():
-        while not r.gone: r.out.put("."), time.sleep(0.01)
+        while not r.gone and len(r.made) < r.max_tokens: r.made.append(46), r.out.put("."), time.sleep(0.01)
+        r.finish = "gone" if r.gone else "length"
+        r.out.put(None)
       threading.Thread(target=run, daemon=True).start()
+      time.sleep(self.pause)  # so the client can leave first
       return True
   chatty = Chatty()
   http = serve.server(chatty, "chatty", port=0)
   threading.Thread(target=http.serve_forever, daemon=True).start()
+  def ask(stream, tokens=1000):
+    s, n = socket.create_connection(("127.0.0.1", http.server_address[1]), timeout=5), len(chatty.made)
+    body = json.dumps({"prompt": "Hi", "max_tokens": tokens, "stream": stream}).encode()
+    s.sendall(b"POST /v1/completions HTTP/1.0\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+    until(lambda: len(chatty.made) == n + 1, "the request reached the engine")
+    return s
   try:
     for stream in (False, True):
-      body = json.dumps({"prompt": "Hi", "max_tokens": 1000, "stream": stream}).encode()
-      with socket.create_connection(("127.0.0.1", http.server_address[1]), timeout=5) as s:
-        s.sendall(b"POST /v1/completions HTTP/1.0\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
-        until(lambda: len(chatty.made) == 1 + stream, "the request reached the engine")
-        time.sleep(0.1)
+      with ask(stream): time.sleep(0.1)
       until(lambda: chatty.made[-1].gone, "the request whose client hung up should end", 2)
+    chatty.pause = 0.3
+    with ask(True) as s: s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # closing resets it
+    until(lambda: chatty.made[-1].gone, "a stream whose client left before its headers should end", 2)
+    chatty.pause = 0
+    with ask(False, 50) as s:  # 0.5 s of pieces
+      time.sleep(0.1)
+      s.sendall(b"\r\n")
+      assert json.loads(received(s).partition(b"\r\n\r\n")[2])["choices"][0]["text"] == "." * 50
+    with ask(True, 3) as s:
+      s.shutdown(socket.SHUT_WR)
+      assert received(s).endswith(b"data: [DONE]\n\n"), "a client that half-closes still gets its stream"
   finally: http.shutdown(); http.server_close()
 
 def bytes_tokenizer(folder):  # writes a byte-level vocabulary of the 256 bytes to tokenizer.json in folder
@@ -2167,6 +2199,33 @@ def test_request_inputs(tmp_path):
   r = serve.Request(bytes_tokenizer(tmp_path), [1], temperature=0, logprobs=20)
   r.take(np.array([0., 1., 2.]), True)
   assert r.made == [2] and [t for t, _ in r.probs[0][2]] == [2, 1, 0], "logprobs can exceed a small vocabulary"
+
+def test_stop_logprobs(tmp_path):
+  # When a stop string cuts the text, the log probabilities are those of the tokens that spell the text that's left.
+  tok = bytes_tokenizer(tmp_path)
+  for text, stop, kept in (("abc STOP", "STOP", "abc "), ("aé", "é", "a"), ("ab", "a", "")):
+    r = serve.Request(tok, [], 20, 0, stop=[stop], logprobs=0)
+    for b in text.encode():
+      if r.take(np.eye(256)[b], True): break
+    assert r.finish == "stop" and r.said == kept and bytes(t for t, _, _ in r.probs) == kept.encode(), (text, r.probs)
+
+def test_constraint_scan():
+  # When 32 draws don't fit an output constraint, Request.pick tries the 4,096 likeliest tokens in order and no more,
+  # since each try decodes the whole output again, on the thread that decodes every slot.
+  tried = []
+  def nothing(text, pending=b""): tried.append(text); return 1 if text == "" else 0  # only the empty text fits, and isn't complete
+  r = serve.Request(SimpleNamespace(bytes={i: b"x" for i in range(20000)}), [], 5, 1.0, seed=0, shape=nothing)
+  with pytest.raises(ValueError, match="no token"): r.pick(serve.Head.of(np.random.default_rng(0).normal(0, 1, 20000)))
+  assert len(tried) <= 32 + 4096 + 1, len(tried)
+
+def test_session_order():
+  # Saving a slot whose tokens are a session already makes that session the most recently used, the last to be evicted.
+  import collections
+  engine = object.__new__(serve.Engine)
+  engine.held, engine.coherent, engine.park, engine.keep = [[1, 2]], [True], 1, 1
+  engine.sessions = collections.OrderedDict([((1, 2), "kept"), ((3,), "other")])
+  engine.save(0)
+  assert list(engine.sessions.items()) == [((3,), "other"), ((1, 2), "kept")]
 
 def test_sampling_boundaries(chip):
   # Small finite temperatures must not overflow either the inverse temperature or the device normalization.
@@ -2384,9 +2443,10 @@ def test_tokenizer_without_specials(tmp_path):
 def test_serve_bad_requests(tmp_path):
   import urllib.error, urllib.request
   class Stand:
-    tok, places, failed, busy = bytes_tokenizer(tmp_path), 64, False, [None]
+    tok, places, failed, busy, refuse = bytes_tokenizer(tmp_path), 64, False, [None], None
     def offer(self, r):
       if self.failed: raise RuntimeError("engine failed")
+      if self.refuse: raise ValueError(self.refuse)  # as Engine.offer refuses a prompt too long for a slot
       self.last, r.finish = r, "stop"
       r.end()
       return True
@@ -2411,7 +2471,13 @@ def test_serve_bad_requests(tmp_path):
     ask(hi([{"type": "text", "text": "H"}, {"type": "text", "text": "i"}]), chat=True)
     assert stand.last.ids == ids, "text parts join into the message's text"
     assert json.load(ask({"prompt": "Hi"}))["choices"][0]["finish_reason"] == "stop"
-    stand.failed = True
+    # Each response has an id of its own, though CPython gives a freed Request's address to the next. A prompt offer refuses gets 400
+    named = [json.load(ask({"prompt": "Hi"}))["id"] for _ in range(4)]
+    assert len(set(named)) == 4 and all(re.fullmatch("baretile-[0-9a-f]{32}", i) for i in named), named
+    stand.refuse = "a prompt needs 1 to 62 tokens, not 70"
+    with pytest.raises(urllib.error.HTTPError) as e: ask({"prompt": "Hi"})
+    assert e.value.code == 400 and json.load(e.value)["error"]["message"] == stand.refuse
+    stand.refuse, stand.failed = None, True
     with pytest.raises(urllib.error.HTTPError) as e: ask({"prompt": "Hi"})
     assert e.value.code == 503
   finally: http.shutdown(); http.server_close()
@@ -2526,8 +2592,24 @@ def test_schema_edges():
   def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
   for schema in ({"$ref": "#/$defs/loop", "$defs": {"loop": {"$ref": "#/$defs/loop"}}},
                  {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}},
-                 {"type": 3}, {"type": []}, {"anyOf": []}, {"items": 3}, {"maxItems": -1}):
+                 {"type": 3}, {"type": []}, {"anyOf": []}, {"allOf": []}, {"items": 3}, {"maxItems": -1}):
     with pytest.raises(ValueError): fits(schema)
+  # A keyword that formatted would ignore is refused by name. Annotations and the bounds it documents as unenforced are accepted
+  for schema, named in (({"not": {"type": "string"}}, "not"),
+                        ({"type": "array", "prefixItems": [True], "uniqueItems": True}, "prefixItems, uniqueItems"),
+                        ({"properties": {"a": {"if": {}, "then": {}}}}, "if, then"), ({"anyOf": [{"minProperties": 1}]}, "minProperties"),
+                        ({"allOf": [{"patternProperties": {}}]}, "patternProperties")):
+    with pytest.raises(ValueError, match=f"unsupported schema keywords: {named}$"): fits(schema)
+  marked = {"title": "T", "description": "d", "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "x", "examples": [1],
+            "default": 1, "deprecated": False, "readOnly": True, "writeOnly": False, "$comment": "c", "type": "integer"}
+  assert fits(marked)("1") == 2 and fits(marked)('"1"') == 0
+  assert fits({"type": "string", "pattern": "^a", "format": "date", "minLength": 3})('"b"') == 2 and fits({"minimum": 5})("1") == 2
+  every = fits({"allOf": [{"type": "integer"}, {"enum": [1, 2, "x"]}]})
+  assert every("1") == 2 and every('"x"') == 0 and every("3") == 0
+  # older pydantic puts a described $ref in allOf
+  wrapped = fits({"type": "object", "properties": {"a": {"allOf": [{"$ref": "#/$defs/n"}], "description": "a number"}},
+                  "$defs": {"n": {"type": "integer"}}})
+  assert wrapped('{"a": 1}') == 2 and wrapped('{"a": "s"}') == 0
   assert fits(False)("null") == 0 and fits(True)("null") == 2
   assert fits({"type": "object", "properties": {"x": False}})('{"x": 1}') == 0
   assert fits({"type": "string", "anyOf": [True, False]})("null") == 0
@@ -2725,7 +2807,7 @@ def test_serve_chat(chip, tmp_path):
   # with thinking off, the prompt carries an empty reasoning block, which makes it too long for these slots
   off = len(tok.encode(serve.chat("<|im_start|> <think>", hi[1:], False), special=True))
   with pytest.raises(urllib.error.HTTPError) as e: ask(body | {"chat_template_kwargs": {"enable_thinking": False}})
-  assert json.load(e.value)["error"]["message"].startswith(f"{off} tokens")
+  assert e.value.code == 400 and json.load(e.value)["error"]["message"] == f"a prompt needs 1 to 62 tokens, not {off}"
   think.shutdown()
   assert serve.chat("<|im_start|> <think>", hi[1:], False) == "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
   assert serve.answer("<think>\nLet me see.\n</think>\n\nHi!") == ("Let me see.", "Hi!") and serve.answer("<think>\nHm") == ("Hm", "")
@@ -2735,6 +2817,20 @@ def test_serve_chat(chip, tmp_path):
   assert serve.answer("<|channel|>analysis<|message|>Greet.<|end|><|start|>assistant<|channel|>final<|message|>Hello!") == ("Greet.", "Hello!")
   assert serve.answer("<|channel|>analysis<|message|>Gree") == ("Gree", "") and serve.answer("<|channel|>final<|message|>Hi") == ("", "Hi")
   assert serve.answer("<|channel|>") == serve.answer("<|channel|>analysis") == ("", ""), "a partial channel name is neither reasoning nor answer"
+
+def test_chat_templates():
+  # gpt-oss's harmony takes a first system or developer message as its developer message, and refuses a later one or a
+  # tool message, which it would give the model as its own words. Its reasoning effort is low, medium or high. Llama 3
+  # trims each message, as Hugging Face's template does.
+  hi = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
+  for late in ({"role": "system", "content": "Be terse."}, {"role": "developer", "content": "x"}, {"role": "tool", "content": "42"}):
+    with pytest.raises(ValueError, match=f"a {late['role']} message"): serve.chat("<|channel|>", hi + [late])
+  assert serve.chat("<|channel|>", hi + [{"role": "assistant", "content": "Hello"}, {"role": "user", "content": "Bye"}]).endswith(
+    "<|start|>user<|message|>Hi<|end|><|start|>assistant<|channel|>final<|message|>Hello<|end|><|start|>user<|message|>Bye<|end|><|start|>assistant")
+  with pytest.raises(ValueError, match="reasoning_effort"): serve.chat("<|channel|>", hi, effort="banana")
+  assert serve.chat("<|start_header_id|>", [{"role": "system", "content": "\n Be brief. "}, {"role": "user", "content": "  hi \n"}]) == (
+    "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"
+    "<|start_header_id|>assistant<|end_header_id|>\n\n")
 
 class Kept(serve.Request):  # a request that keeps the logits row behind each of its tokens (Head.row)
   def take(self, head, room):
@@ -2971,7 +3067,9 @@ def test_chat_tools(tmp_path):
   assert reply["finish_reason"] == "tool_calls" and message["content"] == "Let me look." and message["reasoning_content"] == "I should read it."
   assert json.loads(reply["message"]["tool_calls"][0]["function"]["arguments"]) == {"path": "a.txt", "lines": 2}
   events = streamed(ask({"messages": messages[:2], "tools": tools, "stream": True}))[0]
-  assert "".join(e["delta"].get("content", "") for e in events).strip() == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
+  # the stream's content agrees with the response's, without the whitespace before the call, and no chunk is empty
+  assert "".join(e["delta"].get("content", "") for e in events) == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
+  assert all(e["delta"] or e["finish_reason"] for e in events), events
   assert "".join(e["delta"].get("reasoning_content", "") for e in events) == "I should read it."
   assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
   with pytest.raises(urllib.error.HTTPError) as e:
