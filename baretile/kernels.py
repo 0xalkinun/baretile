@@ -28,7 +28,7 @@ def grid_parts(rt, w, kt, grid, base, more=0):
   produce bitwise-identical results."""
   bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
   if base + (bp + 3) * kt <= UNPACKABLE: return None
-  for least in (min(4, kt - 1), 1):
+  for least in (max(min(4, kt - 1), 1), 1):  # a part is a tile or more, so a K of one tile has none
     for q in range(bq, 0, -1):
       q = -(-bq // -(-bq // q))  # make the groups as even as possible
       acc = OUTS - bp * q * tile_bytes("fp32")
@@ -328,12 +328,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   last_read = lambda keep: max([passes_of(r)[-1] for r in kept if narrow(r) == keep], default=None)
   # In passes, a matmul computed in several passes, like the scores under a softmax, keeps the line's tiles of B in L1
   # from the first pass, as a kept input does. At most one matmul gets this. B can't be a block float or picked by
-  # indices, its row of A must be kept, and the tiles must fit.
+  # indices, its row of A must be kept and stay the same along the line, as it does across a row or through a batch
+  # that A is one matrix of, since later passes don't fetch A again, and the tiles must fit.
   line_b, computed = None, [None]
   for j in matmuls:
     mine = [p for p, pl in enumerate(plans) if j in pl[1]]
     if (reducing and line_b is None and len(mine) > 1 and not ops[j]["wt"] and ops[j]["ids"] is None
-        and rows_at[matmuls.index(j)] is not None and
+        and rows_at[matmuls.index(j)] is not None and (axis == 2 or axis == 0 and size(ops[j]["x"])[0] == 1) and
         top + L * ops[j]["kt"] <= room): line_b, computed, lines_at, top = j, mine, top, top + L * ops[j]["kt"]
   if line_b is not None: decls += f"static unsigned line_done[{L}];\n"
   single = {}  # without passes, a scalar input also gets its own slot, fetched once a worker
@@ -360,10 +361,10 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # over the result's leading dimensions, or 0 for a batch of 1
   def which(r):
     if size(r)[0] == 1: return "0"
-    if leading and not isinstance(r, int) and size(r)[0] != span: return "bo"  # one of the folded result's matrices
+    v = "bo" if leading and size(r)[0] != span else "b"  # one of the folded result's matrices, or of the sweep's
     rep, n = (reps[r] if isinstance(reps[r], tuple) else (reps[r], 0)) if reps and isinstance(r, int) else (1, 0)
-    if n: return f"(b / {rep}) % {n}" if rep > 1 else f"b % {n}"
-    return f"b / {rep}" if rep > 1 else "b"
+    if n: return f"({v} / {rep}) % {n}" if rep > 1 else f"{v} % {n}"
+    return f"{v} / {rep}" if rep > 1 else v
   def matrix(r, base):  # the batch term of r's tile number
     return "" if size(r)[0] == 1 else f"{which(r)} * a[{base + 1}] + "
   # The tile of r that goes with b, i_ and j. r is an input or the result, its [address, strides, offset] at a[base].
@@ -533,7 +534,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                       f"{tt(unpack(f'{bs} + z', f'{1 + DEPTH} + z') + REPORT)} }} {off}{posted} }}")
         # B's line stays in L1 across passes. The first pass that computes it fetches it once the line before is done.
         elif j == line_b:
-          line = f"{lines_at} + k * {kt}"  # A's row is kept as below
+          line = f"{lines_at} + k * {kt}"  # A's row stays in L1 from the first pass, the same along the line
           if p == computed[0]:
             c[B].append(f"{{ reached(line_done[k]); unsigned new = fresh({q}, {which(op['x'])} * {rt} + i_); "
                         f"for (unsigned m = 0; m < {kt}; m++) "
@@ -752,7 +753,9 @@ def attention_l1(ht, R, wt, parts):
   oacc = bh.L1_SIZE - R * T * tile_bytes("fp32")
   places = oacc - R * tile_bytes("int32")
   used, ranges = p_slot + R + R * ht, places - 64
-  if used > UNPACKABLE or ranges < B8 + 4 * ht * tile_bytes(wt or "bf16") or (wt and 2 * ht > B8_SLOTS):
+  # a block float's two frames are at B8. bf16's are among the slots, which must end below the key ranges
+  below = B8 + 4 * ht * tile_bytes(wt) if wt else slot_base("bf16") + used * tile_bytes("bf16")
+  if used > UNPACKABLE or ranges < below or (wt and 2 * ht > B8_SLOTS):
     raise ValueError(f"attention head width {32 * ht} with {32 * R} query rows a unit does not fit in L1")
   return fs, T, (p_slot, p_slot + R), oacc, places, used, ranges
 
@@ -1194,7 +1197,7 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   parts cuts each row into that many parts of cols columns. A split row needs k and cols to be multiples of 32. The
   parts' k best go side by side in the results, which are (batch, rows, parts k). Indices count columns across the row,
   not within the part. With labels, an index is read from an int32 tensor of x's shape at the picked column, as the 64
-  bytes around it. Labels are for a topk over the best indices of the parts.
+  bytes around it. Labels are for a topk over the best indices of the parts, so they need parts=1.
 
   Units write their row of each result tile, in both faces, with zeros past the k columns and past x's rows. Values are
   bf16 or fp32 and indices int32. The tile's 32 units write all of it between them, and no two write the same bytes. A
