@@ -2,3 +2,6 @@
 __pycache__/
 *.egg-info/
 /viz.html
+/baretile-env/
+/record/
+/kernels/
