@@ -4,14 +4,15 @@ The first release target is **one P150a running Llama-3.1-8B-Instruct for one
 user**, with greedy text completion. SmolLM-135M is the smaller development
 fixture. Passing its tests does not qualify Llama or the card.
 
-This is the acceptance specification for [issue #3](https://github.com/0xalkinun/baretile/issues/3),
-dated October 29, 2026. The thresholds below are requirements, not measured
-results. Hardware correctness and performance remain unverified.
+This is the acceptance specification for
+[issue #3](https://github.com/0xalkinun/baretile/issues/3), dated October 29,
+2026. The thresholds below are requirements, not measured results. Hardware
+correctness and performance remain unverified.
 
 ## Fixed inputs
 
-Use these exact revisions, including their tokenizers. [workload.sha256](workload.sha256)
-holds the checksum of every file.
+Use these exact revisions, including their tokenizers.
+[workload.sha256](workload.sha256) holds the checksum of every file.
 
 | Input | Revision |
 | --- | --- |
@@ -70,10 +71,11 @@ not pin a revision.
 ## Precision and limits
 
 All layers and the full vocabulary participate: 32 layers for Llama and 30 for
-SmolLM. No layer cutting, vocabulary reduction or CPU fallback qualifies.
-The model's CPU tokenizer and sampling are allowed; transformer computations
-run on the card. The comparison uses baretile's `tt` mode, defined in
-[`llama.precision`](../baretile/models/llama.py), against a separate `bf16` diagnostic.
+SmolLM. No layer cutting, vocabulary reduction or CPU fallback qualifies. The
+model's CPU tokenizer and sampling are allowed; transformer computations run on
+the card. The comparison uses baretile's `tt` mode, defined in
+[`llama.precision`](../baretile/models/llama.py), against a separate `bf16`
+diagnostic.
 
 | Operation | Llama `tt` | `bf16` diagnostic / SmolLM fixture |
 | --- | --- | --- |
@@ -85,9 +87,9 @@ run on the card. The comparison uses baretile's `tt` mode, defined in
 | Embeddings, norms, RoPE tables | bf16 | bf16 |
 
 Token and position tensors are int32. The residual stream between blocks is
-fp32: attention's output and the MLP's down keep their fp32 sums and add them
-to it, and each norm reads it rounded to bf16. Other stored activations are
-bf16; matmul accumulators and the final logits are fp32. Fused intermediates need not
+fp32: attention's output and the MLP's down keep their fp32 sums and add them to
+it, and each norm reads it rounded to bf16. Other stored activations are bf16;
+matmul accumulators and the final logits are fp32. Fused intermediates need not
 round at the same boundaries as separate operations; [compiler](compiler.md)
 describes these limits. Record the baretile commit as part of the precision
 definition. NumPy's same-weight reference uses full products and does not
@@ -108,7 +110,7 @@ the failing evidence and a numerical explanation, before resuming optimization.
 
 | Gate | Required result |
 | --- | --- |
-| Tokenizer | Exact token IDs and decoded text against Hugging Face's tokenizer from the same revision, with `add_special_tokens=False`, for the three prompts below and `"  café İstanbul 12345\n\tHello!"` |
+| Tokenizer | Exact token IDs and decoded text against Hugging Face's tokenizer from the same revision, with `add_special_tokens=False`, for the three prompts below and `"  café İstanbul 12345\n\tHello!"`. No script runs this gate yet |
 | SmolLM checkpoint smoke | Existing `test_llama_model` passes: two decisions match NumPy's argmax, maximum absolute logit error is below 1, and the second chosen token is 1962 |
 | SmolLM autonomous generation, bf16 | Three prompts × 32 decisions; each run feeds its own selected tokens back. At every step, relative maximum logit error is at most 3%, and the selected token is within 1% of the reference logit span of the reference maximum |
 | Llama B2 reference agreement, `tt` | At least 450/500 top-1 matches (90%) and 490/500 top-5 matches (98%), using integer counts without rounding percentages upward |
@@ -142,8 +144,9 @@ Relative maximum error is `max(abs(got - ref)) / max(max(abs(ref)), 1e-6)`.
 Selection loss is `(max(ref) - ref[pick]) / max(max(ref) - min(ref), 1e-6)`.
 Also compare the NumPy path with that reference at the same prefixes, to
 separate loader/model errors from device errors. For Llama's independent bf16
-reference, use Transformers in bf16 with eager attention and record its device
-and package versions. Do not substitute baretile's own model code for this check.
+reference, use Transformers in bf16 with eager attention. `test/generation.py`'s
+report records its dtype, device and package versions, baretile's commit and the
+KV cache's format. Do not substitute baretile's own model code for this check.
 
 Keep the Llama bf16 and same-quantized-weight NumPy B2 results beside the `tt`
 result. The former exposes loss introduced by the low-precision configuration;
@@ -164,11 +167,12 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 LLAMA="$SMOLLM_DIR" \
 ```
 
 The ordinary `python3 -m baretile.models.llama model "prompt"` demonstration
-follows NumPy's choices, so it isn't the autonomous test. `test/generation.py` is:
-it feeds the chip its own picks for the three prompts, compares every step with
-transformers at the same prefix, and exits with an error when a step misses its
-gate. In `bf16` that's the SmolLM gate above, and in `tt` the Llama one. It needs
-PyTorch and transformers, and writes each step's errors to the report:
+follows NumPy's choices, so it isn't the autonomous test. `test/generation.py`
+is: it feeds the chip its own picks for the three prompts, compares every step
+with transformers at the same prefix, and exits with an error when a step misses
+its gate or its logits on the chip aren't finite. In `bf16` that's the SmolLM
+gate above, and in `tt` the Llama one. It needs PyTorch and transformers, and
+writes each step's errors to the report:
 
 ```sh
 python3 test/generation.py "$SMOLLM_DIR" smollm-generation.json 32 bf16
@@ -179,9 +183,10 @@ Running the independent reference checks in CI is tracked in
 [#5](https://github.com/0xalkinun/baretile/issues/5).
 
 On a card, complete [bring-up](bring-up.md) first and run with `TTSIM` unset
-in the root environment described there. These existing commands report B2
+in the environment described there. These existing commands report B2
 accuracy; compare their reported percentages with the gate, since the CLI does
 not enforce the threshold or return a failure code for a low score.
+`test/bringup.py`'s llama stage runs the `tt` command and fails below the gate.
 
 ```sh
 python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 tt
@@ -210,10 +215,10 @@ curl --fail-with-body --max-time 600 http://localhost:8000/v1/completions \
 
 Repeat with `"stream":true,"stream_options":{"include_usage":true}`. Require
 HTTP 200, nonempty output, a normal stop/length finish reason, correct usage
-counts, and equal assembled text and token counts across the two response
-forms. A failed or cancelled request must release the slot so another request
-can finish. The HTTP checks, including all three prompts and slot recovery,
-belong in the [card acceptance record](https://github.com/0xalkinun/baretile/issues/11).
+counts, and equal assembled text and token counts across the two response forms.
+A failed or cancelled request must release the slot so another request can
+finish. The HTTP checks, including all three prompts and slot recovery, belong
+in the [card acceptance record](https://github.com/0xalkinun/baretile/issues/11).
 The server binds to all interfaces and has no API-key check; run this local
 acceptance case on a trusted host as described in [serving](models.md#serving).
 
@@ -229,9 +234,9 @@ model load/upload time and prompt-to-first-token latency separately.
 
 Run three fresh processes on the card and retain each raw result plus the
 median. Record cold versus reused compilation cache. Record PCIe link, firmware,
-available workers, host, Python/NumPy/PyTorch/Transformers versions, model hashes,
-baretile and vendor commits, precision and command. HTTP first-text latency is
-time to the first nonempty SSE event, not a per-token timestamp.
+available workers, host, Python/NumPy/PyTorch/Transformers versions, model
+hashes, baretile and vendor commits, precision and command. HTTP first-text
+latency is time to the first nonempty SSE event, not a per-token timestamp.
 
 The existing broad benchmark command is:
 
@@ -244,9 +249,10 @@ It also runs B1, batch-32 B2, long-context B3 and multi-user B4. Those results
 are outside this specification; it is not yet an isolated first-workload
 command. [Benchmark task #12](https://github.com/0xalkinun/baretile/issues/12)
 must provide that isolation and a comparable vendor measurement before a
-performance claim. `--quick` cuts layers and sizes, so it cannot qualify a model.
-There is no tokens/s release floor yet: establish the hardware baseline before
-choosing an optimization target. Simulator times do not estimate card speed.
+performance claim. `--quick` cuts layers and sizes, so it cannot qualify a
+model. There is no tokens/s release floor yet: establish the hardware baseline
+before choosing an optimization target. Simulator times do not estimate card
+speed.
 
 Publish a result for each gate as passed, failed or not run, with commands,
 logs and the exact source revision. This specification can be complete while

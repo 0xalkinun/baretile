@@ -60,7 +60,7 @@ def test_size():
             "  return " + " + ".join("1" * 60)]
   assert code_lines("\n".join(sample)) == 1 + 1 + 1 + 3, "the return takes 246 columns, so three lines"
   lines = sum(code_lines((root / "baretile" / f"{m}.py").read_text()) for m in CORE)
-  assert lines <= BUDGET, f"the core is {lines:,} lines at {WIDTH} columns, over its budget of {BUDGET:,}. Remove or reuse something first"
+  assert lines < BUDGET, f"the core is {lines:,} lines at {WIDTH} columns, not under its budget of {BUDGET:,}. Remove or reuse something first"
   assert re.search(rf"under {BUDGET:,} lines of code at {WIDTH} columns", (root / "README.md").read_text()), "the README states the budget"
   wide = [f"{m}.py:{i}" for m in CORE for i, line in enumerate((root / "baretile" / f"{m}.py").read_text().splitlines(), 1)
           if len(line) > WIDTH]

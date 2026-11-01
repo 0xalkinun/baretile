@@ -21,29 +21,35 @@ ruff check
 ```
 
 With pytest-xdist installed, `-n auto` runs the tests in a process for each CPU,
-as CI does. On four CPUs, that halves the time.
+as CI does. On four CPUs, that halves the time. CI also splits the suite across
+jobs by each test's time, as [testing](docs/testing.md#ttsim-chaos) describes.
 
 [Testing and debugging](docs/testing.md) lists the optional checks that need
-model files, PyTorch or transformers, and explains what to do when a launch
-hangs.
+model files, PyTorch, transformers, tiktoken, safetensors or a tinygrad
+checkout, and explains what to do when a launch hangs.
 
 ## What a change needs
 
 - A test that runs on ttsim. Compare kernels against NumPy.
-- The tests your change touches, and `test/test_device.py`, passing before you send
-  it. CI runs the whole suite, on 120 and on 140 Tensix tiles.
-- For a new or changed kernel, a passing run under [ttsim-chaos](docs/testing.md#ttsim-chaos),
-  which adds the NoC latency, FPU and SFPU latency, and core jitter that ttsim leaves out.
-  CI runs the kernel tests under it with a new seed each time, and the whole suite on all 140 Tensix tiles.
+- The tests your change touches, and `test/test_device.py`, passing before you
+  send it. CI runs the whole suite, on 120 and on 140 Tensix tiles.
+- For a new or changed kernel, a passing run under
+  [ttsim-chaos](docs/testing.md#ttsim-chaos), which adds the NoC latency, FPU
+  and SFPU latency, and core jitter that ttsim leaves out. CI runs the kernel
+  tests under it with a new seed each time, and the whole suite on all 140
+  Tensix tiles.
 - For a refactor of a kernel, the same compiled bytes. Run the suite once before
   and once after, each time with an empty cache (for example
-  `XDG_CACHE_HOME=$(mktemp -d)`), and compare the contents of the images it leaves
-  in `$XDG_CACHE_HOME/baretile`, for example with
-  `sha256sum $XDG_CACHE_HOME/baretile/* | cut -d' ' -f1 | sort`. Their names hash
-  the source, so they change with any edit to the C text.
-- Docs that stay true. If your change alters how something works, update the page
-  in [docs/](docs) that describes it. The tests run the README's Python examples
-  and check the docs' links.
+  `XDG_CACHE_HOME=$(mktemp -d)`) and `TTSIM` set to the simulator, since the new
+  cache has none (for example
+  `TTSIM=~/.cache/baretile/ttsim/v1.11.5/libttsim_bh.so`). Compare the contents
+  of the images it leaves in `$XDG_CACHE_HOME/baretile`, for example with
+  `find $XDG_CACHE_HOME/baretile -maxdepth 1 -type f -exec sha256sum {} + | cut -d' ' -f1 | sort`.
+  Their names hash the source, so they change with any edit to the C text.
+- Docs that stay true. If your change alters how something works, update the
+  page in [docs/](docs) that describes it. The tests run the README's Python
+  examples and check the docs' links. A pull request that changes only Markdown
+  runs just these doc checks and the package checks in CI, not the suite.
 - A pull request that says what you ran and what it printed.
 
 You're responsible for every line you send, however you wrote it. We close
@@ -55,10 +61,10 @@ small ones. Before you start on something large, say so in its issue.
 The code has five layers. Each module imports only the layers below it, and
 `test_layers` checks this.
 
-- Layer 0 is the device (`bh.py`, `pci.py`, `chip.py`) and layer 1 is the runtime
-  (`runtime.py`).
-- Layer 2 is Tensix codegen (`tensix.py`) and layer 3 is the kernels and `Tensor`
-  (`kernels.py`, `tensor.py`).
+- Layer 0 is the device (`bh.py`, `pci.py`, `chip.py`) and layer 1 is the
+  runtime (`runtime.py`).
+- Layer 2 is Tensix codegen (`tensix.py`) and layer 3 is the kernels and
+  `Tensor` (`kernels.py`, `tensor.py`).
 - Layer 4 is the models and the server (`baretile/models/`) and the adapters
   (`baretile/adapters/`).
 
@@ -79,16 +85,17 @@ no line in them, the C in their strings included, is longer than 120.
 ## Style
 
 - Layers 0 to 3 use only the standard library. Layer 4 and the tests can use
-  NumPy, and an adapter the library it adapts.
+  NumPy, the models also tiktoken and PyTorch where a command needs them, and an
+  adapter the library it adapts.
 - Keep it flat: few files, no class hierarchies and no config systems. Don't add
   an abstraction until it has a second user.
 - Facts about the chip live as data in [bh.py](baretile/bh.py). An instruction's
   modifier values stay next to the compiler code that uses them.
 - Every wait has a timeout. If the chip hangs, we report it.
-- A caller's mistake raises an exception (`ValueError` for a bad argument), and so
-  does a card in the wrong state (`RuntimeError`). Use `assert` only for baretile's
-  own invariants, and never put work in one: `python -O` drops asserts.
-  `test_checks_without_asserts` runs bad calls under `-O`.
+- A caller's mistake raises an exception (`ValueError` for a bad argument), and
+  so does a card in the wrong state (`RuntimeError`). Use `assert` only for
+  baretile's own invariants, and never put work in one: `python -O` drops
+  asserts. `test_checks_without_asserts` runs bad calls under `-O`.
 - Comments explain a constraint or a reason that the code doesn't make clear.
   Docstrings start with what the function does and mention anything surprising.
   Document kernel arguments and layouts when a caller needs them.
@@ -99,9 +106,9 @@ include numbers only with the command that reproduces them. Simulator cycle
 counts, cost estimates and measurements from a card are different things, so
 say which one a number is.
 
-We use the same terms everywhere. A worker is a Tensix tile running a kernel, and
-BRISC and the TRISCs are its RISC-V cores. A tensor tile holds 32 by 32 values.
-"Tile column" refers to `Tensor.columns`.
+We use the same terms everywhere. A worker is a Tensix tile running a kernel,
+and BRISC and the TRISCs are its RISC-V cores. A tensor tile holds 32 by 32
+values. "Tile column" refers to `Tensor.columns`.
 
 Use one short commit subject under 70 characters and no body, for example
 "matmul: read B by columns" or "adapter: fix JIT input ownership". Put any

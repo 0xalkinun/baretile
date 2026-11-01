@@ -2,18 +2,19 @@
 
 This page lists what you can build on, and what it promises. Names it doesn't
 list, and names that start with an underscore, are internal and change freely.
-baretile is pre-alpha. Its first launches have run on a P150a, but nothing below
-is tested there yet, so everything is promised on ttsim only.
+baretile is pre-alpha. A P150a has run the first bring-up stages, preflight,
+chip and transfers; nothing else is tested on a card yet, so everything below is
+promised on ttsim only.
 
-baretile has its own small frontend, `tensor.Tensor`, which its models are written
-in. tinygrad programs also run on baretile, through the adapter, which compiles
-tinygrad's graphs to `Tensor` operations.
+baretile has its own small frontend, `tensor.Tensor`, which its models are
+written in. tinygrad programs also run on baretile, through the adapter, which
+compiles tinygrad's graphs to `Tensor` operations.
 
 ## Stability
 
 A **stable** name keeps its meaning across 0.x releases. When one has to change,
-the release's [changelog](../CHANGELOG.md) says so under "Changed" and says how to
-update. An **experimental** name can change in any release, and the changelog
+the release's [changelog](../CHANGELOG.md) says so under "Changed" and says how
+to update. An **experimental** name can change in any release, and the changelog
 still lists the change. The version stays below 0.1 until baretile is tested on
 a P150a.
 
@@ -46,8 +47,9 @@ Each promise names the test that checks it.
 
 ### Devices and runtimes
 
-- One `Chip` at a time has a device open, in any process. A second opener gets
-  `RuntimeError` instead of sharing the first one's TLBs and DRAM.
+- One `Chip` at a time has a device open, in any process. A second opener, or a
+  second `Chip` on the same device object, gets `RuntimeError` instead of
+  sharing the first one's TLBs and DRAM.
   [`test_open_device`](../test/test_device.py)
 - A `Runtime` owns a rectangle of workers. A new runtime that overlaps it takes
   over, and the old one, its tensors and its recordings then raise
@@ -60,7 +62,8 @@ Each promise names the test that checks it.
   the rest, so the next runtime finds the workers idle.
   [`test_takeover_during_tensix_kernel`](../test/test_kernels.py)
 - A runtime dropped without `close()` gives its memory back at the next safe
-  point: the next runtime, or an allocation that finds no room.
+  point: the next runtime, once Python has collected the dropped one, or an
+  allocation that finds no room, which collects first.
   [`test_dropped_runtime_gives_memory_back`](../test/test_device.py)
 - A bad argument raises `ValueError`, and a card in the wrong state
   `RuntimeError`, also under `python -O`.
@@ -108,8 +111,9 @@ Each promise names the test that checks it.
   up. [`test_recording_lifetime_and_reuse`](../test/test_kernels.py),
   [`test_jit_input_grads`](../test/test_kernels.py)
 - The same tensor can be passed twice, and a returned view of an input is on
-  that call's input. Keep inputs that `f` writes apart from each other and from
-  captured tensors that `f` only reads.
+  that call's input, or on jit's copy of an input it had to copy in. Keep inputs
+  that `f` writes apart from each other and from captured tensors that `f` only
+  reads.
   [`test_jit_input_aliases`](../test/test_kernels.py),
   [`test_jit_returned_views`](../test/test_kernels.py)
 
@@ -120,16 +124,36 @@ are the ones a caller meets first:
 
 - bf16 is the default. Uploads round to nearest even, and a packed bf16 result
   rounds half up, so the two can differ by one bf16 step.
+  [`test_bf16_special_values`](../test/test_kernels.py),
   [`test_fp32`](../test/test_kernels.py)
 - A matmul takes four fidelity phases by default, which makes bf16 products
   exact; fewer phases drop bits. Sums are still rounded.
   [`test_matmul_fidelity`](../test/test_kernels.py)
 - int32 addition and subtraction wrap, and comparisons cover the full range.
-  An int32 matmul accumulates in fp32.
   [`test_int32`](../test/test_kernels.py),
   [`test_integer_boundaries`](../test/test_kernels.py)
+- A matmul with `dtype="int32"` accumulates in fp32 and converts the result;
+  int32 operands raise `ValueError`.
+  [`test_matmul_composition_and_integer_output`](../test/test_kernels.py)
 - fp32 comparisons treat NaN as unordered, whatever its sign, and `where` keeps
-  the selected value's bits. [`test_selection_boundaries`](../test/test_kernels.py)
+  the selected value's bits.
+  [`test_selection_boundaries`](../test/test_kernels.py)
 - bfp8 and bfp4 are storage formats. `cast` makes them, and a matmul by a
   block-float B is bit for bit the bf16 matmul by its values.
   [`test_bfp`](../test/test_kernels.py)
+
+### The server
+
+- `python3 -m baretile.models.serve` serves `GET /v1/models`,
+  `POST /v1/completions` and `POST /v1/chat/completions` in OpenAI's format,
+  streamed or not. [`test_serve_http`](../test/test_models.py),
+  [`test_serve_chat`](../test/test_models.py)
+- An invalid request gets HTTP 400 before it takes a slot, and a request that
+  finds no free slot gets 429 at once.
+  [`test_serve_bad_requests`](../test/test_models.py),
+  [`test_serve_http`](../test/test_models.py)
+- A request whose headers and body take longer than the input wait gets 408,
+  once its request line has arrived, and a body over the limit 413. Connections
+  past the server's limit get 503, and past one address's share 429.
+  [`test_http_input_limits`](../test/test_models.py),
+  [`test_http_connection_limits`](../test/test_models.py)

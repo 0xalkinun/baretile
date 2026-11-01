@@ -48,7 +48,8 @@ A missing wait shows up as a wrong tile or a hang, but not always on ttsim,
 which finishes most units at once. [ttsim-chaos](testing.md#ttsim-chaos) delays
 the NoC and the math units, and that finds most of these. Run the ramp under it
 after changing a program. CI runs it there with every kind of delay. To see
-where a program has got to, [`print`](testing.md#printing-from-a-kernel) from it.
+where a program has got to, [`print`](testing.md#printing-from-a-kernel) from
+it.
 
 ## The operation
 
@@ -58,9 +59,10 @@ and launches the kernel over its tiles. The inputs must be stored the way
 be copied first. Then the kernel's result is an ordinary tensor: it can be read
 back, used in other operations, or freed like any other.
 
-To test the kernel, compare it with NumPy on inputs whose result is exact in bf16,
-as the ramp does with small integers, and on a shape that gives each worker
-several tiles, so both frames take turns. The ramp runs on four workers for that.
+To test the kernel, compare it with NumPy on inputs whose result is exact in
+bf16, as the ramp does with small integers, and on a shape that gives each
+worker several tiles, so both frames take turns. The ramp runs on four workers
+for that.
 
 ## Going further
 
@@ -69,5 +71,6 @@ fusion of many operations, reductions over several passes, matmuls that stream
 B, and block floats. `transpose_kernel` is the closest to this one.
 [Compiler](compiler.md) explains the counters and semaphores they use, and
 `tensix.py` has the instructions.
+
 To read the C that `kernels.py` generates for an operation, run it with
 [`BARETILE_DUMP`](testing.md#reading-a-kernels-programs) set.

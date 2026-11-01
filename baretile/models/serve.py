@@ -929,9 +929,10 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   late = {"error": {"message": f"the request's headers and body took more than {input_wait}s"}}
   class Handler(BaseHTTPRequestHandler):
     def handle(self):
-      # The deadline is the only bound on reading the request. It shuts the socket for reading, so the read ends and the
-      # request gets its 408. A socket timeout would restart at every read, and one that fired during the headers would
-      # make http.server drop the connection without a reply.
+      # The deadline is the only bound on reading the request. It shuts the socket for reading, so the read ends and a
+      # request whose request line came gets its 408 (one with none is closed without a reply). A socket timeout would
+      # restart at every read, and one that fired during the headers would make http.server drop the connection
+      # without a reply.
       self.expired = threading.Event()
       def expire():
         self.expired.set()

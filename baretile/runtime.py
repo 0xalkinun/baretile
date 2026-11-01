@@ -660,7 +660,8 @@ class Runtime:
   def load(self, kernel):
     """Load a kernel into the workers' L1 and return its address, reusing an existing copy if present. Loading
     multicasts over the rectangle, including the dispatcher. If space runs out, wait for queued work before
-    evicting kernels. Strict TLB ordering makes the kernel arrive before a later doorbell write."""
+    evicting kernels. Strict TLB ordering should make the kernel arrive before a later doorbell write, which a card has
+    yet to show (docs/bring-up.md)."""
     self.check()
     if kernel not in self.loaded:
       if len(kernel) > PRINT - KERNELS:
