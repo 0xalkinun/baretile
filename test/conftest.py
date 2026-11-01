@@ -2,7 +2,7 @@
 # code generation and tensors; test_models.py covers models, serving and adapters. They run on the simulator that
 # python3 -m baretile.chip ttsim downloads, or the libttsim.so that TTSIM names. On a machine with a card and no TTSIM,
 # they open the first Blackhole on the PCI bus as root (see docs/bring-up.md).
-import functools, gc, json, os, pathlib, statistics, pytest
+import functools, gc, json, os, pathlib, random, statistics, pytest
 import numpy as np
 from baretile import pci
 from baretile.chip import Chip
@@ -56,6 +56,10 @@ def pytest_runtest_logreport(report):  # setup, call and teardown add up to a te
 def pytest_sessionfinish(session):  # in the main process, which gets every worker's reports
   if os.environ.get("DURATIONS") == "write" and not hasattr(session.config, "workerinput"):
     DURATIONS.write_text(json.dumps({k: round(v, 2) for k, v in sorted(times.items())}, indent=0) + "\n")
+
+@pytest.fixture(autouse=True)
+def seeded(request):  # the random module's numbers depend on the test alone, so a failure repeats in any order or worker
+  random.seed(request.node.nodeid)
 
 @pytest.fixture
 def no_gc():  # Python collects only where the test calls gc.collect()

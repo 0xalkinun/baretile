@@ -1207,9 +1207,9 @@ def main():
     template = next((t.get("template") for t in template if isinstance(t, dict) and t.get("name") == "default"), None)
   template = template or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
   http = server(engine, name, template, eos, port, defaults=defaults, connections=connections)
-  print(f"serving {name} on port {port}: on the chip after {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), "
-        f"{slots} slots of {places} positions, prefilling {engine.chunk} tokens at a time, {http.connections} connections, "
-        f"{http.per_client} per address", flush=True)
+  print(f"serving {name} on port {http.server_address[1]}: on the chip after {time.time() - start:.0f}s "  # port 0 picks a free one
+        f"({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} positions, prefilling {engine.chunk} tokens at a time, "
+        f"{http.connections} connections, {http.per_client} per address", flush=True)
   http.serve_forever()
 
 if __name__ == "__main__": main()
