@@ -3,6 +3,53 @@
 baretile is pre-alpha. Everything below is tested on Tenstorrent's ttsim
 simulator; nothing has run on a P150a yet.
 
+## 0.0.6
+
+The release whose tinygrad programs run on baretile in about baretile's own time. A small GPT-2, 2 blocks 128 wide on 64
+tokens in fp32, written once with tinygrad's llm.c model and once with `baretile.models.train`, per call on ttsim:
+
+| | 0.0.5 | 0.0.6 | baretile's own |
+| --- | --- | --- | --- |
+| tinygrad, a sequence's loss | 228 launches, 2 downloads, 9.78s | 124 launches, 0.92s | 108 launches, 0.94s |
+| tinygrad, an AdamW step | 781 launches, 4 downloads, 25.16s | 500 launches, 3.42s | 417 launches, 3.11s |
+
+At 0.0.5 each call downloaded values for the host to compute, so a `TinyJit` ran its Python every call; now both
+replay. ttsim's time is the simulator's, not a card's. [Issue #84](https://github.com/baretile/baretile/issues/84) has
+the scripts, and a small MLP's numbers in fp32 and bf16: its bf16 inference through tinygrad takes baretile's own 2
+launches.
+
+### Changed
+
+- The tinygrad adapter runs tinygrad's `POW`, like an MSE loss's square, and a `WHERE` on a constant, like its
+  gradient's, on the chip, so an SGD step on that loss replays under `TinyJit`.
+- tinygrad's bf16 matmul, which sums its bf16 products in fp32 and casts the sum to bf16, is one baretile bf16 matmul,
+  and the ops after it, like a bias and an activation, join its kernel. A matmul that more than one kernel reads is
+  computed once; one that baretile cuts into parts along K keeps the fp32 sum.
+- A matmul is made as `a @ b` or `b @ a`, whichever transposes fewer values, so a gradient like `x.T @ g` needs no
+  transpose after it.
+- A reduction that moves its axes first keeps the rest as rows and columns, where it made a column a tile row for
+  each 32 values, which every op after it was moved into.
+- tinygrad's `Embedding` is a `gather`, and its gradient a matmul by the one-hot's transpose, as baretile's own
+  `gather`'s gradient is; neither broadcasts the table over the tokens. An id outside the table reads what's there,
+  where tinygrad's one-hot gives zeros.
+- Attention heads of whole tiles, split from a row of q, k and v, are views of it, a matmul reads one transposed in
+  place, and heads side by side are a `merge`.
+- tinygrad's `stack`, which its `cat` of equal parts is, runs on the chip, where it went through the host and kept a
+  `TinyJit` from replaying. Pads summed, as a `cat` of other parts and a split's gradient are, write each part into
+  its columns.
+- A `TinyJit` replay writes what the call stores into a captured buffer, like an optimizer's new weight, into the
+  buffer's other tensor, and the two take turns, where it copied each back: a copy a parameter a step, three with
+  Adam.
+- A tensor made from host data on `BARETILE` crosses PCIe once, and isn't copied on the chip after. fp32 that's only
+  read as bf16, as `Tensor(a).cast(dtypes.bfloat16)` from NumPy is, is rounded on the host, to nearest even as
+  tinygrad's CPU rounds it, and goes up as bf16, with no cast kernel.
+
+### Fixed
+
+- A freed tensor whose address was `Bound`, as `jit` gives a copy of an input it can't read in place, handed the
+  `Bound` to the next allocation there, in any runtime on the chip. A later recording that launched with that tensor
+  would have bound it to an input, and its replays moved it there.
+
 ## 0.0.5
 
 The first release whose tensors have more than three dimensions, and whose Qwen3-0.6B passes the generation check:
