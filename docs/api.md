@@ -2,8 +2,13 @@
 
 This page lists what you can build on, and what it promises. Names it doesn't
 list, and names that start with an underscore, are internal and change freely.
-baretile is pre-alpha, and nothing has run on a card yet, so everything below is
-promised on ttsim only.
+baretile is pre-alpha. Its first launches have run on a P150a, but nothing below
+is tested there yet, so everything is promised on ttsim only.
+
+To write programs, use tinygrad through the adapter, as baretile's own workloads
+will ([the roadmap](https://github.com/orgs/baretile/projects/1)). `tensor.Tensor`
+is the engine's API, which the adapter compiles to. It grows only for what the
+hardware can do and tinygrad can't express, like block-float weights.
 
 ## Stability
 
