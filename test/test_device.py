@@ -1,8 +1,8 @@
 # Device and runtime tests (layers 0 and 1), plus import and layer checks. See conftest.py for simulator setup.
 import ast, collections, ctypes, gc, hashlib, io, math, mmap, os, pathlib, random, re, shutil, struct, subprocess, sys, threading, time, tokenize
-import weakref, pytest
+import errno, weakref, pytest
 from baretile import bh, pci, runtime
-from baretile.chip import check
+from baretile.chip import Chip, check
 from baretile.hello import hello
 from baretile.runtime import DATA, KERNELS, MAILBOX, MCAST_STATE, Bound, Runtime, compile_kernel
 
@@ -67,8 +67,9 @@ def test_size():
   assert not wide, f"lines over {WIDTH} columns in the core: {wide}"
 
 def test_open_device(chip):
-  # A device has one opener at a time, since two Chips on one chip would hand out the same TLBs and DRAM.
+  # A device has one opener at a time, and one Chip, since two Chips on one chip would hand out the same TLBs and DRAM.
   with pytest.raises(RuntimeError, match="already open"): pci.open_device()
+  with pytest.raises(RuntimeError, match="already has a Chip"): Chip(chip.pci)
   with pytest.raises(ValueError, match="chips"): pci.open_device(64)
 
 def test_config_space(chip):
@@ -78,16 +79,18 @@ def test_config_space(chip):
 
 def test_arc(chip):
   # ARC messages and telemetry. A client that died can leave a response unread in the queue, and the next message must
-  # still get its own answer. We fake that by overwriting the slot of TEST's response and marking it unread.
+  # still get its own answer. We fake that by overwriting the slot of TEST's response and marking it unread. Through
+  # tt-kmd, messages go through kmd's queue, not the one this fakes, so we leave that part out.
   chip.arc_msg(0x90)  # TEST
-  (x, y), entry = bh.ARC, bh.ARC_QUEUE_ENTRY
-  qcb = chip.read32(x, y, bh.ARC_QUEUES)
-  base, n = chip.read32(x, y, qcb), chip.read32(x, y, qcb + 4) & 0xFF
-  q = base + bh.APP_QUEUE * (entry + 2 * n * entry)
-  rptr = (chip.read32(x, y, q + bh.ARC_QUEUE_PTRS[1]) - 1) % (2 * n)
-  chip.write32(x, y, q + entry * (1 + n + rptr % n), 0xABCD0000)
-  chip.write32(x, y, q + bh.ARC_QUEUE_PTRS[1], rptr)  # mark it unread
-  assert chip.arc_msg(0x90)[0] != 0xABCD0000, "got the stale response left in the queue"
+  if not isinstance(chip.pci, pci.Kmd):
+    (x, y), entry = bh.ARC, bh.ARC_QUEUE_ENTRY
+    qcb = chip.read32(x, y, bh.ARC_QUEUES)
+    base, n = chip.read32(x, y, qcb), chip.read32(x, y, qcb + 4) & 0xFF
+    q = base + bh.APP_QUEUE * (entry + 2 * n * entry)
+    rptr = (chip.read32(x, y, q + bh.ARC_QUEUE_PTRS[1]) - 1) % (2 * n)
+    chip.write32(x, y, q + entry * (1 + n + rptr % n), 0xABCD0000)
+    chip.write32(x, y, q + bh.ARC_QUEUE_PTRS[1], rptr)  # mark it unread
+    assert chip.arc_msg(0x90)[0] != 0xABCD0000, "got the stale response left in the queue"
   t = chip.telemetry()
   assert len(chip.tensix) in (120, 140) and t[bh.TAG_AICLK] > 0, "expected 140 Tensix, or 120 from firmware 19.5 on, and a nonzero AICLK"
 
@@ -256,7 +259,12 @@ def test_card_sysfs(tmp_path, monkeypatch):
   monkeypatch.setattr(pci, "SYS", str(tmp_path))
   monkeypatch.setattr(pci.os, "geteuid", lambda: 0)
   assert pci.find_cards() == [bdf]
+  (dev / "resource0").rename(tmp_path / "resource0")
+  with pytest.raises(FileNotFoundError) as failed: pci.Card(bdf)
+  (tmp_path / "resource0").rename(dev / "resource0")
+  # a Card that failed to open gives back config space's lock, though its traceback, in failed, still holds it
   card, data = pci.Card(bdf), random.randbytes(64)
+  del failed
   with pytest.raises(RuntimeError, match="already open"): pci.Card(bdf)  # config space stays locked while card is open
   card.write(0x1000, data)
   with open(dev / "resource0", "rb") as f: written = f.read(0x1040)[0x1000:]
@@ -273,10 +281,21 @@ def test_card_sysfs(tmp_path, monkeypatch):
       time.sleep(0.01)
   threading.Thread(target=back, daemon=True).start()
   (tmp_path / "rescan").write_text("")
-  pci.reset(bdf, timeout=5)
+  assert pci.reset(bdf, timeout=5) is None, "no tt-kmd to bind the card again"
   cfg = (dev / "config").read_bytes()
   assert [int.from_bytes(cfg[off:off + 4], "little") for off, _ in bh.RESET_TIMER] == [v for _, v in bh.RESET_TIMER]
   assert (dev / "remove").read_text() == "1" and (tmp_path / "rescan").read_text() == "1"
+  # With tt-kmd loaded, the rescan binds it again, and reset gives back its device file, for chip reset to open
+  (tmp_path / "drivers" / pci.DRIVER).mkdir(parents=True)
+  (dev / "tenstorrent" / "tenstorrent!0").mkdir(parents=True)
+  monkeypatch.setattr(pci, "DEV", str(tmp_path / "dev"))
+  threading.Thread(target=back, daemon=True).start()
+  def bound():  # udev makes the device file a moment after the rescan
+    time.sleep(0.3)
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev" / "0").write_text("")
+  threading.Thread(target=bound, daemon=True).start()
+  assert pci.reset(bdf, timeout=5) == str(tmp_path / "dev" / "0")
 
 def test_preflight(tmp_path, monkeypatch):
   # preflight reads what opening a card needs from a fake sysfs. With tt-kmd driving it, that's its device file, which
@@ -333,6 +352,7 @@ class FakeKmd:
     self.fd = os.memfd_create("tenstorrent")
     os.ftruncate(self.fd, 1 << 30)  # BAR0's 512 MiB, then room for the windows; sparse, so nothing is written yet
     self.path, self.tlbs, self.unpinned, self.polls = f"/proc/self/fd/{self.fd}", 0, [], 0
+    self.power, self.posted, self.abandoned, self.refuse = None, None, 0, 0  # refuse: an errno for the next POST
   def ioctl(self, fd, request, buf):
     name = {0xFA << 8 | n: name for name, n in pci.KMD.items()}[request]
     if name == "QUERY_MAPPINGS": struct.pack_into("<IIQQ", buf, 8, pci.KMD_MAPPING_BAR0, 0, 0, 512 << 20)
@@ -346,20 +366,32 @@ class FakeKmd:
       os.pwrite(self.fd, reg.to_bytes(12, "little"), bh.TLB_CONFIG + 12 * id)
     elif name == "PIN_PAGES": struct.pack_into("<QQ", buf, 24, 0x1234000, 1 << 60 | 0x1234000)
     elif name == "UNPIN_PAGES": self.unpinned.append(struct.unpack_from("<QQ", buf))
-    elif name == "SMC_MSG" and struct.unpack_from("<I", buf, 4)[0] == pci.KMD_SMC_POLL:
-      self.polls += 1
-      if self.polls == 1: raise BlockingIOError(11, "the message is still pending")
-      struct.pack_into("<8I", buf, 16, *range(8))
+    elif name == "SET_POWER_STATE": self.power = struct.unpack_from("<IIBBH", buf)
+    elif name == "SMC_MSG":  # one message outstanding for the file, as kmd allows. 0xEE never gets an answer
+      flags, header = struct.unpack_from("<I", buf, 4)[0], struct.unpack_from("<I", buf, 16)[0]
+      if flags == pci.KMD_SMC_POST:
+        if self.refuse or self.posted is not None:
+          e, self.refuse = self.refuse or errno.EBUSY, 0
+          raise OSError(e, os.strerror(e))
+        self.posted = header
+      elif flags == pci.KMD_SMC_ABANDON: self.posted, self.abandoned = None, self.abandoned + 1
+      else:
+        self.polls += 1
+        if self.polls == 1 or self.posted == 0xEE: raise BlockingIOError(11, "the message is still pending")
+        self.posted = None
+        struct.pack_into("<8I", buf, 16, *range(8))
     return 0
 
 def test_kmd(tmp_path, monkeypatch):
   # Kmd maps BAR0 and the TLB windows kmd gives it, and reads and writes go to the right one. A window kmd configures has
   # the 96 bits that Card writes, including the static VC class that CONFIGURE_TLB leaves out. Pinned DMA memory goes
   # back when its memoryview does, and an ARC message waits for kmd's answer. One Kmd has a device at a time, and a
-  # dropped one lets the next one open it.
+  # dropped one lets the next one open it. Opening asks kmd for the busy AI clock, which it doesn't give a client by
+  # default, and keeps the other power flags on.
   kmd = FakeKmd(tmp_path)
   monkeypatch.setattr(pci.fcntl, "ioctl", kmd.ioctl)
   card = pci.Kmd("0000:01:00.0", kmd.path)
+  assert kmd.power == (40, 0, 0, 4, 0b1111), "argsz, flags, reserved, four valid flags: busy clock, PHYs, Tensix, L2CPU"
   with pytest.raises(RuntimeError, match="already open"): pci.Kmd("0000:01:00.0", kmd.path)
   del card
   card = pci.Kmd("0000:01:00.0", kmd.path)  # the dropped one closed its file, and its lock with it
@@ -382,6 +414,15 @@ def test_kmd(tmp_path, monkeypatch):
   gc.collect()
   assert len(kmd.unpinned) == 1 and kmd.unpinned[0][1] == 1 << 21
   assert card.message(0x90) == tuple(range(8)) and kmd.polls == 2
+  # A message that ARC doesn't answer is given up, so the next one can go. Only the errno of a kmd without the ioctl
+  # asks for a newer kmd, and other errors come as they are.
+  with pytest.raises(TimeoutError, match="0xee"): card.message(0xEE)
+  assert kmd.abandoned == 1 and card.message(0x90) == tuple(range(8))
+  kmd.refuse = errno.EINVAL
+  with pytest.raises(RuntimeError, match="2.11 or later"): card.message(0x90)
+  kmd.refuse = errno.EOPNOTSUPP
+  with pytest.raises(OSError) as refused: card.message(0x90)
+  assert refused.value.errno == errno.EOPNOTSUPP and "2.11" not in str(refused.value)
 
 @pytest.mark.skipif("KMD_IOCTL" not in os.environ, reason="set KMD_IOCTL to tt-kmd's ioctl.h")
 def test_kmd_layouts(tmp_path):
@@ -405,7 +446,8 @@ def test_kmd_layouts(tmp_path):
 
 def test_fetch_ttsim(tmp_path, monkeypatch):
   # fetch_ttsim downloads the simulator once, and only with the expected SHA-256. A server in a thread stands in for
-  # GitHub.
+  # GitHub. Two fetches at once both install a whole library: both finish downloading before either installs it, and
+  # their temporary files must not collide.
   import http.server
   library, gets = os.urandom(1024), []
   class Release(http.server.BaseHTTPRequestHandler):
@@ -425,6 +467,15 @@ def test_fetch_ttsim(tmp_path, monkeypatch):
     assert not path.parent.exists() or not any(path.parent.iterdir()), "a download that doesn't check out leaves nothing"
     monkeypatch.setattr(pci, "TTSIM_SHA256", hashlib.sha256(library).hexdigest())
     assert pci.fetch_ttsim() == pci.fetch_ttsim() == path and path.read_bytes() == library and len(gets) == 2
+    path.unlink()
+    barrier, replace = threading.Barrier(2, timeout=10), os.replace
+    def install(src, dst):
+      barrier.wait()
+      return replace(src, dst)
+    monkeypatch.setattr(os, "replace", install)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(2) as pool: fetched = list(pool.map(lambda _: pci.fetch_ttsim(), range(2)))
+    assert fetched == [path, path] and path.read_bytes() == library and list(path.parent.iterdir()) == [path]
   finally: server.shutdown(); server.server_close()
 
 def test_setup_checks(tmp_path, monkeypatch):

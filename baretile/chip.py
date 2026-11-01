@@ -1,13 +1,15 @@
 # NoC access through PCIe TLB windows. Chip also reads ARC telemetry and coordinate tables,
 # resets Tensix cores, and transfers data through Ethernet links.
-import hashlib, importlib.util, pathlib, shutil, struct, subprocess, time
+import hashlib, importlib.util, pathlib, shutil, struct, subprocess, time, weakref
 from baretile import bh, pci
-from baretile.pci import Kmd
+from baretile.pci import Kmd, Sim
 
 class Chip:
   # boot is how long to wait for ARC firmware, in seconds. After a reset it takes minutes, and umd allows 300.
   def __init__(self, pci, boot=2.0):
     if (ids := pci.cfg_read(0)) != bh.VENDOR | bh.DEVICE << 16: raise RuntimeError(f"not a Blackhole: {ids:#x}")
+    # two Chips on one device would hand out the same TLBs and DRAM. The reference is weak, so a dropped Chip lets go
+    if (had := getattr(pci, "chip", None)) and had(): raise RuntimeError("this device already has a Chip. Share it")
     self.pci, self.target = pci, None  # TLB 0 is the shared window, and map hands out the others
     self.taken = {}  # (start, end) -> runtime resources; these do not keep the Runtime alive
     self.dram_holes = [(0, bh.DRAM_BANK_SIZE)]  # all runtimes on this chip share its DRAM
@@ -19,10 +21,10 @@ class Chip:
     if not kmd: self.arc_msg(bh.ASIC_STATE0)  # leave the state that tt-kmd puts the chip in when it lets go of it
     if not kmd: self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_TELEMETRY[0]), "publish its telemetry", boot)
-    # Ask for the busy AI clock and, like UMD, wait up to 0.2 s for it to come within 5% of bh.AICLK. If it doesn't,
-    # we use the clock it reports. ttsim reports 1000 MHz.
+    # Ask for the busy AI clock (Kmd asked kmd for it when it opened) and, like UMD, wait up to 0.2 s for it to come
+    # within 5% of bh.AICLK. If it doesn't, we use the clock it reports. ttsim reports 1000 MHz, so we don't wait there.
     if not kmd: self.arc_msg(bh.AICLK_GO_BUSY)
-    busy, end = bh.AICLK / 1e6, time.monotonic() + 0.2
+    busy, end = bh.AICLK / 1e6, time.monotonic() + (0 if isinstance(pci, Sim) else 0.2)
     while abs(self.telemetry().get(bh.TAG_AICLK, 0) - busy) > 0.05 * busy and time.monotonic() < end: self.pci.tick()
     t = self.telemetry()
     missing = {bh.TAG_AICLK, bh.TAG_GDDR_STATUS, bh.TAG_TENSIX_COLS, bh.TAG_GDDR_ENABLED} - t.keys()
@@ -38,6 +40,7 @@ class Chip:
     self.wait(lambda: 0 not in training(), "finish GDDR training", 300)
     bad = [b for b, s in zip(self.banks, training()) if s != 1]
     if bad: raise RuntimeError(f"GDDR banks {bad} failed training (UMD retrains with ARC message 0xB6)")
+    pci.chip = weakref.ref(self)
 
   # tile (x, y) on the raw NoC0 grid, for bh.hops
   def raw(self, x, y): return (x if y < 2 else self.noc_x[x]), self.noc_y[y]
@@ -49,7 +52,8 @@ class Chip:
     base = addr & ~(bh.TLB_WINDOW - 1)
     if tlb is None:
       if (x, y, base, start) not in self.kept:
-        if (free := next(self.free_tlbs, None)) is None: raise RuntimeError(f"all {bh.TLB_COUNT} TLBs are taken")
+        if (free := next(self.free_tlbs, None)) is None:
+          raise RuntimeError(f"all {bh.TLB_COUNT - 1} TLBs that map reserves are taken. TLB 0 is the shared window")
         self.kept[x, y, base, start] = free
       tlb = self.kept[x, y, base, start]
     mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1,
@@ -176,7 +180,7 @@ def check():
 # Report firmware, clock, Tensix tiles, DRAM banks and ARC telemetry. Run this before loading kernels on a new card,
 # or on the simulator. check runs check() without opening the device, and ttsim downloads the tested simulator
 # (pci.fetch_ttsim). For a card, release gives it back to tt-kmd (pci.release), and reset calls pci.reset before
-# opening it.
+# opening it, through tt-kmd when it's loaded and so binds the card again.
 if __name__ == "__main__":
   import os, sys
   command = sys.argv[1] if len(sys.argv) > 1 else None
@@ -196,8 +200,8 @@ if __name__ == "__main__":
     print(f"{bdf}: {pci.release(bdf)} has the card")
     sys.exit()
   if reset := command == "reset":
-    pci.reset(bdf := pci.find_cards()[0])
-    dev = pci.Card(bdf)
+    path = pci.reset(bdf := pci.find_cards()[0])
+    dev = pci.Kmd(bdf, path) if path else pci.Card(bdf)  # as open_device does, so the card stays with tt-kmd
   else: dev = pci.open_device()
   chip = Chip(dev, 300 if reset else 2)
   t = chip.telemetry()

@@ -56,9 +56,10 @@ USE = dict(context=32768, kv="bf16", accept=0.0)
 def probed(card, path):  # the card with the probe's numbers in place of the spec's (python3 -m baretile.probe 8 path)
   with open(path) as f: p = json.load(f)
   chunks = [p[f"DRAM reads of {f} chunks, {CHUNKS} in flight: grid workers, own banks"] for f in ("bfp8", "bfp4")]  # how decode reads weights
+  hz = p.get("AI clock", bh.AICLK / 1e6) * 1e6  # the clock the probe's cycles count. Older records don't have it
   return card | dict(bandwidth=min(chunks) * 1e9, reach=1.0,
-                     tflops=2 * 32**3 / p["matmul step, 1 phase, unpacks included"] * WORKERS * bh.AICLK,
-                     launch=p["launch, 100 queued: chip each"] / bh.AICLK, pcie=min(p["upload over PCIe"], p["read back over PCIe"]) * 1e9)
+                     tflops=2 * 32**3 / p["matmul step, 1 phase, unpacks included"] * WORKERS * hz,
+                     launch=p["launch, 100 queued: chip each"] / hz, pcie=min(p["upload over PCIe"], p["read back over PCIe"]) * 1e9)
 
 def shape(c, mode="bf16"):
   """Return matrix sizes and traffic estimates using the formats selected by llama.precision.

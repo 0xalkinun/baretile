@@ -81,7 +81,8 @@ def kernels():
 def probe(chip, n=64, rounds=32, upload=8 << 20):
   """Run the probes and return rows of (what, measured, bound, unit). Tensix probes loop n times, and NoC probes run
   `rounds` rounds."""
-  k, rows, hz = kernels(), [], chip.telemetry()[bh.TAG_AICLK] * 1e6
+  k, hz = kernels(), chip.telemetry()[bh.TAG_AICLK] * 1e6
+  rows = [("AI clock", hz / 1e6, bh.AICLK / 1e6, "MHz")]  # what the cycles below count, which models.cost converts with
   rt = Runtime(chip)
   first, workers, grid = rt.cores[0], len(rt.cores), len(rt.readers)
   reading = compile_kernel(table("reader", [bh.noc_xy(*port) for _, port in rt.readers]) + "\n" + DRAM_READS)
@@ -189,4 +190,5 @@ if __name__ == "__main__":
   print("ttsim: timings do not predict card performance" if sim else f"{chip.pci.sys}: the card")
   rows = probe(chip, upload=(int(sys.argv[1]) if len(sys.argv) > 1 else 8) << 20)
   for what, value, against, unit in rows: print(f"  {what:72s} {value:12.2f} {unit:9s}" + (f" (bound: {against})" if against is not None else ""))
-  if len(sys.argv) > 2: json.dump({what: value for what, value, _, _ in rows}, open(sys.argv[2], "w"), indent=1)
+  if len(sys.argv) > 2:
+    with open(sys.argv[2], "w") as f: json.dump({what: value for what, value, _, _ in rows}, f, indent=1)
