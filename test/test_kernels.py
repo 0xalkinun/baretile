@@ -1,5 +1,5 @@
 # Tests for Tensix code generation, kernels and Tensor (layers 2 and 3). See conftest.py for simulator setup.
-import gc, json, math, os, pathlib, random, re, struct, subprocess, sys, pytest
+import gc, inspect, json, math, os, pathlib, random, re, struct, subprocess, sys, pytest
 import numpy as np
 from baretile import bh, pci, tensix, tensor, viz
 from baretile.kernels import grid_parts
@@ -155,6 +155,11 @@ def test_viz_script(tmp_path):
   (tmp_path / "script.py").write_text("from baretile import pci\nfrom baretile.chip import Chip\nfrom baretile.runtime import Runtime\n"
                                       "from baretile.tensor import Tensor\nchip = Chip(pci.open_device())\nRuntime(chip)\nrt = Runtime(chip)\n"
                                       "print((Tensor.of(rt, [[1.0, 2.0]]) * 3).tolist())\n")
+  out = subprocess.run([sys.executable, "-m", "baretile.viz", "script.py"], cwd=tmp_path, capture_output=True, text=True, timeout=300,
+                       env=os.environ | {"PYTHONPATH": str(pathlib.Path(__file__).parent.parent)})
+  assert out.returncode == 0 and out.stdout.startswith("[[3.0, 6.0]]"), out.stdout + out.stderr
+  [run] = page_data(tmp_path / "viz.html")
+  assert [k["name"] for k in run["kernels"]] == ["mul", "readback"] and run["kernels"][0]["graph"][-1][0] == "mul"
 
 
 def test_jit(chip, monkeypatch):
@@ -284,12 +289,13 @@ def test_recording_lifetime_and_reuse(chip):
   first.send()
   assert out.tolist() == [[4]]
   go = hold(rt)
-  first.send()
-  addr = out.addr
-  del out
-  first.close()
-  assert addr in rt.used, "queued replay keeps storage after the recording is closed"
-  go()
+  try:  # a failure still lets the held launch go, or the next test's Runtime waits for it
+    first.send()
+    addr = out.addr
+    del out
+    first.close()
+    assert addr in rt.used, "queued replay keeps storage after the recording is closed"
+  finally: go()
   rt.wait()
   assert addr not in rt.used and not rt.pinned and not rt.pinned_freed
   with pytest.raises(RuntimeError, match="not ready"): first.send()
@@ -728,8 +734,8 @@ def test_matmul_fidelity(chip):
 
 @pytest.mark.parametrize("dtype", ["bfp8", "bfp4"])
 def test_bfp(chip, dtype):
-  # A matmul by a block-float B is bit for bit the bf16 matmul by its values. B reads 1088 bytes a tile for bfp8 and
-  # 576 for bfp4, against 2048 for bf16. The loop covers the ways B comes in: streamed beside A when K is over 256
+  # A matmul by a block-float B is bit for bit the bf16 matmul by its values. A tile of B is 1088 bytes in bfp8 and
+  # 576 in bfp4, against 2048 in bf16. The loop covers the ways B comes in: streamed beside A when K is over 256
   # tiles, a token's row of A kept and shared, multicast in three buffers, a batch with a block's column kept, and K
   # split. Then it's fused with what follows and with a bf16 matmul, so unpacker 0 switches to the block float and
   # back.
@@ -771,8 +777,8 @@ def test_matmul_parts(chip):
   # kernels.grid_parts). Workers sum their result tiles over the parts in fp32 accumulators in L1, and the last part
   # starts from that sum. When the accumulators don't fit, a worker does its block a group of columns at a time and
   # reads A again for each group. B is read once; A is read once per group.
-  # The cases split K into these parts, in tiles: 22, 22, 20. Then 64, 64 with a bfp8 B in regions past the slots, 22
-  # with B transposed, and 32 four times, so A's buffers go round. Then 22 with the last workers of the grid taking 2
+  # The cases split K into these parts, in tiles: 22, 22, 20. Then 32 four times with a bfp8 B in regions past the slots,
+  # 22 with B transposed, and 32 four times again, so A's buffers go round. Then 22 with the last workers of the grid taking 2
   # of their 3 columns. Last is a grid of one row, with blocks of 32 tile rows in two groups of 4 columns, where the
   # last worker has none in the second group.
   base = tensix.FRAMES + 2 * 3 + 1  # a lone matmul: two frames of 3 slots, plus one slot for its op
@@ -866,7 +872,7 @@ def test_matmul_bank_local(chip):
 def test_matmul_by_columns(chip):
   # Tensor.columns must preserve matmul results across all read paths. Tile column j forms one run along K
   # in bank j % 8. Block floats store the run's exponents before its values.
-  # The cases cover a token's row: bank-local, with K too long for the slots, and with K cut into a batch. They cover a
+  # The cases cover a token's row: bank-local, and with K cut into a batch. They cover a
   # grid's blocks with K in one part and in several, passes over a row as in a softmax, blocks on one worker, A
   # streamed beside B, and the experts that tokens pick with index=. B by columns reads back as it was; ordinary
   # arithmetic and movement require casting it back to ordinary tiles.
@@ -875,7 +881,7 @@ def test_matmul_by_columns(chip):
     (None, 288, 4096, 224, "bfp8"), (None, 320, 2048, 416, "bf16"), (None, 64, 256, 512, "softmax"), (1, 96, 256, 128, "bf16"),
     (1, 32, 9600, 64, "bf16")]
   for end, m, k, n, how in cases:
-    rt = Runtime(chip, end=row_end(chip) if end == "row" else end and chip.tensix[end])
+    rt = Runtime(chip, end=end and chip.tensix[end])
     x, b = Tensor.of(rt, bf16(rng.uniform(-1, 1, (m, k))).tolist()), Tensor.of(rt, bf16(rng.uniform(-1, 1, (k, n))).tolist())
     w = b.cast(how).realize() if how in ("bfp8", "bfp4") else b
     f = (lambda w: (x @ w).softmax(-1)) if how == "softmax" else (lambda w: x @ w)
@@ -1184,11 +1190,12 @@ def test_sfpu(chip):
   x[0][:10] = map(bf, [0.0, -0.0, 1.0, -1.0, -100.0, 3.0e-39, 1e30, -1e30, math.inf, -math.inf])
   y = [[bf(random.uniform(-1, 1)) for _ in range(64)] for _ in range(64)]
   tx, ty = Tensor.of(rt, x), Tensor.of(rt, y)
-  def check(got_rows, ins, f):  # within a bf16 step, but 1/0 only has to be infinite
+  def check(got_rows, ins, f):  # within a bf16 step, and infinities exact, but 1/0 only has to be infinite
     for got, row in zip(got_rows, ins):
       for g, v in zip(got, row):
         want = f(flush(v))
-        assert (math.isinf(g) if flush(v) == 0 and f is recip else g == want or abs(g - want) <= abs(want) * 2**-7), (v, g, want)
+        assert (math.isinf(g) if flush(v) == 0 and f is recip else g == want if math.isinf(want) else
+                abs(g - want) <= abs(want) * 2**-7), (v, g, want)
   exp = lambda v: math.inf if v > 88.7 else 0.0 if v < -104 else flush(bf(math.exp(v)))
   recip = lambda v: math.inf if v == 0 else flush(bf(1 / v))  # 1/inf is 0
   assert tx.relu().tolist() == [[max(flush(v), 0.0) for v in row] for row in x]
@@ -1221,9 +1228,10 @@ def test_elementwise(chip):
   def make(lo, hi, extra=()):
     a = bf16(np.concatenate([edges, extra, rng.uniform(lo, hi, 40 * 64 - len(edges) - len(extra))]).reshape(40, 64))
     return a, np.where(np.abs(a) < 2.0**-126, 0.0, a), Tensor.of(rt, a.tolist())
-  def check(t, want, rel, atol=0.0):  # rounds want like the packer: past bf16's range is inf, and so is NaN
+  def check(t, want, rel, atol=0.0):  # rounds want like the packer: past bf16's range is inf, and so is NaN. inf is exact
     want, got = np.nan_to_num(bf16(want, True), nan=np.inf, posinf=np.inf, neginf=-np.inf), np.array(t.tolist())
-    assert ((got == want) | (np.abs(got - want) <= rel * np.abs(want) + atol)).all(), np.argwhere(got != want)[:5]
+    with np.errstate(invalid="ignore"): near = np.abs(got - want) <= rel * np.abs(want) + atol
+    assert np.where(np.isinf(want), got == want, near).all(), np.argwhere(got != want)[:5]
   with np.errstate(all="ignore"):
     _, fx, tx = make(-8, 8, [1e30, -1e30])
     for f, ref in [(tx.exp2, np.exp2), (tx.exp, np.exp), (tx.log2, np.log2), (tx.log, np.log), (tx.sqrt, np.sqrt)]: check(f(), ref(fx), 2**-7)
@@ -1338,12 +1346,13 @@ def test_attend(chip):
     if lo == 200:
       assert read == 2 * (1 + 2 + 16 + 16) + 8, read
 
-def test_attention_unit_rows(chip):
+def test_attention_unit_rows(chip, monkeypatch):
   # With one worker, a unit takes up to 8 tile rows of queries, which share each key and value tile it reads. The
   # rows' largest scores share Dst's two accumulator tiles, a quarter of a tile each. The cases cover 8 rows, a last
   # unit of 3, a sliding window over a bfp8 cache, a repeat, a unit of 3 rows in parts, and scores whose maximum
   # bf16 can't hold.
-  rt, rng = Runtime(chip, end=chip.tensix[1]), np.random.default_rng(44)
+  rt, rng, used, cached = Runtime(chip, end=chip.tensix[1]), np.random.default_rng(44), [], tensor._cached
+  monkeypatch.setattr(tensor, "_cached", lambda key, make: used.append(key) or cached(key, make))  # the kernels each case asks for
   for e, rows, hd, keys, rep, fmt, window, parts, R in ((1, 256, 64, 256, 1, "bf16", 0, None, 8), (2, 330, 64, 320, 2, "bf16", 0, None, 8),
                                                          (1, 100, 128, 200, 1, "bfp8", 50, None, 4), (1, 96, 64, 128, 1, "bf16", 0, 2, 3)):
     q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
@@ -1352,11 +1361,12 @@ def test_attention_unit_rows(chip):
     tq, tk, tv = (Tensor.of(rt, x.tolist()) for x in (q, k, v))
     if fmt != "bf16": tk, tv = (x.cast(fmt).realize() for x in (tk, tv)); k, v = value(tk), value(tv)
     if rep > 1: tk, tv = tk.repeat_interleave(rep), tv.repeat_interleave(rep)
+    used.clear()
     got = value(tq.attend(tk, tv, Tensor.of(rt, places.tolist(), "int32"), window, parts=parts))
     s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.011)
-    assert any(key[:4] == ("attend", hd // 32, -(-rows // 32), R) for key in tensor.kernels), "a unit of R tile rows"
+    assert any(key[:4] == ("attend", hd // 32, -(-rows // 32), R) for key in used), "a unit of R tile rows"
   q = Tensor.of(rt, [[10000] * 64] * 256)
   k = Tensor.of(rt, [[10000] * 64] * 64)
   v = Tensor.of(rt, [[1] * 64] * 32 + [[5] * 64] * 32)
@@ -1954,14 +1964,19 @@ def test_autograd(chip):
   assert np.allclose(value((tc - ta).mean().gradient(tc)[0]), 1 / 40, rtol=1e-6), "20 rows of a mean over 800"
 
 def test_long_autograd_history(chip):
-  # Graphs deeper than Python's recursion limit realize and differentiate.
+  # Graphs deeper than Python's recursion limit realize and differentiate. A long chain takes long to realize, so that
+  # one is shorter, under a lower limit.
   rt = Runtime(chip)
   x = Tensor.full(rt, 1, 1, 2, "fp32").requires_grad_()
   y = x
   for _ in range(1100): y = y + 1
   g, = y.gradient(x)
   assert g.tolist() == [[1.0]]
-  assert y.tolist() == [[1102.0]], "a deep lazy expression also realizes without Python recursion"
+  y, limit = x, sys.getrecursionlimit()
+  for _ in range(400): y = y + 1
+  sys.setrecursionlimit(len(inspect.stack(0)) + 200)  # room for 200 more frames, half the chain
+  try: assert y.tolist() == [[402.0]], "a deep lazy expression also realizes without Python recursion"
+  finally: sys.setrecursionlimit(limit)
   # Realized steps still retain their gradient history. backward must traverse that history without recursion too.
   y = x
   for _ in range(1100): y = y.repeat_interleave(1)

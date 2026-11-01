@@ -700,7 +700,7 @@ def test_takeover_after_hung_multicast(chip):
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { mcast_begin(); mcast_done(NIU(WR_ACKS) + 1); }"), units=1)
   with pytest.raises(TimeoutError): rt.wait(timeout=0.5)
   cores = [*rt.cores, rt.dispatcher]
-  for attempt in range(2):
+  for _ in range(2):
     with Runtime(chip, end=chip.tensix[1]) as fresh:
       assert all(chip.read32(*xy, MCAST_STATE + 4) == 0 for xy in cores)
       fresh.launch(compile_kernel("void kmain(volatile unsigned *a) { a[0] = 7; }"))

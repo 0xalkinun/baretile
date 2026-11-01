@@ -1,5 +1,5 @@
 # Model, server, training, adapter and benchmark tests (layer 4). See conftest.py for simulator setup.
-import gc, html, importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
+import collections, gc, html, importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
 from baretile import pci, tensor
@@ -89,6 +89,10 @@ def need_tinygrad(name="tinygrad"):
   if "TINYGRAD" not in os.environ: return pytest.importorskip(name)
   if os.environ["TINYGRAD"] not in sys.path: sys.path.insert(0, os.environ["TINYGRAD"])
   return importlib.import_module(name)
+
+def reporting(adapter, monkeypatch):  # the adapter's report on, as BARETILE_REPORT=1 sets it at import, and empty, for one test
+  monkeypatch.setattr(adapter, "REPORT", True)
+  monkeypatch.setattr(adapter, "reports", collections.Counter())
 
 def adapter_on(chip):  # the tinygrad adapter, on a runtime of its own over the whole chip
   need_tinygrad()
@@ -414,7 +418,7 @@ def test_tinygrad_cat(chip, monkeypatch):
   assert np.allclose(out[0].numpy(), np.concatenate([x * 2, y * 3, z * 4], 1), rtol=1e-6)
   assert np.allclose(out[1].numpy(), np.concatenate([x + 1, (y * z)[:, :64]], 1), rtol=1e-6)
 
-def test_tinygrad_bool_cat(chip):
+def test_tinygrad_bool_cat(chip, monkeypatch):
   # A bool is stored as 1 or 0 in the dtype of the comparison that made it, so the parts of a cat or a stack of bools
   # from fp32, int32 and bf16 are cast to one dtype. Both cats, of equal parts and of unequal ones, and the stack stay
   # on the chip and give the CPU's values.
@@ -425,14 +429,9 @@ def test_tinygrad_bool_cat(chip):
   def run(device):
     f, b, w = Tensor(x, device=device) > 0, Tensor(x, device=device).cast(dtypes.bfloat16) < 0, Tensor(i, device=device) > 0
     return [t.numpy() for t in (Tensor.cat(f, b, w[:, :32], dim=1), Tensor.cat(f, w, b, dim=1), Tensor.stack(f, b, w[:, 32:]))]
-  adapter.REPORT, before = True, dict(adapter.reports)
-  try:
-    adapter.reports.clear()
-    got = run("BARETILE")
-    assert not adapter.reports, adapter.reports
-  finally:
-    adapter.REPORT = False
-    adapter.reports.clear(); adapter.reports.update(before)
+  reporting(adapter, monkeypatch)
+  got = run("BARETILE")
+  assert not adapter.reports, adapter.reports
   for g, w in zip(got, run("CPU")): assert g.dtype == w.dtype and np.array_equal(g, w)
 
 def test_tinygrad_uploads_once(chip, monkeypatch):
@@ -563,35 +562,30 @@ def test_tinygrad_host_materialize(chip):
     assert runs == 2 or dict(adapter.RT.pinned) == pins, "discarded recordings release their pins"
 
 
-def test_tinygrad_report(chip, capsys):
+def test_tinygrad_report(chip, monkeypatch, capsys):
   # With BARETILE_REPORT=1, the adapter counts what leaves the chip for tinygrad's CPU, and why, at the line of the
   # program that did it: here random numbers, and a pad on six axes that no move makes. A TinyJit call that won't replay
   # says why, at the function. A program that stays on the chip reports nothing, and the exit report says so.
   adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit
   here = os.path.relpath(__file__)
-  adapter.REPORT, before = True, dict(adapter.reports)  # as BARETILE_REPORT=1 sets it at import
-  try:
-    adapter.reports.clear()
-    x = Tensor(np.ones((2,) * 6, np.float32), device="BARETILE")
-    (x * 2 + 1).realize()
-    assert not adapter.reports, adapter.reports
-    adapter.print_report()
-    assert "everything ran on the chip" in capsys.readouterr().err
-    (x.reshape(8, 8) * Tensor.rand(8, 8, device="BARETILE")).realize()
-    padded = TinyJit(lambda x: (x.pad(((1, 0),) * 6) * 2).realize())
-    for _ in range(3): padded(Tensor(np.ones((2,) * 6, np.float32), device="BARETILE"))
-    whys = {why: site for why, site in adapter.reports}
-    assert whys["random numbers"].startswith(here + ":"), adapter.reports
-    assert any(w.startswith("a view of") and site.startswith(here + ":") for w, site in whys.items()), adapter.reports
-    assert whys["a TinyJit call won't replay, for host work in the call"].endswith("<lambda>"), adapter.reports
-    adapter.print_report()
-    assert "random numbers" in capsys.readouterr().err
-  finally:
-    adapter.REPORT = False
-    adapter.reports.clear(); adapter.reports.update(before)
+  reporting(adapter, monkeypatch)
+  x = Tensor(np.ones((2,) * 6, np.float32), device="BARETILE")
+  (x * 2 + 1).realize()
+  assert not adapter.reports, adapter.reports
+  adapter.print_report()
+  assert "everything ran on the chip" in capsys.readouterr().err
+  (x.reshape(8, 8) * Tensor.rand(8, 8, device="BARETILE")).realize()
+  padded = TinyJit(lambda x: (x.pad(((1, 0),) * 6) * 2).realize())
+  for _ in range(3): padded(Tensor(np.ones((2,) * 6, np.float32), device="BARETILE"))
+  whys = {why: site for why, site in adapter.reports}
+  assert whys["random numbers"].startswith(here + ":"), adapter.reports
+  assert any(w.startswith("a view of") and site.startswith(here + ":") for w, site in whys.items()), adapter.reports
+  assert whys["a TinyJit call won't replay, for host work in the call"].endswith("<lambda>"), adapter.reports
+  adapter.print_report()
+  assert "random numbers" in capsys.readouterr().err
 
-def test_tinygrad_report_recorded_again(chip):
+def test_tinygrad_report_recorded_again(chip, monkeypatch):
   # A TinyJit call that runs Python where a replay could have run says why, also when it records again: here since a
   # buffer it reads was replaced from the host, or since its store went over host bytes, each before every call. One
   # that launches nothing says so once, and runs normally from then on. The values are the CPU's.
@@ -611,21 +605,16 @@ def test_tinygrad_report_recorded_again(chip):
         buf.allocator._copyin(buf._buf, memoryview(np.full(64, n, np.float32)))
       got += [scaled(x).tolist(), step(x).tolist(), nothing(x).tolist()]
     return got
-  adapter.REPORT, before = True, dict(adapter.reports)
-  try:
-    adapter.reports.clear()
-    got = run("BARETILE")
-    whys = {why: (site.split()[-1], n) for (why, site), n in adapter.reports.items()}
-  finally:
-    adapter.REPORT = False
-    adapter.reports.clear(); adapter.reports.update(before)
+  reporting(adapter, monkeypatch)
+  got = run("BARETILE")
+  whys = {why: (site.split()[-1], n) for (why, site), n in adapter.reports.items()}
   assert whys == {"a TinyJit call recorded again, for a buffer it reads that changed": ("<lambda>", 2),
                   "the next TinyJit call records again, for a store over host bytes": ("step", 3),
                   "a TinyJit call won't replay, for nothing launched on the chip": ("<lambda>", 1)}, whys
   assert got == run("CPU")
 
 
-def test_tinygrad_fp16(chip):
+def test_tinygrad_fp16(chip, monkeypatch):
   # fp16 values stay on the chip, as fp32 rounded to fp16 wherever tinygrad makes them, to nearest even as tinygrad's
   # CPU rounds. So a cast to half, math on halves, a half buffer from the host and one read back give the CPU's values,
   # and nothing goes to the CPU.
@@ -637,14 +626,9 @@ def test_tinygrad_fp16(chip):
     a, b = Tensor(x, device=device), Tensor(h, device=device)
     y = (a * 3).half()  # rounded where it's made
     return [t.numpy() for t in (y, y + b, (y * b).float() + a, b.float().sum(1), (a @ b.float().T).half())]
-  adapter.REPORT, before = True, dict(adapter.reports)
-  try:
-    adapter.reports.clear()
-    got = run("BARETILE")
-    assert not adapter.reports, adapter.reports
-  finally:
-    adapter.REPORT = False
-    adapter.reports.clear(); adapter.reports.update(before)
+  reporting(adapter, monkeypatch)
+  got = run("BARETILE")
+  assert not adapter.reports, adapter.reports
   # The elementwise results are the CPU's to the bit, except that the CPU skips rounding a product of halves that a
   # kernel casts up to fp32, as numpy and fp16 hardware round it. The sum and the matmul differ by fp32 rounding, which
   # the matmul's bf16 parts leave at about 2^-11 of its largest value, and its rounding to fp16 at 2^-11 more.
@@ -656,7 +640,7 @@ def test_tinygrad_fp16(chip):
     assert g.dtype == w.dtype and (np.array_equal(g, w) if exact else error <= 2**-10), (g.dtype, error)
 
 
-def test_tinygrad_cache_put(chip):
+def test_tinygrad_cache_put(chip, monkeypatch):
   # A store into whole rows of a BARETILE buffer, as a KV cache takes its new positions, is a put on the chip. A store
   # into part of each row still goes through the host, and the report says so. Both give the CPU's values.
   adapter = adapter_on(chip)
@@ -668,14 +652,10 @@ def test_tinygrad_cache_put(chip):
     t[:, :, 5:7, :].assign(Tensor(new, device=device) * 2).realize()
     t[:, :, :, 3:5].assign(Tensor(cols, device=device)).realize()
     return t.numpy()
-  adapter.REPORT, before, start = True, dict(adapter.reports), adapter.RT.launches
-  try:
-    adapter.reports.clear()
-    got = run("BARETILE")
-    whys = [why for why, _ in adapter.reports]
-  finally:
-    adapter.REPORT = False
-    adapter.reports.clear(); adapter.reports.update(before)
+  reporting(adapter, monkeypatch)
+  start = adapter.RT.launches
+  got = run("BARETILE")
+  whys = [why for why, _ in adapter.reports]
   assert ("put", 1) in [(k, n) for k, n, _, _ in adapter.RT.profile(start)], adapter.RT.profile(start)
   assert whys == ["a store into part of a buffer, through the host"], whys  # the columns, not the rows
   assert np.array_equal(got, run("CPU"))
@@ -890,7 +870,7 @@ def test_torch_frontend(chip):
 
 def test_tinygrad_llm(chip):
   # The Transformer in tinygrad/llm runs two SmolLM-shaped blocks on BARETILE, against our numpy Llama with the same
-  # bf16 weights. tinygrad's KV cache is fp16, which the adapter doesn't have, so it stays on the host. The blocks are
+  # bf16 weights. tinygrad's KV cache is fp16, which the adapter keeps on the chip in fp32 rounded to fp16. The blocks are
   # precompiled tinygrad functions, and the adapter inlines them with fresh buffers on each call.
   need_tinygrad("tinygrad.llm.model")
   from tinygrad import Tensor as TT, dtypes, nn
@@ -1192,13 +1172,14 @@ def test_llama_layer(chip, n):
 
 def test_kv_cache(chip):
   # A two-block Llama decodes 5 tokens after a 5-token prompt, against numpy. Positions are data, not shapes, so the
-  # steps launch the same kernels and replay from the third.
+  # steps launch the same kernels and replay from the third: only the first two run forward's Python.
   rt, rng = Runtime(chip), np.random.default_rng(13)
   c, w = smol(rng, 2)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
   kv, np_kv = llama.kv_cache(c, 32, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 32, np.zeros)
   on = lambda row: Tensor.of(rt, [row], "int32")
-  step, ids = tensor.jit(lambda ids, places: llama.forward(ids, places, t, c, kv)), [7, 200, 31, 64, 5]
+  ran, ids = [], [7, 200, 31, 64, 5]
+  step = tensor.jit(lambda ids, places: ran.append(places) or llama.forward(ids, places, t, c, kv))
   for i in range(6):
     new = ids if i == 0 else ids[-1:]
     places = list(range(len(ids) - len(new), len(ids)))
@@ -1206,6 +1187,7 @@ def test_kv_cache(chip):
     want = llama.forward(new, places, w, c, np_kv)[0]
     assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (i, np.abs(got - want).max(), np.abs(want).max())
     ids.append(int(want.argmax()))
+  assert len(ran) == 2, "the step after the second should replay"
   assert np.allclose(want, llama.forward(ids[:-1], range(len(ids) - 1), w, c, llama.kv_cache(c, 32, np.zeros))[0], atol=1e-3)
 
 def test_moe(chip):
@@ -1700,7 +1682,9 @@ def test_readme_examples():
   root = pathlib.Path(__file__).parent.parent
   readme = (root / "README.md").read_text()
   run = lambda *args: subprocess.run([sys.executable, *args], capture_output=True, text=True, timeout=600, cwd=root)
-  for block in re.findall(r"```python\n(.*?)```", readme, re.S):
+  blocks = re.findall(r"```python\n(.*?)```", readme, re.S)
+  assert blocks, "the README has no Python examples"
+  for block in blocks:
     out, said = run("-c", block), [line[2:] for line in block.splitlines() if line.startswith("# ")]
     assert out.returncode == 0 and out.stdout.splitlines() == said, out.stdout + out.stderr
   said, out = re.search(r"`baretile.hello` prints:\n\n```text\n(.*)\n```", readme)[1], run("-m", "baretile.hello")
@@ -1708,24 +1692,31 @@ def test_readme_examples():
   assert out.returncode == 0 and workers(out.stdout) == workers(said), out.stdout + out.stderr
 
 def test_website_matches_readme():
-  # Each line in the homepage's code blocks is a line in one of the README's, so the two can't drift apart. Comments
-  # at the end of a homepage line are its own.
+  # Each of the homepage's code blocks is lines of one of the README's, in their order, so the homepage shows no code
+  # that the README doesn't. It may leave lines out, and comments at the end of a homepage line are its own.
   root = pathlib.Path(__file__).parent.parent
-  readme = {line for block in re.findall(r"```\w*\n(.*?)```", (root / "README.md").read_text(), re.S) for line in block.splitlines()}
+  readme = [block.splitlines() for block in re.findall(r"```\w*\n(.*?)```", (root / "README.md").read_text(), re.S)]
   page = (root / "website/public/index.html").read_text()
-  lines = [html.unescape(re.sub(r"<[^>]+>", "", line)) for block in re.findall(r"<pre[^>]*><code>(.*?)</code></pre>", page, re.S)
-           for line in block.splitlines()]
-  missing = [line for line in (re.sub(r"\s+# .*$", "", line) for line in lines) if line.strip() and line not in readme]
-  assert lines and not missing, missing
+  blocks = [[re.sub(r"\s+# .*$", "", html.unescape(re.sub(r"<[^>]+>", "", line))) for line in block.splitlines()]
+            for block in re.findall(r"<pre[^>]*><code[^>]*>(.*?)</code></pre>", page, re.S)]
+  def within(lines, block):  # lines, apart from empty ones, are a subsequence of block
+    rest = iter(block)
+    return all(line in rest for line in lines if line.strip())
+  missing = [lines for lines in blocks if not any(within(lines, block) for block in readme)]
+  assert blocks and not missing, missing
 
 def test_doc_links():
   # Each link in the Markdown files to a file of the repository, by a relative path or on GitHub's main branch, finds
-  # the file, and each #anchor in one finds a heading there, as GitHub makes them. Links in code blocks don't count.
+  # the file, and each #anchor in one finds a heading there, as GitHub makes them. So does each link from the website
+  # to GitHub's main branch. Links and headings in code blocks don't count.
   root = pathlib.Path(__file__).parent.parent
-  headings = lambda p: {re.sub(r"[^\w\- ]", "", h.strip().lower()).replace(" ", "-") for h in re.findall(r"^#+ (.+)$", p.read_text(), re.M)}
+  text = lambda p: re.sub(r"```.*?```", "", p.read_text(), flags=re.S)
+  headings = lambda p: {re.sub(r"[^\w\- ]", "", h.strip().lower()).replace(" ", "-") for h in re.findall(r"^#+ (.+)$", text(p), re.M)}
   broken = []
-  for page in [*root.glob("*.md"), *root.glob("docs/*.md"), *root.glob("website/*.md")]:
-    for target in re.findall(r"\]\(([^)\s]+)\)", re.sub(r"```.*?```", "", page.read_text(), flags=re.S)):
+  for page in [*root.glob("*.md"), *root.glob("docs/*.md"), *root.glob("website/*.md"), *root.glob(".github/**/*.md"),
+               *root.glob("website/public/**/*.html")]:
+    links = r'href="(https://github\.com/0xalkinun/baretile/[^"]+)"' if page.suffix == ".html" else r"\]\(([^)\s]+)\)"
+    for target in re.findall(links, text(page)):
       if m := re.fullmatch(r"https://github\.com/0xalkinun/baretile/(?:blob|tree)/main/([^#]*)(?:#(.*))?", target): path, anchor = root / m[1], m[2]
       elif re.match(r"\w+:", target): continue  # another site
       else:
@@ -1744,7 +1735,7 @@ def test_two_chips():
                        timeout=600, cwd=pathlib.Path(__file__).parent.parent)
   assert run.returncode == 0 and run.stdout.strip().endswith("ok"), run.stdout + run.stderr
 
-@pytest.mark.skipif("LLAMA8B" not in os.environ, reason="set LLAMA8B=1 to test full block dimensions; this takes several minutes on ttsim")
+@pytest.mark.skipif(os.environ.get("LLAMA8B") != "1", reason="set LLAMA8B=1 to test full block dimensions; this takes several minutes on ttsim")
 def test_llama_8b_shapes(chip):
   # One block in Llama-3.1-8B's shapes at TT's performance precision, so B2's matmuls, casts and attention run at
   # full size. Only the vocabulary is cut, to 2048. On ttsim the casts in llama.upload take minutes, and upload waits
@@ -1817,18 +1808,16 @@ def test_benchmark_table():
   s, attention = cost.shape(c, "tt"), 2 * 4 * 4 * llama.head(c) * 10 * 11 // 2  # two blocks, scores and values, 4 heads, causal over 10 tokens
   assert benchmark.prefill_work(c, 10) == 2 * 10 * (s.work - s.head_work) + 2 * s.head_work + s.prefill_phases * attention
 
-def test_benchmark_load(chip, tmp_path):
+def test_benchmark_load(chip, tmp_path, start):
   # B4's load against serve.py for a small model: two agents, two streamed turns each. The second turn extends the
   # first, so most of its prompt should already be cached.
   rt, rng = Runtime(chip), np.random.default_rng(37)
   c, w = smol(rng, 2, places=128)
   engine = serve.Engine(rt, {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, c, bytes_tokenizer(tmp_path), slots=2, places=128, chunk=32)
   threading.Thread(target=engine.run, daemon=True).start()
-  httpd = serve.server(engine, "smol", port=0)
-  threading.Thread(target=httpd.serve_forever, daemon=True).start()
+  httpd = start(serve.server(engine, "smol", port=0))
   got = benchmark.load(f"http://localhost:{httpd.server_address[1]}", 2, SimpleNamespace(system=6, task=2, tool=2, out=4, n=2),
                        " ".join(f"w{i}" for i in range(40)))
-  httpd.shutdown()
   assert got["turns"] == 4 and got["tokens/s"] > 0 and got["seconds to first text"] > 0 and got["prompt tokens cached"] > 0.3, got
 
 def test_benchmark_streams():
@@ -1978,11 +1967,12 @@ def test_token_accuracy(chip):
   for i in range(8):
     ids, places = (prompt, range(36)) if i == 0 else ([after[i - 1]], [35 + i])
     top5.append([int(k) for k in np.argsort(-llama.forward(ids, places, w, c, kv)[0])[:5]])
-  assert llama.accuracy(rt, t, c, prompt, after, top5, 8)[:2] == (1, 1)
-  top5[3] = top5[3][1:] + top5[3][:1]  # move its most likely to last, so it's still in the top 5
   top1, five, picks = llama.accuracy(rt, t, c, prompt, after, top5, 8)
-  assert (top1, five) == (7 / 8, 1) and picks[3] == top5[3][-1], (top1, five, picks)
-  assert llama.accuracy(None, w, c, prompt, after, top5, 8) == (top1, five, picks), "numpy (rt None) should give the same picks and scores"
+  assert (top1, five) == (1, 1), (top1, five, picks)
+  # numpy (rt None) makes the chip's picks, and scores them as the chip's are scored
+  top5[3] = top5[3][1:] + top5[3][:1]  # move its most likely to last, so it's still in the top 5
+  top1, five, again = llama.accuracy(None, w, c, prompt, after, top5, 8)
+  assert (top1, five, again) == (7 / 8, 1, picks) and picks[3] == top5[3][-1], (top1, five, again)
   for steps in (0, 9):  # a step past the reference's predictions has nothing to score against
     with pytest.raises(ValueError, match="1 to 8 steps"): llama.accuracy(None, w, c, prompt, after, top5, steps)
 
@@ -2038,7 +2028,7 @@ def test_batched_decode(chip):
 def test_serve_command(tmp_path):
   # python3 -m baretile.models.serve serves a model folder, which is what fetch makes of a Hugging Face ID, as in the
   # README. A small random Llama answers a completion over HTTP, and a chat in the default of its named chat templates.
-  import socket, subprocess, urllib.request
+  import subprocess, urllib.request
   rng, dim, ffn, vocab = np.random.default_rng(5), 64, 128, 256
   w = lambda *shape: (rng.normal(0, 0.1, shape).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
   weights = {"model.embed_tokens.weight": w(vocab, dim), "lm_head.weight": w(vocab, dim), "model.norm.weight": w(dim),
@@ -2053,16 +2043,17 @@ def test_serve_command(tmp_path):
   # Some checkpoints keep named chat templates. chat uses the default
   (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": [{"name": "tool_use", "template": "{{ tools }}"},
                                                                                {"name": "default", "template": "<|im_start|>"}]}))
-  with socket.socket() as s:
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
   root = pathlib.Path(__file__).parent.parent
-  server = subprocess.Popen([sys.executable, "-m", "baretile.models.serve", str(tmp_path), str(port), "1", "64"], cwd=root, text=True,
+  server = subprocess.Popen([sys.executable, "-m", "baretile.models.serve", str(tmp_path), "0", "1", "64"], cwd=root, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=os.environ | {"PYTHONPATH": str(root)})
+  slow = threading.Timer(600, server.kill)  # a server that hangs before it's ready ends its output, and so the loop below
+  slow.start()
   try:
-    for line in server.stdout:  # it says when it's ready
-      if f"on port {port}" in line: break
+    for line in server.stdout:  # it says when it's ready, and on which port: port 0 has the system pick a free one
+      if m := re.search(r"on port (\d+)", line): break
     else: pytest.fail("the server stopped before it was ready")
+    slow.cancel()
+    port = int(m[1])
     ask = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions", json.dumps({"prompt": "Hi", "max_tokens": 3, "temperature": 0}).encode())
     reply = json.load(urllib.request.urlopen(ask, timeout=600))
     assert reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 3, reply
@@ -2071,10 +2062,11 @@ def test_serve_command(tmp_path):
     reply = json.load(urllib.request.urlopen(ask, timeout=600))
     assert reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 2, reply
   finally:
+    slow.cancel()
     server.kill()
     server.wait()
 
-def test_serve_timeout(tmp_path):
+def test_serve_timeout(tmp_path, start):
   # A request that receives no text within wait seconds must release its slot. A complete response gets HTTP 504, and a
   # stream ends with a chunk whose finish_reason is error, then [DONE]. The stand-in engine accepts requests without answering.
   import queue, urllib.error, urllib.request
@@ -2083,14 +2075,12 @@ def test_serve_timeout(tmp_path):
     lock, failed, busy = threading.Lock(), False, [None]
     offer = serve.Engine.offer
   hung = Hung()
-  http = serve.server(hung, "hung", port=0, wait=0.2)
-  threading.Thread(target=http.serve_forever, daemon=True).start()
+  http = start(serve.server(hung, "hung", port=0, wait=0.2))
   post = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/completions",
                                                                     json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=60)
   with pytest.raises(urllib.error.HTTPError) as e: post({"prompt": "Hi"})
   assert e.value.code == 504 and hung.waiting.get_nowait().gone, "the engine should drop a request that timed out"
   data = post({"prompt": "Hi", "stream": True}).read().decode()
-  http.shutdown()
   last = json.loads(data.split("\n\n")[-3].removeprefix("data: "))
   assert data.endswith("data: [DONE]\n\n") and last["choices"][0]["finish_reason"] == "error" and "no text came" in last["error"]["message"], data
   assert hung.waiting.get_nowait().gone
@@ -2680,6 +2670,16 @@ def test_reasoning_stream_prefixes():
     if text.endswith("Answer."): assert full == ("Reasoning.", "Answer.")
     else: assert full == ("Reasoning.<", ""), "flush an unfinished marker as ordinary text when generation ends"
 
+@pytest.fixture
+def start():  # serves each server it's given on a thread of its own until the test ends, however it ends
+  started = []
+  def go(server):
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+    started.append(server)
+    return server
+  yield go
+  for server in started: server.shutdown(); server.server_close()
+
 def serving(chip, tmp_path):  # the serve.py engine of the serve tests: a small model with sharp attention, on two slots
   rt, rng = Runtime(chip), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -2706,7 +2706,7 @@ def test_serve(chip, tmp_path):
   def greedy(prompt, n):  # numpy's tokens for the same prompt, as baretile.models.llama decodes
     kv, ids = llama.kv_cache(c, 64, np.zeros), list(prompt)
     logits = llama.forward(ids, list(range(len(ids))), w, c, kv)[0]
-    for i in range(n - 1): ids.append(int(logits.argmax())); logits = llama.forward(ids[-1:], [len(ids) - 1], w, c, kv)[0]
+    for _ in range(n - 1): ids.append(int(logits.argmax())); logits = llama.forward(ids[-1:], [len(ids) - 1], w, c, kv)[0]
     return ids[len(prompt):] + [int(logits.argmax())]
   assert together == [greedy(p, 6) for p in prompts], "requests must get numpy's greedy tokens while they decode together"
   before = engine.prefilled
@@ -2734,21 +2734,20 @@ def test_serve(chip, tmp_path):
   r.gone = True  # its client has gone
   assert r.take(np.eye(256)[97], True) and (r.made, r.finish) == ([], "gone") and r.out.empty()
 
-def completions(engine):  # serve.py's HTTP server on engine, its URL, and a function that posts a completion request
+def completions(engine, start):  # serve.py's HTTP server on engine: its URL, and a function that posts a completion request
   import urllib.request
-  http = serve.server(engine, "smol", port=0, defaults={"temperature": 0})
-  threading.Thread(target=http.serve_forever, daemon=True).start()
+  http = start(serve.server(engine, "smol", port=0, defaults={"temperature": 0}))
   url = f"http://127.0.0.1:{http.server_address[1]}/v1"
   post = lambda body: urllib.request.urlopen(urllib.request.Request(url + "/completions", json.dumps(body).encode(),
                                                                     {"Content-Type": "application/json"}), timeout=600)
-  return http, url, post
+  return url, post
 
-def test_serve_http(chip, tmp_path):
+def test_serve_http(chip, tmp_path, start):
   # serve.py's HTTP side: completions match the engine's tokens, streamed or not, with logprobs. When no slot is free,
   # a request gets an immediate 429 so the client can retry or use another provider.
   import urllib.request
   engine, tok, _, _ = serving(chip, tmp_path)
-  http, url, post = completions(engine)
+  url, post = completions(engine, start)
   r = serve.Request(tok, tok.encode("Hi there"), 6, 0)
   engine.waiting.put(r)
   text = tok.decode(done(r))
@@ -2768,20 +2767,18 @@ def test_serve_http(chip, tmp_path):
   assert e.value.code == 429 and json.load(e.value)["error"]["code"] == 429, "with no slot free, expected an immediate 429, not a wait"
   for h in holding: assert streamed(h)[1] is None, "usage only when the request asks for it"
   assert json.load(post({"prompt": "Hi", "max_tokens": 2}))["usage"]["completion_tokens"] == 2, "the slots should be free once the streams end"
-  http.shutdown()
 
-def test_serve_schema(chip, tmp_path):
+def test_serve_schema(chip, tmp_path, start):
   # A JSON schema as a completion's response format: the text is JSON that the schema allows, and it stops where the
   # schema allows no more.
   engine, _, _, _ = serving(chip, tmp_path)
-  http, _, post = completions(engine)
+  _, post = completions(engine, start)
   schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"], "additionalProperties": False}
   shaped = json.load(post({"prompt": "Hi there", "max_tokens": 80, "temperature": 0,
                            "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}}))["choices"][0]
   assert json.loads(shaped["text"])["answer"] in ("yes", "no") and shaped["finish_reason"] == "stop", shaped  # the schema allows no more text
-  http.shutdown()
 
-def test_serve_chat(chip, tmp_path):
+def test_serve_chat(chip, tmp_path, start):
   # Chat templates, and a thinking model's reasoning, which a chat completion returns apart from its answer, streamed
   # or not. gpt-oss's harmony format has channels for the two.
   import urllib.request
@@ -2790,8 +2787,7 @@ def test_serve_chat(chip, tmp_path):
   assert serve.chat("... <|im_start|> ...", hi) == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
   assert serve.chat("... <|start_header_id|> ...", hi[1:]) == ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"
                                                                "<|start_header_id|>assistant<|end_header_id|>\n\n")
-  think = serve.server(engine, "smol", "<|im_start|> <think>", port=0)  # a thinking model's template (Qwen3's)
-  threading.Thread(target=think.serve_forever, daemon=True).start()
+  think = start(serve.server(engine, "smol", "<|im_start|> <think>", port=0))  # a thinking model's template (Qwen3's)
   ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{think.server_address[1]}/v1/chat/completions",
                                                                    json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=600)
   r = serve.Request(tok, tok.encode(serve.chat("<|im_start|> <think>", hi[1:]), special=True), 6, 0)
@@ -2808,7 +2804,6 @@ def test_serve_chat(chip, tmp_path):
   off = len(tok.encode(serve.chat("<|im_start|> <think>", hi[1:], False), special=True))
   with pytest.raises(urllib.error.HTTPError) as e: ask(body | {"chat_template_kwargs": {"enable_thinking": False}})
   assert e.value.code == 400 and json.load(e.value)["error"]["message"] == f"a prompt needs 1 to 62 tokens, not {off}"
-  think.shutdown()
   assert serve.chat("<|im_start|> <think>", hi[1:], False) == "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
   assert serve.answer("<think>\nLet me see.\n</think>\n\nHi!") == ("Let me see.", "Hi!") and serve.answer("<think>\nHm") == ("Hm", "")
   harmony = serve.chat("<|channel|>", hi, effort="low")  # gpt-oss's harmony has its system message, ours as a developer message, and channels
@@ -3019,9 +3014,9 @@ def test_prompt_snapshot_includes_prediction(chip, tmp_path):
   engine.admit(next_request)
   assert next_request.cached == 0 and engine.coherent[0], "incomplete prediction history must be rebuilt"
 
-def test_chat_tools(tmp_path):
+def test_chat_tools(tmp_path, start):
   # serve.qwen_chat must give the strings that Qwen3.6's chat_template.jinja makes through transformers'
-  # apply_chat_template. Tool calls in an answer come out in OpenAI's format, typed by the tool's schema, and go back
+  # apply_chat_template, written down here from it. Tool calls in an answer come out in OpenAI's format, typed by the tool's schema, and go back
   # into the template as they came. Over HTTP, a stand-in engine answers with a tool call, in one response and
   # streamed.
   import queue, urllib.request
@@ -3058,8 +3053,7 @@ def test_chat_tools(tmp_path):
         r.out.put(None)
   stand = Stand()
   threading.Thread(target=stand.run, daemon=True).start()
-  http = serve.server(stand, "qwen", qwen, port=0)
-  threading.Thread(target=http.serve_forever, daemon=True).start()
+  http = start(serve.server(stand, "qwen", qwen, port=0))
   ask = lambda body: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/chat/completions",
                                                                    json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=60)
   reply = json.load(ask({"messages": messages[:2], "tools": tools}))["choices"][0]
@@ -3084,7 +3078,6 @@ def test_chat_tools(tmp_path):
     assert reply["message"]["content"] == shown and reply["finish_reason"] == "stop" and "tool_calls" not in reply["message"]
     events = streamed(ask({"messages": messages[:2], "tools": tools, "stream": True}))[0]
     assert "".join(e["delta"].get("content", "") for e in events) == shown and events[-1]["finish_reason"] == "stop"
-  http.shutdown()
 
 def test_attention_cost_units():
   # cost.attention counts reads in kernels.attention_plan's units. A unit reads each key and value tile once for all its
@@ -3171,8 +3164,13 @@ def test_cost(tmp_path):
   read = cost.shape(l8, "bfp4").every + cost.session(l8, use | {"context": 612.5, "kv": "bfp8"}).kv
   assert abs(read / 6.20e9 - 1) < 0.02, read
   card = dict(cost.CARD)
-  t = cost.step(c, s, use, card, 4)
-  assert math.isclose(cost.hourly(card) / (4 * t.rate * 3600) * 1e6, cost.hourly(card) / (4 / t.seconds) / 3600 * 1e6)
+  # the report's dollars per million tokens out, for 4 users: a step makes a token each, or 1 + accept with drafts
+  kv = llama.precision(c, "experts", None)["kv", None][0]
+  rows = [row for row in (line.split() for line in cost.report(str(tmp_path / "qwen"), "experts", accept=0.5).splitlines()) if row[:1] == ["4"]]
+  assert len(rows) == 2, rows
+  for row, made, speculative in zip(rows, (1, 1.5), (False, True)):
+    t = cost.step(c, s, use | {"accept": 0.5, "kv": kv}, card, 4, speculative)
+    assert abs(float(row[7]) - cost.hourly(card) * t.seconds / (4 * made) / 3600 * 1e6) < 1e-3, row
   (tmp_path / "probe.json").write_text(json.dumps({"DRAM reads of bfp8 chunks, 4 in flight: grid workers, own banks": 420.0,
                                                    "DRAM reads of bfp4 chunks, 4 in flight: grid workers, own banks": 300.0,
                                                    "matmul step, 1 phase, unpacks included": 16.0, "launch, 100 queued: chip each": 2700.0,
@@ -3203,10 +3201,10 @@ def test_cost(tmp_path):
   result = cost.report(str(tmp_path / "llama"), dram=held + card["reserve"] + 1)
   assert "0 sessions fit" in result and "no room for a session" in result and "tok/s" not in result
 
-def test_fetch(tmp_path, monkeypatch):
+def test_fetch(tmp_path, monkeypatch, start):
   # serve.fetch from a local server standing in for Hugging Face (HF_ENDPOINT). It gets the shards the index names and
   # the configs that exist, and a finished download isn't fetched again.
-  import functools, http.server, threading
+  import functools, http.server
   hub = tmp_path / "hub" / "org" / "model" / "resolve" / "main"
   hub.mkdir(parents=True)
   weight_map = {"a": "model-1.safetensors", "b": "model-2.safetensors", "c": "model-1.safetensors"}
@@ -3214,8 +3212,7 @@ def test_fetch(tmp_path, monkeypatch):
            "model-1.safetensors": "1", "model-2.safetensors": "2", "model.safetensors.index.json": json.dumps({"weight_map": weight_map})}
   for name, text in files.items(): (hub / name).write_text(text)
   quiet = type("Quiet", (http.server.SimpleHTTPRequestHandler,), {"log_message": lambda *a: None})
-  hf = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(quiet, directory=str(tmp_path / "hub")))
-  threading.Thread(target=hf.serve_forever, daemon=True).start()
+  hf = start(http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(quiet, directory=str(tmp_path / "hub"))))
   monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{hf.server_address[1]}")
   folder = serve.fetch("org/model", str(tmp_path / "cache"))
   assert sorted(os.listdir(folder)) == sorted([*files, ".done"]) and all((pathlib.Path(folder) / n).read_text() == t for n, t in files.items())
