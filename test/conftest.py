@@ -2,7 +2,7 @@
 # code generation and tensors; test_models.py covers models, serving and adapters. They run on the simulator that
 # python3 -m baretile.chip ttsim downloads, or the libttsim.so that TTSIM names. On a machine with a card and no TTSIM,
 # they open the first Blackhole on the PCI bus as root (see docs/bring-up.md).
-import functools, gc, os, pytest
+import functools, gc, json, os, pathlib, statistics, pytest
 import numpy as np
 from baretile import pci
 from baretile.chip import Chip
@@ -33,11 +33,29 @@ def pytest_runtest_makereport(item, call):  # with SKIPS=fail, a test that skips
   if report.skipped and os.environ.get("SKIPS") == "fail":
     report.outcome, report.longrepr = "failed", f"it skipped, with SKIPS=fail: {report.longrepr}"
 
-def pytest_collection_modifyitems(config, items):  # with PART=i/n, every nth test from the ith, for one of n processes
+# With PART=i/n, part i of n of the tests, for one of n processes or CI jobs. The parts take about as long, by the
+# seconds each test took in test/durations.json: longest first, each goes to the part with the least so far. A test the
+# file doesn't list counts as its median. DURATIONS=write rewrites the file from the tests this run runs.
+DURATIONS, times = pathlib.Path(__file__).with_name("durations.json"), {}
+def pytest_collection_modifyitems(config, items):
   if not (part := os.environ.get("PART")): return
   i, n = map(int, part.split("/"))
-  config.hook.pytest_deselected(items=[t for k, t in enumerate(items) if k % n != i - 1])
-  items[:] = items[i - 1::n]
+  known = json.loads(DURATIONS.read_text())
+  seconds = lambda t: known.get(t.nodeid, statistics.median(known.values()))
+  load, mine = [0.0] * n, set()
+  for t in sorted(items, key=seconds, reverse=True):
+    k = load.index(min(load))
+    load[k] += seconds(t)
+    if k == i - 1: mine.add(t.nodeid)
+  config.hook.pytest_deselected(items=[t for t in items if t.nodeid not in mine])
+  items[:] = [t for t in items if t.nodeid in mine]  # in the suite's order
+
+def pytest_runtest_logreport(report):  # setup, call and teardown add up to a test's time
+  if os.environ.get("DURATIONS") == "write": times[report.nodeid] = times.get(report.nodeid, 0) + report.duration
+
+def pytest_sessionfinish(session):  # in the main process, which gets every worker's reports
+  if os.environ.get("DURATIONS") == "write" and not hasattr(session.config, "workerinput"):
+    DURATIONS.write_text(json.dumps({k: round(v, 2) for k, v in sorted(times.items())}, indent=0) + "\n")
 
 @pytest.fixture
 def no_gc():  # Python collects only where the test calls gc.collect()

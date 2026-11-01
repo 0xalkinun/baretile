@@ -4,8 +4,9 @@
 # process. The suite includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints,
 # PyTorch, transformers or tiktoken skip themselves here. A test that takes over ten minutes prints the stacks of its
 # process's threads (faulthandler_timeout), so a hung one says where, and a job that takes over 20 minutes, where it
-# takes about 5, is stopped. A pull request's branch runs once, as the pull request, and a newer push to it cancels the
-# run still going. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
+# takes about 3, is stopped. A pull request's branch runs once, as the pull request, and a newer push to it cancels the
+# run still going. A pull request that changes only Markdown runs the doc tests and the package checks, and skips the
+# simulator jobs. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
 name: test
 on:
   push:
@@ -17,6 +18,30 @@ concurrency:
 permissions:
   contents: read
 jobs:
+  # whether the simulator jobs run: on a push to main, and on a pull request that changes anything but Markdown
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.files.outputs.code }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then echo code=true >> "$GITHUB_OUTPUT"; exit; fi
+          others=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                   --jq '.[].filename' | grep -cv '\.md$' || true)
+          echo "code=$([ "$others" != 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+  # the links, the README's examples and the website, which a docs-only pull request runs alone
+  docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy pytest
+      - run: python -m pytest test/test_models.py -k "test_doc_links or test_readme_examples or test_website_matches_readme"
   package:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -47,17 +72,20 @@ jobs:
           python -I -c "from baretile.models import cost, gpt2, llama, qwen, serve, train"
           python -I -m baretile.models.serve 2>&1 | grep -q "usage"
   # The suite on released ttsim, whose p150 has 120 Tensix tiles, and on ttsim-chaos with all 140 and no noise, since a
-  # p150 reports 120 or 140 depending on its firmware. Each runs as three jobs, the gth on every third test from the gth
-  # on (PART in test/conftest.py), in a pytest-xdist worker for each of the runner's CPUs.
+  # p150 reports 120 or 140 depending on its firmware. Each runs as five jobs, which split the tests by the seconds each
+  # took in test/durations.json (PART in test/conftest.py), in a pytest-xdist worker for each of the runner's CPUs. The
+  # 20 slowest tests show at the end of each job's log.
   test:
-    name: test (${{ matrix.tiles }} tiles, ${{ matrix.group }}/3)
+    name: test (${{ matrix.tiles }} tiles, ${{ matrix.group }}/5)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         tiles: [120, 140]
-        group: [1, 2, 3]
+        group: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -106,7 +134,7 @@ jobs:
           if [ ${{ matrix.tiles }} = 140 ]; then
             export TTSIM="$RUNNER_TEMP/ttsim-chaos/src/_out/release_bh/libttsim.so" TTSIM_CHAOS_UNHARVESTED=1
           fi
-          PART=${{ matrix.group }}/3 python -m pytest -n auto --dist worksteal -o faulthandler_timeout=600 test
+          PART=${{ matrix.group }}/5 python -m pytest -n auto --dist worksteal --durations=20 -o faulthandler_timeout=600 test
         env:
           OPENBLAS_NUM_THREADS: 1
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
@@ -114,8 +142,11 @@ jobs:
           KMD_IOCTL: ${{ runner.temp }}/ioctl.h
   # The comparisons with transformers, PyTorch, tiktoken and safetensors skip in the test job, which doesn't install
   # them. This job installs pinned versions and runs those tests, and SKIPS=fail turns a skip into a failure, so a
-  # missing package can't pass for a green run. The PyTorch frontend also needs the pinned tinygrad.
+  # missing package can't pass for a green run. The PyTorch frontend also needs the pinned tinygrad. pip's cache follows
+  # this file, where the versions are pinned.
   references:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -123,11 +154,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/workflows/test.yml
       - name: Install clang, lld and the Python packages
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
           python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install numpy pytest transformers==5.20.2 tiktoken==0.13.0 safetensors==0.8.0
+          python -m pip install numpy pytest pytest-xdist transformers==5.20.2 tiktoken==0.13.0 safetensors==0.8.0
       - name: Check out tinygrad
         run: |
           git init -q "$RUNNER_TEMP/tinygrad"
@@ -140,7 +173,7 @@ jobs:
           restore-keys: kernels-
       - run: python -m baretile.chip ttsim
       - run: >-
-          python -m pytest -s -rs -o faulthandler_timeout=600 test/test_models.py::test_train test/test_models.py::test_train_gpt2
+          python -m pytest -n auto -rs --durations=20 -o faulthandler_timeout=600 test/test_models.py::test_train test/test_models.py::test_train_gpt2
           test/test_models.py::test_llama_frequencies test/test_models.py::test_tokenizer test/test_models.py::test_hf_families
           test/test_models.py::test_qwen3_moe test/test_models.py::test_qwen3_5_moe test/test_models.py::test_mxfp4
           test/test_models.py::test_torch_frontend
@@ -149,12 +182,14 @@ jobs:
           TINYGRAD: ${{ runner.temp }}/tinygrad
   # The kernels on ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md,
   # "ttsim-chaos"), with every kind of timing noise. The run number seeds it, so each run tries other timings. It runs as
-  # two jobs, each a process for each of the runner's CPUs, on every nth test from its own on (PART in test/conftest.py).
+  # two jobs, each a process for each of the runner's CPUs, on a part of the tests (PART in test/conftest.py).
   # ttsim-chaos seeds a process's noise once, so what a test sees follows from the tests before it, and
   # TTSIM_CHAOS_SEED=s PART=i/n repeats part i of n of run s, as re-running a failed job does. The log shows both. A part
   # that hangs is stopped at 15 minutes, before the job is, so its log still shows.
   chaos:
     name: chaos (${{ matrix.group }}/2)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -210,14 +245,17 @@ jobs:
           TTSIM_CHAOS_SEED: ${{ github.run_number }}
   # The check that main's branch protection requires: it passes when every job above passed, so they can be split or
   # renamed without changing the repository's settings. It runs even when one fails, since a skipped check would pass.
+  # A simulator job may be skipped only because the pull request changes nothing but Markdown.
   all:
     if: always()
-    needs: [package, test, references, chaos]
+    needs: [changes, docs, package, test, references, chaos]
     runs-on: ubuntu-24.04
     steps:
       - run: |
           echo "${{ join(needs.*.result, ' ') }}"
-          [ -z "$(echo "${{ join(needs.*.result, ' ') }}" | tr ' ' '\n' | grep -v '^success$')" ]
+          allowed='^success$'
+          [ "${{ needs.changes.outputs.code }}" = false ] && allowed='^(success|skipped)$'
+          [ "${{ needs.changes.result }}" = success ] && [ -z "$(echo "${{ join(needs.*.result, ' ') }}" | tr ' ' '\n' | grep -Ev "$allowed")" ]
   # The bring-up stages on a P150a, from preflight through the model tests, on the self-hosted runner in the card's
   # machine. They run once a maintainer sets the repository variable CARD to true, and never for a pull request from a
   # fork: a self-hosted runner runs whatever the pull request's code does, with the machine's access. With the variable

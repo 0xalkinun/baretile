@@ -163,10 +163,15 @@ takeover, cancellation, shutdown and host memory, where timing bugs hide. None o
 them depends on exact simulated timing. CI also runs the whole suite with
 `TTSIM_CHAOS_UNHARVESTED=1`, beside the released ttsim's.
 
-CI splits its runs across runners with `PART=i/n`, which runs every nth test from
-the ith. The suite on each ttsim runs as three jobs, each in a pytest-xdist
-worker for each CPU. The noise runs as two jobs, each a process for each CPU on
-its own part. A process's noise follows from the seed and the tests it runs, in
+CI splits its runs across runners with `PART=i/n`, which runs part i of n, split
+so the parts take about as long by the seconds each test took in
+[test/durations.json](../test/durations.json). `DURATIONS=write` rewrites that
+file from the tests a run runs, so run the whole suite with it after adding slow
+tests. The suite on each ttsim runs as five jobs, each in a pytest-xdist worker
+for each CPU, and each lists its 20 slowest tests at the end. The noise runs as
+two jobs, each a process for each CPU on its own part. A pull request that
+changes only Markdown runs the doc tests and the package checks, and skips the
+simulator jobs. A process's noise follows from the seed and the tests it runs, in
 order, so `TTSIM_CHAOS_SEED=s PART=i/n`, with the job's settings and tests,
 repeats a failed part, and the log shows all of them. A test that runs over ten
 minutes prints the stacks of its process's threads, pytest's

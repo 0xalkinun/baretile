@@ -31,7 +31,8 @@ hangs.
 ## What a change needs
 
 - A test that runs on ttsim. Compare kernels against NumPy.
-- The whole suite passing before you send it.
+- The tests your change touches, and `test/test_device.py`, passing before you send
+  it. CI runs the whole suite, on 120 and on 140 Tensix tiles.
 - For a new or changed kernel, a passing run under [ttsim-chaos](docs/testing.md#ttsim-chaos),
   which adds the NoC latency, FPU and SFPU latency, and core jitter that ttsim leaves out.
   CI runs the kernel tests under it with a new seed each time, and the whole suite on all 140 Tensix tiles.
