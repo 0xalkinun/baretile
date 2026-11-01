@@ -278,7 +278,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   if len(wts) > 1: raise ValueError("a kernel takes one block-float format")
   wt = next(iter(wts), "bfp8")
   # the number of blocks down and across a matrix
-  br, bc = (mc[1], len(grid[0])) if mc else (1, bcast[0] * bcast[1]) if bcast else (-(-rt // bp), -(-w // bq))
+  br, bcols = (mc[1], len(grid[0])) if mc else (1, bcast[0] * bcast[1]) if bcast else (-(-rt // bp), -(-w // bq))
   decls, tail = "", ""  # BRISC's tables and statics, and the code it runs last
   if mc:
     (gx_n, gy_n), (xs, ys) = mc, grid
@@ -404,7 +404,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     (r,), k, ib = picked, shapes[picked[0]][2], tile_bytes("int32")
     it = -(-shapes[r][1] // 32)  # tiles of indices, kept in L1 below OUTS
     if not (shapes[r][0] == 1 and k <= 32 and OUTS - it * ib >= B8 + 3 * B8_SLOTS * tile_bytes("bfp8")):
-      raise ValueError("indices must be one tile column below OUTS")
+      raise ValueError("indices must be one matrix of at most 32 columns")
     indices = (f"#define IDS {OUTS - it * ib:#x}\nstatic unsigned ids(unsigned b) {{ "
                f"unsigned t = b / {k}, j = b % {k};  // index (t, j)\n"
                f"  return ((volatile unsigned *)IDS)[t / 32 * 1024 + (t % 32 / 16 * 2 + j / 16) * 256 + t % 16 * 16 + "
@@ -476,7 +476,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
         # it have it.
         if mc:
           gx_n, gy_n = mc
-          gx, gy, a_n = f"unit % {bc}", f"unit / {bc}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {K}"
+          gx, gy, a_n = f"unit % {bcols}", f"unit / {bcols}", f"(i0 + {bp} < {rt} ? {bp} : {rt} - i0) * {K}"
           # worker k's share of n tiles
           part = lambda n, k, parts: (f"{k} * {n} / {parts}", f"({k} + 1) * {n} / {parts}")
           (a0, a1), (b0, b1) = part(a_n, gx, gx_n), part(K, gy, gy_n)
@@ -545,17 +545,17 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
         else:
           # with bcast or shared, A's row is in already
           new = "0" if bcast or shared else f"fresh({q}, {which(op['x'])} * {rt} + i_)"
-          # B's column comes n tiles a chunk, into part p of the ring, with A's tiles beside it if the row is new. A
+          # B's column comes per tiles a chunk, into part p of the ring, with A's tiles beside it if the row is new. A
           # block float's ring is at b8_at or B8, a bf16's at ring_slot.
           if chunked:
-            n, first = chunk_tiles(op["wt"]), 0 if bfp else ring_slot
-            c[B].append(f"{cond}{live}{{ unsigned new = {new}; for (unsigned m0 = 0; m0 < {kt}; m0 += {n}) {{ "
-                        f"unsigned nk = {kt} - m0 < {n} ? {kt} - m0 : {n}, "
-                        f"p = chunk_part(); {run_b('m0', f'{first} + p * {n}', 'nk')}; "
+            per, ring_first = chunk_tiles(op["wt"]), 0 if bfp else ring_slot
+            c[B].append(f"{cond}{live}{{ unsigned new = {new}; for (unsigned m0 = 0; m0 < {kt}; m0 += {per}) {{ "
+                        f"unsigned nk = {kt} - m0 < {per} ? {kt} - m0 : {per}, "
+                        f"p = chunk_part(); {run_b('m0', f'{ring_first} + p * {per}', 'nk')}; "
                         f"if (new) for (unsigned m = m0; m < m0 + nk; m++) get(a[{x}], {a_tile}, {rows_at[q]} + m); "
                         f"chunk_issued(p, nk); }} "
                         "tagged(0); }")
-            steps_u = lambda lo, hi: (f"for (unsigned m = {lo}; m < {hi}; m++) {{ unsigned z = landed_chunk(m, {n}); "
+            steps_u = lambda lo, hi: (f"for (unsigned m = {lo}; m < {hi}; m++) {{ unsigned z = landed_chunk(m, {per}); "
                                       f"{tt(step_unpack('z'))} }}")
             if not bfp:  # move unpacker 0 to the ring for B's steps
               at = lambda slot: tt(reconfigure(SEC0_base=(slot_base(dtype) + slot * tile_bytes(dtype)) // 16 - 1))
@@ -635,7 +635,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     passes.append((bool(swept_ops or reductions), c))
   # A unit's first column. With local, it's the first column in the worker's bank, plus 8 for each reader of that bank
   # before this one. Tile column j of B is in bank (j + B's tile offset) % 8, or in bank j % 8 for B by columns.
-  col0 = f"unit % {bc} * {bq}"
+  col0 = f"unit % {bcols} * {bq}"
   if local:
     first_b = "0" if ops[matmuls[0]]["bc"] else f"a[{arg(ops[matmuls[0]]['y']) + 3}]"
     col0 = f"((reader[unit] >> 12 & 7) - {first_b}) % {len(bh.DRAM)} + {len(bh.DRAM)} * (reader[unit] >> 16 & 255)"
@@ -669,11 +669,12 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       # With local, a unit's columns come from its worker's reader (col0), so the step to the next unit below would be
       # wrong. But a worker takes one unit, since the units are the grid's workers, and the bcast prologue relies on
       # it too.
-      return f"""  unsigned unit = a[0], b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = {col0};
+      return f"""  unsigned unit = a[0], b = unit / {br * bcols}, i0 = unit % {br * bcols} / {bcols} * {bp}, \
+j0 = {col0};
   for (unsigned u = 0; u < a[1]; u++, unit++) {{
     {tiles_c}
     // the next unit, without dividing
-    if ((j0 += {bq}) == {bc * bq}) {{ j0 = 0; if ((i0 += {bp}) == {br * bp}) {{ i0 = 0; b++; }} }}
+    if ((j0 += {bq}) == {bcols * bq}) {{ j0 = 0; if ((i0 += {bp}) == {br * bp}) {{ i0 = 0; b++; }} }}
   }}"""
     index = ("b", "i_", "j")  # a tile's position: matrix, row, column. A unit fixes the two the sweep doesn't walk
     (outer, _), (inner, m) = [(index[ax], n[ax]) for ax in range(3) if ax != axis]
@@ -697,21 +698,21 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     (gx_n, gy_n), (xs, ys), kt, x = bcast, grid, ops[matmuls[0]]["kt"], arg(ops[matmuls[0]]["x"])
     # each matrix's grid rows
     rects = [bh.noc_rect((xs[0], ys[g]), (xs[gx_n - 1], ys[g + gy_n - 1])) for g in range(0, nb * gy_n, gy_n)]
-    decls, tail = table("rect", rects) + "\n" + ours, f"unflag({gx_n}, 0);"
+    decls, tail = decls + table("rect", rects) + "\n" + ours, f"unflag({gx_n}, 0);"
     in_batch = matrix(ops[matmuls[0]]["x"], x)
     near = (f"  for (unsigned i = 0; i < {len(bh.DRAM)}; i++) near[i] = bank[i];\n"
             "  near[reader[a[0]] >> 12 & 7] = reader[a[0]] & 0xFFF; "
             " // its own bank through its reader's port\n") if local else ""
-    first = (near + f"  {{ unsigned b = a[0] / {bc}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, "
+    first = (near + f"  {{ unsigned b = a[0] / {bcols}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, "
                     f"end = (gx + 1) * {kt} / {gx_n};\n"
-             f"    if (a[0] % {bc} < {gx_n}) {{ for (unsigned m = e; m < end; "
+             f"    if (a[0] % {bcols} < {gx_n}) {{ for (unsigned m = e; m < end; "
              f"m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
              f"      share(SLOT({rows_at[0]} + e), "
-             f"(end - e) * {tile_bytes(dtype)}, rect[b], {bc - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
+             f"(end - e) * {tile_bytes(dtype)}, rect[b], {bcols - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
   # With shared, grid workers wait for A's row before their first tile. The grid's first row reads and sends it.
   if shared:
     (xs, ys), kt, x = grid, ops[matmuls[0]]["kt"], arg(ops[matmuls[0]]["x"])
-    decls, tail = table("grid_x", xs) + table("grid_y", ys) + "\n", f"unflag({len(xs)}, 0);"
+    decls, tail = decls + table("grid_x", xs) + table("grid_y", ys) + "\n", f"unflag({len(xs)}, 0);"
     get_a = lambda e, end: f"for (unsigned m = {e}; m < {end}; m++) get(a[{x}], m + a[{x + 3}], {rows_at[0]} + m);"
     first = (f"  {{ unsigned me = noc_me(), gx = {len(xs)}, gy = {len(ys)};\n"
              f"    for (unsigned i = 0; i < {len(xs)}; i++) if (grid_x[i] == (me & 63)) gx = i;\n"
@@ -733,7 +734,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   image = compile_kernel(brisc, unpack_program(program(U), cfg, indices + ours),
                          math_program(slots, program(M), dst, indices + ours, bool(wide)),
                          pack_program(program(P), decls=ours))
-  return image, (nb * rt * w // L if reducing else nb * br * bc)  # and the number of units in the result
+  return image, (nb * rt * w // L if reducing else nb * br * bcols)  # and the number of units in the result
 
 def attention_l1(ht, R, wt, parts):
   """Lay out attention_kernel's L1 for a unit of R tile rows of queries.
@@ -768,7 +769,7 @@ def attention_store(ht, R, wt, parts):
   regions reserved for frames."""
   *_, used, top = attention_l1(ht, R, wt, parts)
   if not wt: return used, (UNPACKABLE - used) // ht
-  per = 64 // ht  # key rows in a region
+  per = B8_SLOTS // ht  # key rows in a region
   size = per * ht * tile_bytes(wt)
   windows = ((slot_base("bf16") + used * tile_bytes("bf16") + 63) // 64 * 64,
              B8), (B8 + 2 * 2 * ht * tile_bytes(wt), top)
@@ -852,7 +853,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   # n / rows_a, from slot n % rows_a * ht on. A bf16 row n starts at slot store + n * ht.
   if keep:
     store, room = attention_store(ht, R, wt, parts)
-    rows_a = 64 // ht
+    rows_a = B8_SLOTS // ht
   kept = f"(kt - k0 < {room})" if keep else "0"  # the key row is in the store
   cfg = kernel_config()
   first, onto = accumulating(oacc, False), accumulating(oacc, True)  # pack the output tiles in fp32, then add onto them
