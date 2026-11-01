@@ -763,6 +763,7 @@ def test_matmul_parts(chip):
     rt = Runtime(chip, end=end)
     reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
     kp, q, _ = grid_parts(-(-m // 32), -(-n // 32), k // 32, rt.grid, base, 2)  # this case goes in parts
+    assert grid_parts(-(-m // 32), -(-n // 32), 1, rt.grid, 254) is False, "a K of one tile can't be cut into parts"
     w = -(-n // 32)
     bq = -(-w // min(len(rt.grid[0]), w))  # columns of result tiles in each worker's block, as in grid_parts
     groups = -(-bq // q)  # and the groups they're taken in
@@ -1359,10 +1360,18 @@ def test_attention_extremes(chip):
     assert np.array_equal(value(q.attend(k, v, Tensor.of(rt, [[63]], "int32"), parts=parts)), np.full((1, 1, 64), 2))
 
 def test_attention_capacity(chip):
+  # A head too wide for L1 is refused before anything is allocated or launched. bf16's frames are among the slots, so a
+  # bf16 head fits up to 50 tiles, 1,600 columns, and matches numpy there. A block float's frames go at B8, so a block
+  # float head of 48 tiles doesn't fit.
   from baretile.kernels import attention_parts, attention_store
-  rt = Runtime(chip)
-  for fmt in ("bf16", "bfp8", "bfp4"):
-    q, k, v = Tensor(rt, 1, 1536), Tensor(rt, 32, 1536, dtype=fmt), Tensor(rt, 32, 1536, dtype=fmt)
+  rt, rng = Runtime(chip), np.random.default_rng(48)
+  q, k, v = (bf16(rng.normal(0, 0.05, s)) for s in ((1, 1600), (64, 1600), (64, 1600)))
+  scores = q @ k.T
+  p = np.exp(scores - scores.max())
+  close(Tensor.of(rt, q.tolist()).attend(*(Tensor.of(rt, a.tolist()) for a in (k, v)), Tensor.of(rt, [[63]], "int32")),
+        (p / p.sum()) @ v, 2**-6)
+  for fmt, d in (("bf16", 1632), ("bfp8", 1536), ("bfp4", 1536)):
+    q, k, v = Tensor(rt, 1, d), Tensor(rt, 32, d, dtype=fmt), Tensor(rt, 32, d, dtype=fmt)
     pos = Tensor.of(rt, [[31]], "int32")
     before, used = rt.launches, dict(rt.used)
     for parts in (None, 1, 2):
@@ -1646,6 +1655,23 @@ def test_leading_reductions(chip):
   close(gb, x.sum(1, keepdims=True), 1e-5)
   g, top = a.max(1).sum().gradient(a)[0], x == x.max(1, keepdims=True)
   close(g, top / top.sum(1, keepdims=True), 1e-6)  # to each maximum, split between ties
+  # An input of the result's batch is read at the result's matrix, also over the second leading dimension, so a sum
+  # times it, and softmax's gradient, which multiplies by the sums, match numpy there too.
+  y = bf16(rng.uniform(-2, 2, (2, 1, 5, 40)))
+  close(Tensor.of(rt, x.tolist(), "fp32").sum(1) * Tensor.of(rt, y.tolist(), "fp32"), x.sum(1, keepdims=True) * y, 1e-5)
+  s, w = np.exp(x - x.max(1, keepdims=True)), bf16(rng.uniform(-2, 2, x.shape))
+  s /= s.sum(1, keepdims=True)
+  close((a.softmax(1) * Tensor.of(rt, w.tolist(), "fp32")).sum().gradient(a)[0], s * (w - (s * w).sum(1, keepdims=True)), 1e-5)
+
+def test_matmul_under_reductions(chip):
+  # A matmul under a reduction down its rows or through the batch, as a softmax over them is, gives numpy's values. The
+  # passes after the first, which compute the matmul again, read each tile's own row of A.
+  rng, rt = np.random.default_rng(43), Runtime(chip)
+  a, b = bf16(rng.uniform(-1, 1, (3, 96, 64))), bf16(rng.uniform(-1, 1, (3, 64, 64)))
+  ta, tb = (Tensor.of(rt, v.tolist()) for v in (a, b))
+  for got, m, axis in ((ta[0] @ tb[0], a[0] @ b[0], -1), (ta[0] @ tb[0], a[0] @ b[0], -2), (ta @ tb, a @ b, 0)):
+    e = np.exp(m - m.max(axis, keepdims=True))
+    close(got.softmax(axis), e / e.sum(axis, keepdims=True), 2**-5)
 
 def test_leading_dimensions(chip):
   # A tensor takes up to five dimensions, and the leading ones fold into the batch in row-major order, so (2, 3, 5, 40)
