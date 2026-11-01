@@ -131,6 +131,9 @@ The version is in [pyproject.toml](pyproject.toml). The package on PyPI holds
 3. Install the wheel with `[models]` in a clean environment, outside the
    checkout so imports can't fall back to it, and run the README's commands.
 4. Upload it with `uv publish`, then tag the commit, for example `v0.0.3`.
+5. Make the tag a GitHub pre-release named like `baretile 0.0.3`, with the
+   version's changelog entry as its notes and its links to the repository's
+   files pinned to the tag.
 
 CI builds a wheel from the source distribution on Python 3.12, 3.13 and 3.14,
 and checks its imports, its visualization template, and the models with NumPy.
