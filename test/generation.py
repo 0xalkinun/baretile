@@ -6,38 +6,59 @@
 # reference in bf16. NumPy's logits at the same prefixes come beside them, to tell an error in loading or the model
 # from one on the chip.
 #   python3 test/generation.py path/to/SmolLM-135M [report.json] [steps] [mode]
-# It needs PyTorch and transformers. EOS doesn't stop a prompt, so each runs all its steps. The report holds each
-# prompt's tokens and text, and each step's errors, with the logits of a step that failed.
-import json, os, sys
+# It needs PyTorch and transformers. EOS doesn't stop a prompt, so each runs all its steps. A step whose logits on the
+# chip hold a NaN or an infinity fails either gate. The report holds the versions of the packages and baretile's
+# commit, the KV cache's format, the reference's dtype and device, each prompt's tokens and text, and each step's
+# errors, with the logits of a step that failed.
+import json, os, subprocess, sys
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, ROOT)
 from baretile.models import llama
 from baretile.tensor import Tensor, jit
 
 PROMPTS = ("The meaning of life is", "The capital of France is", "1, 2, 3,")  # as UTF-8, without BOS or a chat template
 ERROR, PICK = 0.03, 0.01  # the gate: the largest error over the reference's largest logit, and the pick's loss over its span
 
-def reference(folder, bf16):  # transformers' model as a function from ids to logits: in bf16, or in fp32 with bf16 weights
+def reference(folder, bf16):
+  """transformers' model as a function from ids to logits, in bf16 or in fp32 with bf16 weights, and what the report
+  records of it: its dtype, its device and the versions of the packages it runs on."""
   import torch, transformers
   model = transformers.AutoModelForCausalLM.from_pretrained(folder, dtype=torch.bfloat16 if bf16 else torch.float32, attn_implementation="eager")
   for p in model.eval().parameters(): p.data = p.data.to(torch.bfloat16).to(p.dtype)
   def run(ids):
     with torch.no_grad(): return model(torch.tensor([ids])).logits[0, -1].double().numpy()
-  return run
+  return run, dict(dtype="bfloat16" if bf16 else "float32 with bfloat16 weights", device=str(model.device),
+                   versions=dict(torch=torch.__version__, transformers=transformers.__version__, numpy=np.__version__))
+
+def commit():  # baretile's commit as git describe gives it, or unknown outside a checkout
+  try: out = subprocess.run(["git", "describe", "--always", "--dirty"], capture_output=True, text=True, cwd=ROOT, timeout=60).stdout.strip()
+  except (OSError, subprocess.TimeoutExpired): out = ""
+  return out or "unknown"
+
+def compare(got, want, numpy):  # a step's row: the chip's pick and its errors against the reference's logits, and NumPy's
+  pick, top, span = int(got.argmax()), max(np.abs(want).max(), 1e-6), max(np.ptp(want), 1e-6)
+  return dict(token=pick, finite=bool(np.isfinite(got).all()), error=float(np.abs(got - want).max() / top),
+              pick_loss=float((want.max() - want[pick]) / span), in_top5=bool(pick in np.argsort(-want)[:5]),
+              numpy_error=float(np.abs(numpy - want).max() / top))
+
+def meets(row, close):  # the gate on the logits if close, else the one on the five best. argmax picks a NaN, so both need finite logits
+  return row["finite"] and (row["error"] <= ERROR and row["pick_loss"] <= PICK if close else row["in_top5"])
 
 def check(rt, folder, steps=32, mode="bf16", prompts=PROMPTS):
   """Generate steps tokens after each prompt on rt's chip, from the chip's own picks, and compare each step with
   transformers and NumPy. Return the report, whose passed says whether every step met the gate."""
   close = mode == "bf16"  # the gate on the logits, else the one on the five best
-  tok, ref = llama.Tokenizer(folder), reference(folder, bf16=not close)
+  tok, (ref, about) = llama.Tokenizer(folder), reference(folder, bf16=not close)
   encoded = [tok.encode(p) for p in prompts]
   size = -(-(max(map(len, encoded)) + steps) // 32) * 32  # cache rows for the longest prompt and its steps
   c, weights = llama.load(folder, size)
   c.precision = llama.precision(c, mode)
   t, w = llama.upload(rt, weights, c.precision), llama.arrays(weights, c.precision)
   on = lambda row: Tensor.of(rt, [row], "int32")
-  report = dict(folder=os.path.abspath(folder), mode=mode, steps=steps, gate=f"error {ERROR}, pick loss {PICK}" if close else "top 5", prompts=[])
-  meets = lambda r: r["error"] <= ERROR and r["pick_loss"] <= PICK if close else r["in_top5"]
+  report = dict(folder=os.path.abspath(folder), mode=mode, steps=steps, gate=f"error {ERROR}, pick loss {PICK}" if close else "top 5",
+                versions=about["versions"] | dict(baretile=commit()), kv=llama.cache_format(c),
+                reference=dict(dtype=about["dtype"], device=about["device"]), prompts=[])
   for prompt, ids in zip(prompts, encoded):
     kv, np_kv = llama.kv_cache(c, size, llama.zeros(rt, llama.cache_format(c))), llama.kv_cache(c, size, np.zeros)
     step = jit(lambda x, places, kv=kv: llama.forward(x, places, t, c, kv))  # a token a step, replayed from the third on
@@ -46,17 +67,15 @@ def check(rt, folder, steps=32, mode="bf16", prompts=PROMPTS):
       places = list(range(len(ids) + len(made) - len(new), len(ids) + len(made)))
       got = llama.logits(llama.forward(on(new), on(places), t, c, kv) if i == 0 else step(on(new), on(places))).astype(np.float64)
       numpy, want = llama.forward(new, places, w, c, np_kv)[0].astype(np.float64), ref(ids + made)
-      pick, top, span = int(got.argmax()), max(np.abs(want).max(), 1e-6), max(np.ptp(want), 1e-6)
-      row = dict(token=pick, error=float(np.abs(got - want).max() / top), pick_loss=float((want.max() - want[pick]) / span),
-                 in_top5=bool(pick in np.argsort(-want)[:5]), numpy_error=float(np.abs(numpy - want).max() / top))
-      if not meets(row):  # what the chip and the reference made of the step
+      row = compare(got, want, numpy)
+      if not meets(row, close):  # what the chip and the reference made of the step
         top5 = lambda x: [(int(k), float(x[k])) for k in np.argsort(-x)[:5]]
         row |= dict(chip_top=top5(got), reference_top=top5(want))
       rows.append(row)
-      made.append(pick)
-      new = [pick]
+      made.append(row["token"])
+      new = [row["token"]]
     report["prompts"].append(dict(prompt=prompt, tokens=made, text=tok.decode(made), steps=rows,
-                                  passed=all(map(meets, rows))))
+                                  passed=all(meets(r, close) for r in rows)))
   report["passed"] = all(p["passed"] for p in report["prompts"])
   return report
 

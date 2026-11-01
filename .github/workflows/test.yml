@@ -277,7 +277,7 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install numpy pytest
       - name: Bring up the card and run the suite on it
-        run: python test/bringup.py record --only preflight,chip,transfers,launches,math,kernels,models,smollm ${{ vars.SMOLLM && format('--smollm {0}', vars.SMOLLM) || '' }}
+        run: python test/bringup.py record --only preflight,chip,transfers,launches,math,kernels,models${{ vars.SMOLLM && format(',smollm --smollm {0}', vars.SMOLLM) || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

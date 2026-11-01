@@ -5,9 +5,10 @@
 #   python3 test/bringup.py record-folder [--smollm path/to/SmolLM-135M] [--llama path/to/Llama-3.1-8B-Instruct
 #     --reference path/to/Llama-3.1-8B-Instruct.refpt] [--from stage] [--only stage,stage]
 # On a card, run it from the checkout with TTSIM unset, and as root when tt-kmd doesn't drive the card. On ttsim every
-# stage runs too, but the later ones take hours there. CI's card job runs it on a P150a (docs/bring-up.md). The SmolLM
-# and Llama stages run when their files are given; the Llama one is the first workload's token-accuracy gate
-# (docs/workload.md).
+# stage runs too, but the later ones take hours there. CI's card job will run it on a P150a once it has a runner
+# (docs/bring-up.md). The SmolLM and Llama stages run when their files are given; the Llama one is the first workload's
+# token-accuracy gate (docs/workload.md). --only takes stage names, and a stage it names fails when its files aren't
+# given, so a misspelled or skipped stage can't pass a run that never ran it.
 import argparse, json, os, pathlib, platform, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import pci
@@ -67,8 +68,13 @@ def run(args):
     entry = dict(stage=name, checks=checks)
     record["stages"].append(entry)
     argv = [c(args) for c in commands]
-    if name not in todo or not passed or None in argv or "" in argv:
+    missing = None in argv or "" in argv  # the files it needs weren't given
+    if name not in todo or not passed or (missing and not args.only):
       entry["result"] = "not run"
+      continue
+    if missing:  # --only names it, so skipping it would pass a run that never ran it
+      entry["result"], passed = "failed: its files weren't given", False
+      print(f"{name:10s}{entry['result']} (--smollm for smollm, --llama and --reference for llama)", file=sys.stderr)
       continue
     log, start = args.record / f"{name}.log", time.monotonic()
     entry |= dict(commands=[" ".join(map(str, a)) for a in argv], log=log.name)
@@ -95,4 +101,6 @@ if __name__ == "__main__":
   p.add_argument("--only", type=lambda s: s.split(","), help="run only these stages, separated by commas")
   args = p.parse_args()
   if bool(args.llama) != bool(args.reference): p.error("--llama and --reference go together")
+  if unknown := set(args.only or ()) - {s[0] for s in STAGES}:
+    p.error(f"--only: no stage {', '.join(sorted(unknown))}. The stages are {', '.join(s[0] for s in STAGES)}")
   sys.exit(not run(args))

@@ -251,7 +251,8 @@ def baretile(folder, prompt, after, top5, book, s):
   rt, clock, on, sim = Runtime(chip), chip.pci.now, lambda row: Tensor.of(rt, [row], "int32"), isinstance(chip.pci, pci.Sim)
   tables = lambda n: llama.upload(rt, {k: w for k, w in llama.rope_weights(c, n).items() if k != "turn"})  # RoPE tables for n positions
   firmware = chip.telemetry().get(bh.TAG_FIRMWARE, 0)
-  code = {d: lines(ROOT, lambda p: p.startswith(d + "/")) for d in ("baretile", "adapters")}
+  code = {"baretile": lines(ROOT, lambda p: p.startswith("baretile/") and not p.startswith("baretile/adapters/")),  # the adapters on their own
+          "adapters": lines(ROOT, lambda p: p.startswith("baretile/adapters/"))}
   versions = {"baretile": git(ROOT), "firmware": ".".join(str(firmware >> b & 255) for b in (24, 16, 8)), "card": card(sim),
               "AI clock MHz": chip.aiclk, "host": host(), "lines of code": code}
   out = {"versions": versions, "clock": "ttsim's, so this only checks the script" if sim else "the host's"}
