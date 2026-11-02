@@ -416,8 +416,9 @@ step, the loss and gradients must match PyTorch's on the same weights and
 sequences, and the update must be AdamW's, computed in float64 from the
 gradients the chip added up. Nothing has trained on a card yet. llm.c and the
 modded-nanogpt speedrun train GPT-2 124M on FineWeb to a validation loss of
-3.28; doing that on a P150a is still to do. fp32 matmuls take three bf16
-products each, so training speed is work for the card.
+3.28, and [#9](https://github.com/0xalkinun/baretile/issues/9) tracks doing that
+on a P150a. fp32 matmuls take three bf16 products each, so training speed is
+work for the card.
 
 [test/train.py](../test/train.py) trains a small character-level GPT-2 on the
 README and these docs, written in tinygrad: llm.c's GPT from tinygrad's
