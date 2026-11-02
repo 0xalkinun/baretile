@@ -1,6 +1,6 @@
 ---
 name: Task
-about: A piece of work, written the way the board's issues are
+about: A piece of work: why it matters, when it's done and where to start
 ---
 
 Why this matters, in a few sentences: who it helps, or what it unblocks.

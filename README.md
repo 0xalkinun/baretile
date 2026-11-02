@@ -149,10 +149,10 @@ shows how to get the tokens, its settings and the small model's loss curve.
 
 ## Learn baretile
 
-The [ramps](https://github.com/0xalkinun/baretile/tree/main/ramps) teach baretile
-from the top down. Each one is a script that checks its results as it goes, and
-its comments explain each step, so read it beside its output. They're in the
-repository:
+The [ramps](https://github.com/0xalkinun/baretile/tree/main/ramps) teach
+baretile from the top down. Each one is a script that checks its results as it
+goes, and its comments explain each step, so read it beside its output. They're
+in the repository:
 
 ```sh
 git clone https://github.com/0xalkinun/baretile
