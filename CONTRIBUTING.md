@@ -33,7 +33,8 @@ checkout, and explains what to do when a launch hangs.
 
 - A test that runs on ttsim. Compare kernels against NumPy.
 - The tests your change touches, and `test/test_device.py`, passing before you
-  send it. CI runs the whole suite, on 120 and on 140 Tensix tiles.
+  send it. CI runs the whole suite, on 120 and on 140 Tensix tiles. On a pull
+  request from a fork, it starts once a maintainer approves the run.
 - For a new or changed kernel, a passing run under
   [ttsim-chaos](docs/testing.md#ttsim-chaos), which adds the NoC latency, FPU
   and SFPU latency, and core jitter that ttsim leaves out. CI runs the kernel
@@ -140,8 +141,9 @@ The version is in [pyproject.toml](pyproject.toml). The package on PyPI holds
    checkout so imports can't fall back to it, and run the README's commands.
 4. Upload it with `uv publish`, then tag the commit, for example `v0.0.3`.
 5. Make the tag a GitHub pre-release named like `baretile 0.0.3`, with the
-   version's changelog entry as its notes and its links to the repository's
-   files pinned to the tag.
+   version's changelog entry as its notes, its links to the repository's files
+   pinned to the tag, and each paragraph on one line, since GitHub shows every
+   line break in a release.
 
 CI builds a wheel from the source distribution on Python 3.12, 3.13 and 3.14,
 and checks its imports, its visualization template, and the models with NumPy.
