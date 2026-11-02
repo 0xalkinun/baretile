@@ -4,8 +4,7 @@ The first release target is **one P150a running Llama-3.1-8B-Instruct for one
 user**, with greedy text completion. SmolLM-135M is the smaller development
 fixture. Passing its tests does not qualify Llama or the card.
 
-This is the acceptance specification for
-[issue #3](https://github.com/0xalkinun/baretile/issues/3), dated October 29,
+This is the acceptance specification for the first workload, dated October 29,
 2026. The thresholds below are requirements, not measured results. Hardware
 correctness and performance remain unverified.
 
@@ -179,8 +178,8 @@ python3 test/generation.py "$SMOLLM_DIR" smollm-generation.json 32 bf16
 python3 test/generation.py "$LLAMA_DIR" llama-generation.json 32 tt
 ```
 
-Running the independent reference checks in CI is tracked in
-[#5](https://github.com/0xalkinun/baretile/issues/5).
+CI runs `test/generation.py`'s gates on a small random Llama
+(`test_autonomous_generation`), not on these checkpoints.
 
 On a card, complete [bring-up](bring-up.md) first and run with `TTSIM` unset
 in the environment described there. These existing commands report B2
@@ -195,9 +194,8 @@ python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.re
 ```
 
 On the host, the NumPy path meets the B2 gate at `tt` with no top-5 margin:
-458/500 top-1 and 490/500 top-5, against 499 and 500 in `bf16`
-([#37](https://github.com/0xalkinun/baretile/issues/37)). Its products are exact,
-so `tt` comes to the card with no top-5 room for the chip's own rounding.
+458/500 top-1 and 490/500 top-5, against 499 and 500 in `bf16`. Its products are
+exact, so `tt` comes to the card with no top-5 room for the chip's own rounding.
 
 For the HTTP case, start one slot, 1,024 positions, `tt` precision and bfp8 KV:
 
@@ -218,9 +216,9 @@ HTTP 200, nonempty output, a normal stop/length finish reason, correct usage
 counts, and equal assembled text and token counts across the two response forms.
 A failed or cancelled request must release the slot so another request can
 finish. The HTTP checks, including all three prompts and slot recovery, belong
-in the [card acceptance record](https://github.com/0xalkinun/baretile/issues/11).
-The server binds to all interfaces and has no API-key check; run this local
-acceptance case on a trusted host as described in [serving](models.md#serving).
+in the card's acceptance record. The server binds to all interfaces and has no
+API-key check; run this local acceptance case on a trusted host as described in
+[serving](models.md#serving).
 
 ## Timing and evidence
 
@@ -247,12 +245,11 @@ BOOK="$REF_DIR/tale-of-two-cities.txt.bz2" \
 
 It also runs B1, batch-32 B2, long-context B3 and multi-user B4. Those results
 are outside this specification; it is not yet an isolated first-workload
-command. [Benchmark task #12](https://github.com/0xalkinun/baretile/issues/12)
-must provide that isolation and a comparable vendor measurement before a
-performance claim. `--quick` cuts layers and sizes, so it cannot qualify a
-model. There is no tokens/s release floor yet: establish the hardware baseline
-before choosing an optimization target. Simulator times do not estimate card
-speed.
+command. A benchmark task must provide that isolation and a comparable vendor
+measurement before a performance claim. `--quick` cuts layers and sizes, so it
+cannot qualify a model. There is no tokens/s release floor yet: establish the
+hardware baseline before choosing an optimization target. Simulator times do not
+estimate card speed.
 
 Publish a result for each gate as passed, failed or not run, with commands,
 logs and the exact source revision. This specification can be complete while

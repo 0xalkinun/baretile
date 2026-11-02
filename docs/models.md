@@ -82,8 +82,7 @@ Qwen3 and Qwen3.5 RMS-norm each head of q and k before RoPE. The norm reads the
 qkv matmul's fp32 sum, runs in fp32 and rounds once to bf16 for RoPE. In bf16,
 the norm's scale would round once for a whole head, and a score doesn't average
 that error out over its products, as it does the roundings of single values.
-Qwen3-0.6B's norm weights make scores near 48, where a rounding of 2^-8 is 0.19
-([#70](https://github.com/0xalkinun/baretile/issues/70)).
+Qwen3-0.6B's norm weights make scores near 48, where a rounding of 2^-8 is 0.19.
 
 The loader fuses q, k and v projections, and gate and up projections, where
 appropriate. Matmul weights are stored by tile columns. The KV cache is
@@ -417,9 +416,8 @@ step, the loss and gradients must match PyTorch's on the same weights and
 sequences, and the update must be AdamW's, computed in float64 from the
 gradients the chip added up. Nothing has trained on a card yet. llm.c and the
 modded-nanogpt speedrun train GPT-2 124M on FineWeb to a validation loss of
-3.28, and [#45](https://github.com/0xalkinun/baretile/issues/45) tracks doing
-that on a P150a. fp32 matmuls take three bf16 products each, so training speed
-is work for the card.
+3.28; doing that on a P150a is still to do. fp32 matmuls take three bf16
+products each, so training speed is work for the card.
 
 [test/train.py](../test/train.py) trains a small character-level GPT-2 on the
 README and these docs, written in tinygrad: llm.c's GPT from tinygrad's

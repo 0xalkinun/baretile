@@ -8,6 +8,8 @@ transfers; nothing else is tested on a card yet.
 
 ### Changed
 
+- The repository moved to [github.com/0xalkinun/baretile](https://github.com/0xalkinun/baretile), and the package's
+  project links point there.
 - Two `Chip`s on one device object raise `RuntimeError`, as a second opener of the device does, since they'd hand out
   the same TLBs and DRAM.
 - The server refuses, with HTTP 400 naming them, JSON-schema keywords it doesn't know, such as `not`, `prefixItems`
@@ -50,9 +52,8 @@ tokens in fp32, written once with tinygrad's llm.c model and once with `baretile
 | tinygrad, an AdamW step | 781 launches, 4 downloads, 25.16s | 500 launches, 3.42s | 417 launches, 3.11s |
 
 At 0.0.5 each call downloaded values for the host to compute, so a `TinyJit` ran its Python every call; now both
-replay. ttsim's time is the simulator's, not a card's. [Issue #84](https://github.com/0xalkinun/baretile/issues/84) has
-the scripts, and a small MLP's numbers in fp32 and bf16: its bf16 inference through tinygrad takes baretile's own 2
-launches.
+replay. ttsim's time is the simulator's, not a card's. A small MLP's bf16 inference through tinygrad takes baretile's
+own 2 launches.
 
 ### Changed
 
@@ -153,7 +154,7 @@ python3 -m baretile.models.train train.bin val.bin layers=2 dim=64 heads=2 ctx=3
 - With tt-kmd driving the card, baretile no longer unbinds it. It opens the card through sysfs as root, as before,
   only when tt-kmd doesn't drive it, and `python3 -m baretile.chip check` reports what that path needs.
 - The Llama families keep the residual stream between blocks in fp32. SmolLM-135M now passes the first workload's
-  bf16 logit gate, at 2.72% at worst where it was 4.16%. A decode step takes more launches, which #57 would fuse back.
+  bf16 logit gate, at 2.72% at worst where it was 4.16%. A decode step takes more launches.
 - The core, from the PCIe driver to the tensors, has a size budget: under 4,500 lines of code at 120 columns, with
   every line within 120 columns.
 
