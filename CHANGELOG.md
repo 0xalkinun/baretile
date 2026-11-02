@@ -4,7 +4,11 @@ baretile is pre-alpha. Everything below is tested on Tenstorrent's ttsim
 simulator. A P150a has run the first bring-up stages, preflight, chip and
 transfers; nothing else is tested on a card yet.
 
-## Unreleased
+## 0.0.7
+
+The release from a pass over the whole repository: fixes to wrong results in reductions, matmuls, slices and block
+floats, configs and requests that are refused where they used to compute something else, and the package's links at
+the repository's new home.
 
 ### Changed
 
