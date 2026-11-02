@@ -1,12 +1,15 @@
-# For every push to main and every pull request that changes more than Markdown: build and check the wheel on Python
-# 3.12 to 3.14, run the test suite on 120 and on 140 Tensix tiles, and alongside them the kernel tests on ttsim-chaos with timing noise. The
-# suite and the noise runs are split across runners, and each uses all of its runner's CPUs, with NumPy on one thread a
-# process. The suite includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints,
-# PyTorch, transformers or tiktoken skip themselves here. A test that takes over ten minutes prints the stacks of its
-# process's threads (faulthandler_timeout), so a hung one says where, and a job that takes over 20 minutes, where it
-# takes about 3, is stopped. A pull request's branch runs once, as the pull request, and a newer push to it cancels the
-# run still going. A pull request that changes only Markdown runs the doc tests and the package checks, and skips the
-# simulator jobs. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
+# For every push to main and every pull request that changes more than Markdown: run ruff and the doc tests, build the
+# wheel and check it on Python 3.12 to 3.14, run the test suite on 120 and on 140 Tensix tiles, and alongside them the
+# kernel tests on ttsim-chaos with timing noise. The jobs that compute run on boat.dev's runners, through its GitHub
+# App: `boat` has 4 CPUs and 8 GB, `boat-large` 8 and 16. Each such job is one of the plan's starts, which are counted
+# by the hour and the day, so the work runs as few, large jobs, seven a run. The two jobs that only read the pull
+# request's files and gather the results run on GitHub's runners. Each job uses all of its runner's CPUs, with NumPy on
+# one thread a process. The suite includes the adapter tests, on the tinygrad commit pinned below. Tests that need
+# checkpoints, PyTorch, transformers or tiktoken skip themselves here. A test that takes over ten minutes prints the
+# stacks of its process's threads (faulthandler_timeout), so a hung one says where, and a job that takes over 30 minutes
+# is stopped. A pull request's branch runs once, as the pull request, and a newer push to it cancels the run still
+# going. A pull request that changes only Markdown runs the checks job and skips the simulator jobs. The card job runs
+# the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
 name: test
 on:
   push:
@@ -37,18 +40,24 @@ jobs:
              [ -n "$files" ] && ! grep -qv '\.md$' <<< "$files"; then code=false; fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
   # ruff, and what a docs-only pull request can break: the links, the README's examples, which run on ttsim, the
-  # website's commands and the core's size as the README states it. SKIPS=fail, so a skip can't pass for a run.
-  docs:
-    runs-on: ubuntu-24.04
+  # website's commands and the core's size as the README states it, with SKIPS=fail, so a skip can't pass for a run.
+  # Then the package: the wheel, built from the sdist, installed on each Python and imported without the checkout on
+  # sys.path.
+  checks:
+    runs-on: boat
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.13
+            3.14
+            3.12
       - name: Install clang, lld and the Python packages
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
-          python -m pip install numpy pytest ruff
+          python -m pip install build numpy pytest ruff
       - run: ruff check
       - run: python -m baretile.chip ttsim
       - run: >-
@@ -56,50 +65,39 @@ jobs:
           "test_size or test_doc_links or test_readme_examples or test_website_matches_readme"
         env:
           SKIPS: fail
-  package:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    strategy:
-      matrix:
-        python: ["3.12", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: python -m pip install build
-      # Build the wheel from the sdist, then import it without the checkout on sys.path.
       - run: python -m build
-      - run: python -m pip install dist/*.whl
       # baretile needs nothing outside the standard library. The models extra adds NumPy for the models and the server
-      - name: Check the installed package and its visualization template
+      - name: Check the installed package, its visualization template, the models and the server
         run: |
-          python -I - <<'PY'
+          for v in 3.12 3.13 3.14; do
+            "python$v" -m venv "$RUNNER_TEMP/py$v"
+            py="$RUNNER_TEMP/py$v/bin/python"
+            "$py" -m pip install -q dist/*.whl
+            "$py" -I - <<'PY'
           from importlib import metadata, resources
           from baretile import chip, kernels, pci, runtime, tensor, tensix, viz
           assert all("extra ==" in r for r in metadata.requires("baretile")), metadata.requires("baretile")
           assert "<canvas" in resources.files("baretile").joinpath("viz.html").read_text()
           PY
-      - run: python -m pip install "$(ls dist/*.whl)[models]"
-      - name: Check the installed models and server
-        run: |
-          python -I -c "from baretile.models import cost, gpt2, llama, qwen, serve, train"
-          python -I -m baretile.models.serve 2>&1 | grep -q "usage"
+            "$py" -m pip install -q "$(ls dist/*.whl)[models]"
+            "$py" -I -c "from baretile.models import cost, gpt2, llama, qwen, serve, train"
+            "$py" -I -m baretile.models.serve 2>&1 | grep -q "usage"
+          done
   # The suite on released ttsim, whose p150 has 120 Tensix tiles, and on ttsim-chaos with all 140 and no noise, since a
-  # p150 reports 120 or 140 depending on its firmware. Each runs as five jobs, which split the tests by the seconds each
+  # p150 reports 120 or 140 depending on its firmware. Each runs as two jobs, which split the tests by the seconds each
   # took in test/durations.json (PART in test/conftest.py), in a pytest-xdist worker for each of the runner's CPUs. The
   # 20 slowest tests show at the end of each job's log.
   test:
-    name: test (${{ matrix.tiles }} tiles, ${{ matrix.group }}/5)
+    name: test (${{ matrix.tiles }} tiles, ${{ matrix.group }}/2)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: boat-large
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         tiles: [120, 140]
-        group: [1, 2, 3, 4, 5]
+        group: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -107,14 +105,14 @@ jobs:
           python-version: "3.12"
       - name: Install clang, lld and the Python packages
         run: |
-          sudo apt-get update && sudo apt-get install -y clang lld
+          sudo apt-get update && sudo apt-get install -y clang lld g++
           python -m pip install numpy pytest pytest-xdist
       # The two-chip library that test_two_chips copies a tensor between. The one-chip library comes from
       # baretile.chip ttsim below, as it does for someone trying baretile
       - name: Download two-chip ttsim
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release download v1.11.5 --repo tenstorrent/ttsim --pattern libttsim_bh_x2.so --dir "$RUNNER_TEMP/ttsim"
+        run: |
+          curl --fail --location --silent --create-dirs --output "$RUNNER_TEMP/ttsim/libttsim_bh_x2.so" \
+            https://github.com/tenstorrent/ttsim/releases/download/v1.11.5/libttsim_bh_x2.so
       # The adapter calls tinygrad's internal APIs, so its tests run on this tinygrad commit. Move the pin and the
       # adapter together.
       - name: Check out tinygrad
@@ -147,7 +145,7 @@ jobs:
           if [ ${{ matrix.tiles }} = 140 ]; then
             export TTSIM="$RUNNER_TEMP/ttsim-chaos/src/_out/release_bh/libttsim.so" TTSIM_CHAOS_UNHARVESTED=1
           fi
-          PART=${{ matrix.group }}/5 python -m pytest -n auto --dist worksteal --durations=20 -o faulthandler_timeout=600 test
+          PART=${{ matrix.group }}/2 python -m pytest -n auto --dist worksteal --durations=20 -o faulthandler_timeout=600 test
         env:
           OPENBLAS_NUM_THREADS: 1
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
@@ -160,8 +158,8 @@ jobs:
   references:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: boat-large
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -194,21 +192,16 @@ jobs:
           SKIPS: fail
           TINYGRAD: ${{ runner.temp }}/tinygrad
   # The kernels on ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md,
-  # "ttsim-chaos"), with every kind of timing noise. The run number seeds it, so each run tries other timings. It runs as
-  # two jobs, each a process for each of the runner's CPUs, on a part of the tests (PART in test/conftest.py).
-  # ttsim-chaos seeds a process's noise once, so what a test sees follows from the tests before it, and
-  # TTSIM_CHAOS_SEED=s PART=i/n repeats part i of n of run s, as re-running a failed job does. The log shows both. A part
-  # that hangs is stopped at 15 minutes, before the job is, so its log still shows.
+  # "ttsim-chaos"), with every kind of timing noise. The run number seeds it, so each run tries other timings. It runs a
+  # process for each of the runner's CPUs, each on a part of the tests (PART in test/conftest.py). ttsim-chaos seeds a
+  # process's noise once, so what a test sees follows from the tests before it, and TTSIM_CHAOS_SEED=s PART=i/n repeats
+  # part i of n of run s, as re-running a failed job does. The log shows both. A part that hangs is stopped at 15
+  # minutes, before the job is, so its log still shows.
   chaos:
-    name: chaos (${{ matrix.group }}/2)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [1, 2]
+    runs-on: boat-large
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -216,7 +209,7 @@ jobs:
           python-version: "3.12"
       - name: Install clang, lld and the Python packages
         run: |
-          sudo apt-get update && sudo apt-get install -y clang lld
+          sudo apt-get update && sudo apt-get install -y clang lld g++
           python -m pip install numpy pytest
       - name: Build ttsim-chaos
         run: |
@@ -227,23 +220,23 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/baretile
-          key: kernels-noise-${{ matrix.group }}-${{ github.sha }}
+          key: kernels-noise-${{ github.sha }}
           restore-keys: |
-            kernels-noise-${{ matrix.group }}-
+            kernels-noise-
             kernels-
       # each part's log once all are done, under its result
       - run: |
           tests=(test/test_device.py test/test_kernels.py test/test_models.py::test_delta_step test/test_models.py::test_delta_pieces
                  test/test_models.py::test_moe 'test/test_models.py::test_ramp[4_kernel.py]')
-          n=$(nproc) parts=$((2 * $(nproc))) first=$(((${{ matrix.group }} - 1) * $(nproc)))
+          n=$(nproc)
           for i in $(seq $n); do
-            PART=$((first + i))/$parts timeout 15m python -m pytest -s -o faulthandler_timeout=600 "${tests[@]}" \
+            PART=$i/$n timeout 15m python -m pytest -s -o faulthandler_timeout=600 "${tests[@]}" \
               > "$RUNNER_TEMP/part$i.log" 2>&1 &
             pids[i]=$!
           done
           for i in $(seq $n); do
             wait ${pids[i]} || failed=1
-            echo "::group::PART=$((first + i))/$parts: $(tail -n 1 "$RUNNER_TEMP/part$i.log")"
+            echo "::group::PART=$i/$n: $(tail -n 1 "$RUNNER_TEMP/part$i.log")"
             cat "$RUNNER_TEMP/part$i.log"
             echo "::endgroup::"
           done
@@ -261,7 +254,7 @@ jobs:
   # A simulator job may be skipped only because the pull request changes nothing but Markdown.
   all:
     if: always()
-    needs: [changes, docs, package, test, references, chaos]
+    needs: [changes, checks, test, references, chaos]
     runs-on: ubuntu-24.04
     steps:
       - run: |

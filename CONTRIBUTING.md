@@ -21,7 +21,7 @@ ruff check
 ```
 
 With pytest-xdist installed, `-n auto` runs the tests in a process for each CPU,
-as CI does. On GitHub's four-CPU runner, that halves the time.
+as CI does. On four CPUs, that halves the time.
 
 [Testing and debugging](docs/testing.md) lists the optional checks that need
 model files, PyTorch or transformers, and explains what to do when a launch
