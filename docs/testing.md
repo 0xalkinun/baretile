@@ -163,19 +163,21 @@ takeover, cancellation, shutdown and host memory, where timing bugs hide. None o
 them depends on exact simulated timing. CI also runs the whole suite with
 `TTSIM_CHAOS_UNHARVESTED=1`, beside the released ttsim's.
 
-CI splits its runs across runners with `PART=i/n`, which runs part i of n, split
-so the parts take about as long by the seconds each test took in
-[test/durations.json](../test/durations.json). `DURATIONS=write` rewrites that
-file from the tests a run runs, so run the whole suite with it after adding slow
-tests. The suite on each ttsim runs as five jobs, each in a pytest-xdist worker
-for each CPU, and each lists its 20 slowest tests at the end. The noise runs as
-two jobs, each a process for each CPU on its own part. A pull request that
-changes only Markdown runs the doc tests and the package checks, and skips the
-simulator jobs. A process's noise follows from the seed and the tests it runs, in
-order, so `TTSIM_CHAOS_SEED=s PART=i/n`, with the job's settings and tests,
-repeats a failed part, and the log shows all of them. A test that runs over ten
-minutes prints the stacks of its process's threads, pytest's
-`faulthandler_timeout`, so a test that hangs in CI says where.
+CI runs on boat.dev's runners, through its GitHub App, as few, large jobs, since
+boat's plans limit how many jobs start an hour and a day. It splits its runs
+with `PART=i/n`, which runs part i of n, split so the parts take about as long
+by the seconds each test took in [test/durations.json](../test/durations.json).
+`DURATIONS=write` rewrites that file from the tests a run runs, so run the whole
+suite with it after adding slow tests. The suite on each ttsim runs as two jobs,
+each in a pytest-xdist worker for each of its runner's 8 CPUs, and each lists
+its 20 slowest tests at the end. The noise runs as one job, a process for each
+CPU on its own part. A pull request that changes only Markdown runs the doc
+tests and the package checks, and skips the simulator jobs. A process's noise
+follows from the seed and the tests it runs, in order, so `TTSIM_CHAOS_SEED=s
+PART=i/n`, with the job's settings and tests, repeats a failed part, and the log
+shows all of them. A test that runs over ten minutes prints the stacks of its
+process's threads, pytest's `faulthandler_timeout`, so a test that hangs in CI
+says where.
 
 `TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
 runs a random lo to hi clocks after it leaves its thread, and the thread goes on
