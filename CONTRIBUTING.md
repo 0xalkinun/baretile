@@ -6,8 +6,9 @@ you can remove or reuse something instead.
 
 ## Finding work
 
-The [issues](https://github.com/0xalkinun/baretile/issues) say what's next.
-Issues labeled `good first issue` are small and a good way into the code.
+The [project board](https://github.com/users/0xalkinun/projects/1) shows what's
+next, and its README explains the plan and how the issues are tracked. Issues
+labeled `good first issue` are small and a good way into the code.
 
 ## Setting up
 

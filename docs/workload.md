@@ -216,9 +216,9 @@ HTTP 200, nonempty output, a normal stop/length finish reason, correct usage
 counts, and equal assembled text and token counts across the two response forms.
 A failed or cancelled request must release the slot so another request can
 finish. The HTTP checks, including all three prompts and slot recovery, belong
-in the card's acceptance record. The server binds to all interfaces and has no
-API-key check; run this local acceptance case on a trusted host as described in
-[serving](models.md#serving).
+in the [card acceptance record](https://github.com/0xalkinun/baretile/issues/5).
+The server binds to all interfaces and has no API-key check; run this local
+acceptance case on a trusted host as described in [serving](models.md#serving).
 
 ## Timing and evidence
 
@@ -245,11 +245,12 @@ BOOK="$REF_DIR/tale-of-two-cities.txt.bz2" \
 
 It also runs B1, batch-32 B2, long-context B3 and multi-user B4. Those results
 are outside this specification; it is not yet an isolated first-workload
-command. A benchmark task must provide that isolation and a comparable vendor
-measurement before a performance claim. `--quick` cuts layers and sizes, so it
-cannot qualify a model. There is no tokens/s release floor yet: establish the
-hardware baseline before choosing an optimization target. Simulator times do not
-estimate card speed.
+command. [Benchmark task #10](https://github.com/0xalkinun/baretile/issues/10)
+must provide that isolation and a comparable vendor measurement before a
+performance claim. `--quick` cuts layers and sizes, so it cannot qualify a
+model. There is no tokens/s release floor yet: establish the hardware baseline
+before choosing an optimization target. Simulator times do not estimate card
+speed.
 
 Publish a result for each gate as passed, failed or not run, with commands,
 logs and the exact source revision. This specification can be complete while
