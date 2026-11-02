@@ -22,12 +22,10 @@ The driver runs in userspace and loads our firmware onto the workers.
 We use Tenstorrent's board firmware for ARC and Ethernet, with no dependency on tt-metal, tt-umd or LLK.</p>
 
 <p>We develop on Tenstorrent's ttsim simulator.
-We haven't tested baretile on a card yet. Simulator timings don't predict card performance.
-The <a href="https://github.com/orgs/baretile/projects/1">roadmap</a> says what we're building first.</p>
+We haven't tested baretile on a card yet. Simulator timings don't predict card performance.</p>
 
-<p><a href="https://github.com/baretile/baretile">Source</a> |
-<a href="https://github.com/baretile/baretile/blob/main/docs/README.md">Docs</a> |
-<a href="https://github.com/orgs/baretile/projects/1">Roadmap</a> |
+<p><a href="https://github.com/0xalkinun/baretile">Source</a> |
+<a href="https://github.com/0xalkinun/baretile/blob/main/docs/README.md">Docs</a> |
 <a href="/blog/">Blog</a> |
 <a href="https://pypi.org/project/baretile/">PyPI</a> |
 <a href="https://x.com/baretile_">X</a></p>
@@ -58,7 +56,7 @@ python3 -m baretile.hello</code></pre>
 <p>With no card on the PCI bus, baretile uses the simulator.
 On a machine with a Blackhole, it opens the card through tt-kmd, Tenstorrent's kernel driver, without root.
 Without tt-kmd, it opens the card through sysfs, which needs root.
-Read <a href="https://github.com/baretile/baretile/blob/main/docs/bring-up.md">bring-up</a> before running on a card.</p>
+Read <a href="https://github.com/0xalkinun/baretile/blob/main/docs/bring-up.md">bring-up</a> before running on a card.</p>
 
 <h2>Tensors</h2>
 
@@ -92,23 +90,23 @@ python3 -m baretile.models.serve HuggingFaceTB/SmolLM-135M 8000</code></pre>
 
 <p>The server speaks OpenAI's completions and chat completions API.
 On ttsim, a token takes about half a minute, since the simulator runs every core of the chip.
-The <a href="https://github.com/baretile/baretile/blob/main/docs/models.md">model docs</a> list the models baretile runs, and cover training and the tinygrad device.
+The <a href="https://github.com/0xalkinun/baretile/blob/main/docs/models.md">model docs</a> list the models baretile runs, and cover training and the tinygrad device.
 We check the models against NumPy and transformers, and training against PyTorch.</p>
 
 <h2>Learning it</h2>
 
-<p>The <a href="https://github.com/baretile/baretile/tree/main/ramps">ramps</a> teach baretile from the top down.
+<p>The <a href="https://github.com/0xalkinun/baretile/tree/main/ramps">ramps</a> teach baretile from the top down.
 Each one is a script that explains its steps and checks its results.
 They're in the repository:</p>
 
-<pre tabindex="0" aria-label="Tutorial commands"><code>git clone https://github.com/baretile/baretile
+<pre tabindex="0" aria-label="Tutorial commands"><code>git clone https://github.com/0xalkinun/baretile
 <span class="k">cd</span> baretile
 python3 ramps/1_tensors.py   <span class="c"># tensor operations, fusion, formats, gradients and jit</span>
 python3 ramps/2_runtime.py   <span class="c"># C kernels on the workers, DRAM and the NoC</span>
 python3 ramps/3_tensix.py    <span class="c"># unpack, math and pack programs written by hand</span>
 python3 ramps/4_kernel.py    <span class="c"># a tensor operation of your own</span></code></pre>
 
-<p>The <a href="https://github.com/baretile/baretile/blob/main/docs/README.md">documentation</a> explains the runtime, the compiler, the models and the hardware.</p>
+<p>The <a href="https://github.com/0xalkinun/baretile/blob/main/docs/README.md">documentation</a> explains the runtime, the compiler, the models and the hardware.</p>
 
 <h2>From the blog</h2>
 
@@ -117,7 +115,7 @@ Follow an addition through local memory, instruction encoding, and three coopera
 
 </main>
 
-<footer>baretile is free software, licensed under <a href="https://github.com/baretile/baretile/blob/main/LICENSE">Apache-2.0</a>.</footer>
+<footer>baretile is free software, licensed under <a href="https://github.com/0xalkinun/baretile/blob/main/LICENSE">Apache-2.0</a>.</footer>
 
 </body>
 </html>

@@ -1600,7 +1600,7 @@ def test_doc_links():
   broken = []
   for page in [*root.glob("*.md"), *root.glob("docs/*.md"), *root.glob("website/*.md")]:
     for target in re.findall(r"\]\(([^)\s]+)\)", re.sub(r"```.*?```", "", page.read_text(), flags=re.S)):
-      if m := re.fullmatch(r"https://github\.com/baretile/baretile/(?:blob|tree)/main/([^#]*)(?:#(.*))?", target): path, anchor = root / m[1], m[2]
+      if m := re.fullmatch(r"https://github\.com/0xalkinun/baretile/(?:blob|tree)/main/([^#]*)(?:#(.*))?", target): path, anchor = root / m[1], m[2]
       elif re.match(r"\w+:", target): continue  # another site
       else:
         file, _, anchor = target.partition("#")

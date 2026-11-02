@@ -14,7 +14,7 @@ tokens in fp32, written once with tinygrad's llm.c model and once with `baretile
 | tinygrad, an AdamW step | 781 launches, 4 downloads, 25.16s | 500 launches, 3.42s | 417 launches, 3.11s |
 
 At 0.0.5 each call downloaded values for the host to compute, so a `TinyJit` ran its Python every call; now both
-replay. ttsim's time is the simulator's, not a card's. [Issue #84](https://github.com/baretile/baretile/issues/84) has
+replay. ttsim's time is the simulator's, not a card's. [Issue #84](https://github.com/0xalkinun/baretile/issues/84) has
 the scripts, and a small MLP's numbers in fp32 and bf16: its bf16 inference through tinygrad takes baretile's own 2
 launches.
 

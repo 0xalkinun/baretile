@@ -6,9 +6,8 @@ you can remove or reuse something instead.
 
 ## Finding work
 
-The [project board](https://github.com/orgs/baretile/projects/1) shows what's
-next, and its README explains the plan and how the issues are tracked. Issues
-labeled `good first issue` are small and a good way into the code.
+The [issues](https://github.com/0xalkinun/baretile/issues) say what's next.
+Issues labeled `good first issue` are small and a good way into the code.
 
 ## Setting up
 
@@ -112,7 +111,7 @@ too.
 
 ## Reporting a bug
 
-Open an [issue](https://github.com/baretile/baretile/issues) with:
+Open an [issue](https://github.com/0xalkinun/baretile/issues) with:
 
 - whether you ran on ttsim (and which version) or a card, and for a card, the
   output of `python3 -m baretile.chip check` and `python3 -m baretile.chip`

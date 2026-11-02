@@ -33,9 +33,9 @@ models = ["numpy"]
 
 [project.urls]
 Homepage = "https://baretile.com"
-Documentation = "https://github.com/baretile/baretile/blob/main/docs/README.md"
-Source = "https://github.com/baretile/baretile"
-Issues = "https://github.com/baretile/baretile/issues"
+Documentation = "https://github.com/0xalkinun/baretile/blob/main/docs/README.md"
+Source = "https://github.com/0xalkinun/baretile"
+Issues = "https://github.com/0xalkinun/baretile/issues"
 
 # Name the namespace package explicitly because baretile/ has no __init__.py. The sdist includes only this package,
 # with its models and adapters.

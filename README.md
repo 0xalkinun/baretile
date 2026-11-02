@@ -1,6 +1,6 @@
 # baretile
 
-[![test](https://github.com/baretile/baretile/actions/workflows/test.yml/badge.svg)](https://github.com/baretile/baretile/actions/workflows/test.yml)
+[![test](https://github.com/0xalkinun/baretile/actions/workflows/test.yml/badge.svg)](https://github.com/0xalkinun/baretile/actions/workflows/test.yml)
 
 baretile is a compiler and runtime for Tenstorrent Blackhole, written in Python.
 You write tensor operations, and it compiles them into Tensix instructions. It
@@ -58,12 +58,12 @@ NumPy, so install `'baretile[models]'` for those. The ramps and the tests are in
 the repository.
 
 To use another ttsim build, such as
-[ttsim-chaos](https://github.com/baretile/baretile/blob/main/docs/testing.md#ttsim-chaos),
+[ttsim-chaos](https://github.com/0xalkinun/baretile/blob/main/docs/testing.md#ttsim-chaos),
 set `TTSIM=/absolute/path/to/libttsim.so`. It comes before a card and before the
 downloaded release. On a machine with a Blackhole and no `TTSIM`, baretile opens
 the card through tt-kmd, Tenstorrent's kernel driver, without root. Without
 tt-kmd, it opens the card through sysfs, which needs root. See
-[bring-up](https://github.com/baretile/baretile/blob/main/docs/bring-up.md)
+[bring-up](https://github.com/0xalkinun/baretile/blob/main/docs/bring-up.md)
 before running on a card.
 
 ## Tensors
@@ -90,7 +90,7 @@ the matmul's result in the math unit's registers, before it's written out.
 Tensors have up to five dimensions, with the last two stored as tiles, and
 support broadcasting, reductions, views and autograd. Storage formats are
 bf16, fp32, int32, bfp8 and bfp4. The
-[compiler docs](https://github.com/baretile/baretile/blob/main/docs/compiler.md)
+[compiler docs](https://github.com/0xalkinun/baretile/blob/main/docs/compiler.md)
 explain the layout and precision limits.
 
 To see the kernels a script launched and what each one computes, run it with
@@ -120,9 +120,9 @@ minutes, half a minute a token, since the simulator runs every core of the chip,
 and curl prints nothing until it's done. The server speaks OpenAI's completions
 and chat completions API, so OpenAI's clients work with it too.
 
-[Models](https://github.com/baretile/baretile/blob/main/docs/models.md#running-a-model)
+[Models](https://github.com/0xalkinun/baretile/blob/main/docs/models.md#running-a-model)
 lists the families baretile runs and how each one is checked, and
-[serving](https://github.com/baretile/baretile/blob/main/docs/models.md#serving)
+[serving](https://github.com/0xalkinun/baretile/blob/main/docs/models.md#serving)
 covers the server's options. To generate from a local checkpoint and compare
 each token with NumPy's choice, pass its folder. The server keeps what it
 downloads in `~/.cache/baretile/hub`:
@@ -133,25 +133,25 @@ python3 -m baretile.models.llama ~/.cache/baretile/hub/HuggingFaceTB/SmolLM-135M
 
 baretile has its own small frontend, `Tensor`, which the models above use.
 tinygrad programs also run on it, through
-[baretile/adapters/tinygrad_device.py](https://github.com/baretile/baretile/blob/main/baretile/adapters/tinygrad_device.py),
+[baretile/adapters/tinygrad_device.py](https://github.com/0xalkinun/baretile/blob/main/baretile/adapters/tinygrad_device.py),
 and PyTorch programs through tinygrad's torch frontend.
 
 To train, `python3 -m baretile.models.train` trains GPT-2 from scratch, by
 default GPT-2 124M on tokens such as FineWeb's, and `python3 test/train.py 300`
 in a checkout trains a small GPT-2 written in tinygrad on baretile's docs, and
 checks every step against PyTorch.
-[Training](https://github.com/baretile/baretile/blob/main/docs/models.md#training)
+[Training](https://github.com/0xalkinun/baretile/blob/main/docs/models.md#training)
 shows how to get the tokens, its settings and the small model's loss curve.
 
 ## Learn baretile
 
-The [ramps](https://github.com/baretile/baretile/tree/main/ramps) teach baretile
+The [ramps](https://github.com/0xalkinun/baretile/tree/main/ramps) teach baretile
 from the top down. Each one is a script that checks its results as it goes, and
 its comments explain each step, so read it beside its output. They're in the
 repository:
 
 ```sh
-git clone https://github.com/baretile/baretile
+git clone https://github.com/0xalkinun/baretile
 cd baretile
 python3 ramps/1_tensors.py
 python3 ramps/2_runtime.py
@@ -164,7 +164,7 @@ second runs C kernels on the workers and moves data over the NoC. The third
 programs the unpack, math and pack threads of a Tensix tile by hand, and the
 fourth puts all four programs together into a tensor operation of your own.
 
-The [documentation](https://github.com/baretile/baretile/blob/main/docs/README.md)
+The [documentation](https://github.com/0xalkinun/baretile/blob/main/docs/README.md)
 explains the runtime, the compiler, the models and the hardware, and includes a
 map of the code.
 
@@ -181,11 +181,11 @@ python3 -m pytest -s test
 With pytest-xdist installed, `python3 -m pytest -n auto test` runs them in a
 process for each CPU, as CI does. On GitHub's four-CPU runner, that halves the time.
 Tests that need checkpoint files are opt-in, and
-[testing](https://github.com/baretile/baretile/blob/main/docs/testing.md#optional-checks)
+[testing](https://github.com/0xalkinun/baretile/blob/main/docs/testing.md#optional-checks)
 lists them.
 
-[CONTRIBUTING.md](https://github.com/baretile/baretile/blob/main/CONTRIBUTING.md)
+[CONTRIBUTING.md](https://github.com/0xalkinun/baretile/blob/main/CONTRIBUTING.md)
 explains how to run the checks, what the code should look like and how to
 report a bug.
 
-Licensed under [Apache-2.0](https://github.com/baretile/baretile/blob/main/LICENSE).
+Licensed under [Apache-2.0](https://github.com/0xalkinun/baretile/blob/main/LICENSE).

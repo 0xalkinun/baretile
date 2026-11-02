@@ -142,7 +142,7 @@ The job never runs for a pull request from a fork. A self-hosted runner runs
 whatever a pull request's code does, with the machine's access, so keep the
 machine for the card, and its runner for this repository. It becomes a required
 check once it has passed reliably for a week
-([#43](https://github.com/baretile/baretile/issues/43)).
+([#43](https://github.com/0xalkinun/baretile/issues/43)).
 
 ## What still needs checking
 
