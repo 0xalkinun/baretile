@@ -79,6 +79,11 @@ on. They use only what [the public API](docs/api.md) lists. When a model needs
 something else, the core gains a public name for it, or the code stays with the
 model.
 
+baretile stays general, so that anyone can build on it. Applications live in
+their own repositories and use baretile through the public API. A change belongs
+in baretile when people beyond one application would use it, so say why in
+those terms and test it that way. Otherwise it stays with the application.
+
 Layers 0 to 3 stay under 4,500 lines of code at 120 columns, not counting
 comments and docstrings, and `test_size` checks it. A line counts once for each
 120 characters it takes, so a longer line doesn't make the count smaller, and
