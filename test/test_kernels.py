@@ -162,6 +162,21 @@ def test_viz_script(tmp_path):
   assert [k["name"] for k in run["kernels"]] == ["mul", "readback"] and run["kernels"][0]["graph"][-1][0] == "mul"
 
 
+def test_viz_dropped_runtimes(tmp_path):
+  # Under viz, a script that makes and drops runtimes one after another leaves as many open as without viz, so it
+  # needs no more host memory, and the page still shows the launches of each one, kept as Python reaps it (#22).
+  (tmp_path / "script.py").write_text(
+    "import gc\nfrom baretile import pci, runtime\nfrom baretile.chip import Chip\nfrom baretile.runtime import Runtime\n"
+    "from baretile.tensor import Tensor\nchip = Chip(pci.open_device())\nfor k in range(3):\n"
+    "  rt = Runtime(chip, start=chip.tensix[2 * k], end=chip.tensix[2 * k + 1])\n"
+    "  print((Tensor.of(rt, [[1.0, 2.0]]) * (k + 1)).tolist())\n  del rt\n  gc.collect()\nprint(len(runtime._open), 'open')\n")
+  env = os.environ | {"PYTHONPATH": str(pathlib.Path(__file__).parent.parent)}
+  for viz_args in ((), ("-m", "baretile.viz")):
+    out = subprocess.run([sys.executable, *viz_args, "script.py"], cwd=tmp_path, capture_output=True, text=True, timeout=300, env=env)
+    assert out.returncode == 0 and "\n1 open\n" in out.stdout, out.stdout + out.stderr
+  runs = page_data(tmp_path / "viz.html")
+  assert [[k["name"] for k in run["kernels"]] for run in runs] == [["mul", "readback"]] * 3
+
 def test_jit(chip, monkeypatch):
   # tensor.jit records the second call of a function and replays its launches after that. Later calls send the same
   # launches on their inputs where they are, without building anything or realizing another expression. The function

@@ -1,9 +1,9 @@
 # Run a script and write its completed launches to viz.html. The page shows a timeline, kernel timings, graphs of
 # fused expressions and each kernel's C programs. It contains its own data and needs a browser with JavaScript enabled.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.viz script.py [args], or -m module [args]
-# The page includes the runtimes still open when the script ends. Closing a runtime, or replacing it with an
-# overlapping one, discards its launch records.
-import json, pathlib, runpy, struct, sys
+# The page includes every runtime the script made, also one it dropped, whose records are kept as Python reaps it.
+# Closing a runtime, or replacing it with an overlapping one, discards its launch records.
+import json, pathlib, runpy, struct, sys, weakref
 from baretile import pci, tensor
 from baretile.runtime import CORES, PROGRAMS, TIMES, Runtime
 
@@ -11,9 +11,13 @@ def save(path, *runtimes, since=0):
   """Write completed launches after since for each runtime, limited to its last TIMES launch records.
   This doesn't wait for queued work. Call rt.wait() first to include it, or save the completed work after
   a timeout or interrupt. A closed or replaced runtime raises RuntimeError, since its records went with it."""
-  made = {v if isinstance(v, bytes) else v[0]: (k, v) for k, v in tensor.kernels.items()}  # what each image was compiled from
-  data = json.dumps([_runtime(rt, since, made) for rt in runtimes]).replace("</", "<\\/")  # nothing in it can close the script tag
+  _write(path, [_runtime(rt, since, _made()) for rt in runtimes])
+
+def _write(path, runs):
+  data = json.dumps(runs).replace("</", "<\\/")  # nothing in it can close the script tag
   pathlib.Path(path).write_text(pathlib.Path(__file__).with_name("viz.html").read_text().replace("{data}", data))
+
+def _made(): return {v if isinstance(v, bytes) else v[0]: (k, v) for k, v in tensor.kernels.items()}  # what each image was compiled from
 
 def _runtime(rt, since, made):
   done = rt.finished()  # the last launch that finished
@@ -68,20 +72,28 @@ def _how(mode):  # describe B's read mode: I selects matrices by index, C stores
   return ", ".join(w for w in ("picked by ids" * (rest != mode), {"C": "by columns", "T": "transposed"}.get(rest[:1], ""), rest.lstrip("CT")) if w)
 
 if __name__ == "__main__":
-  # Keep runtimes alive until save, including when the script raises an exception or receives Ctrl-C.
+  # Write the page when the script ends, also when it raises an exception or receives Ctrl-C. Runtimes are held weakly,
+  # so a dropped one is reaped as it would be without viz. Python calls __del__ before the runtime's host pages can go,
+  # which happens at the next safe point (runtime._reap), so its records are read then.
   if len(sys.argv) < 2 or sys.argv[1] == "-m" and len(sys.argv) < 3: sys.exit("usage: python3 -m baretile.viz script.py [args], or -m module [args]")
-  runtimes, init = [], Runtime.__init__
+  runs, at, init = [], {}, Runtime.__init__  # each runtime's records once it's reaped, else a weak reference to it
   def keep(rt, *args, **kwargs):
     init(rt, *args, **kwargs)
-    runtimes.append(rt)
-  Runtime.__init__ = keep
+    at[id(rt)] = len(runs)
+    runs.append(weakref.ref(rt))
+  def reap(rt):
+    if (i := at.pop(id(rt), None)) is not None: runs[i] = None if rt.closed or not rt.launches else _runtime(rt, 0, _made())
+  Runtime.__init__, Runtime.__del__ = keep, reap
   module = sys.argv[1] == "-m"  # run a module, as python3 -m does, such as baretile.models.llama
   sys.argv = sys.argv[1 + module:]
   if not module: sys.path.insert(0, str(pathlib.Path(sys.argv[0]).resolve().parent))  # what python3 puts first for a script
   try: runpy.run_module(sys.argv[0], run_name="__main__", alter_sys=True) if module else runpy.run_path(sys.argv[0], run_name="__main__")
   finally:
-    # A closed or replaced runtime's launch records went with its host memory, so the page holds the open ones
-    if live := [rt for rt in runtimes if not rt.closed]:
-      save("viz.html", *live)
+    live, made = [], _made()
+    for r in runs:  # a closed or replaced runtime's launch records went with its host memory, so the page holds the others
+      if isinstance(r, dict): live.append(r)
+      elif r is not None and (rt := r()) is not None and not rt.closed: live.append(_runtime(rt, 0, made))
+    if live:
+      _write("viz.html", live)
       print(f"wrote viz.html for {len(live)} runtime{'s' * (len(live) > 1)}. Open it in a browser")
-    elif runtimes: print("no viz.html: the script closed its runtimes, and their launch records went with them", file=sys.stderr)
+    elif runs: print("no viz.html: the script closed its runtimes, and their launch records went with them", file=sys.stderr)
