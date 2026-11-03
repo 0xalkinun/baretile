@@ -167,9 +167,8 @@ class Tensor:
     v = 32 if self.dtype in BFP else min(rows, 32)
     sent, faces = (tb if v == 32 else 32 * v * n,
                    [16 * n * f for f in (0, min(v, 16), 2 * min(v, 16), 2 * min(v, 16) + max(v - 16, 0))])
-    by = bool(self.runs)
-    per, tiles, kernel = (len(self.rt.back) // sent, bytearray(),
-                          _cached(("readback", self.dtype, by), lambda: readback_kernel(self.dtype, by)))
+    key = ("readback", self.dtype, bool(self.runs))
+    per, tiles, kernel = len(self.rt.back) // sent, bytearray(), _cached(key, lambda: readback_kernel(*key[1:]))
     for start in range(0, self.tiles, per):
       k = min(per, self.tiles - start)
       self.rt.launch(kernel, (start, *self._where(True), tc, self.tiles // self.batch, self.rep,
@@ -325,9 +324,8 @@ class Tensor:
     if self.op != "move" and len(steps) <= 1 and min(steps, default=1) > 0:
       batch = slice(picked[0], picked[-1] + 1, min(steps, default=1))
       t = self._relabel((self.batch,))[batch, key[-2], key[-1]]._relabel(tuple(map(len, ranges[:-2])))
-      return t._track("slice", (self,), ranges)  # the gradient by the slice's own ranges, not the batch's steps
-    t = self._map(tuple(map(len, ranges)), range(n), [g.start for g in ranges], [g.step for g in ranges])
-    return t._track("slice", (self,), ranges)
+    else: t = self._map(tuple(map(len, ranges)), range(n), [g.start for g in ranges], [g.step for g in ranges])
+    return t._track("slice", (self,), ranges)  # the gradient by the slice's own ranges, not the batch's steps
 
   # Movement. Each op maps the result's elements to this tensor's, and one launch copies them: move_kernel, or
   # transpose_kernel for a bf16 transpose.
@@ -1013,10 +1011,8 @@ def _fit(t):
   reductions to avoid recomputing them on each pass. Also realize elementwise values shared with work outside
   the reduction. Then split what's left from the operands up: where the ops a kernel for an op would compute are
   more than MAX_OPS, realize the largest value in them that other ops also read, or else the op's largest operand."""
-  matmuls = lambda: [v for v in _lazy(t, set()) if v.op == "matmul" and id(v) not in kept]
   indexed, block, kept = False, None, set()
-  while todo := matmuls():
-    u = todo[0]
+  while (u := next((v for v in _lazy(t, set()) if v.op == "matmul" and id(v) not in kept), None)) is not None:
     dtype = u.srcs[1].dtype
     if (len(u.srcs) == 3 and indexed) or (dtype in BFP and block is not None and dtype != block):
       # one index stream and one block-float unpack format per fused kernel. t no longer reaches u's matmuls
@@ -1170,16 +1166,15 @@ def _expr(t, shape, inputs, kernel):
     return ("ftob", e) if rounds else e
   if t.op == "spread": return _input(_spread_view(t), inputs)  # read in place, like an input
   axis = kernel[0]
-  if any(t._dims[ax] != shape[ax] for ax in range(3) if ax != axis): return _expr(t.realize(), shape, inputs, kernel)
+  # kernels of their own (but a matmul can read B transposed, below), other shapes, and folds along other axes
+  if (t.op in ("T", "move") or any(t._dims[ax] != shape[ax] for ax in range(3) if ax != axis)
+      or t.op in COMBINE and FOLDS[t.op] != axis): return _expr(t.realize(), shape, inputs, kernel)
   if t.op in COMBINE:
-    if FOLDS[t.op] != axis: return _expr(t.realize(), shape, inputs, kernel)
     n = ext(t.srcs[0]._dims, axis)
     if n > 1 and kernel[1] is None: kernel[1] = n
     if (n > 1 and n != kernel[1]) or t.sweep != kernel[5] or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)):
       return _expr(t.realize(), shape, inputs, kernel)
     kernel[2].add(id(t))
-  # kernels of their own, but a matmul can read B transposed (below)
-  if t.op in ("T", "move"): return _expr(t.realize(), shape, inputs, kernel)
   if t.op == "matmul":  # a matmul reads its operands as matrices, not tile by tile, so realize them first
     a, b, *picked = map(_bare, t.srcs)  # picked: the indices that pick B's matrices, if any
     if b.op == "T":  # read transposed. a block float, like a bfp8 key cache, is read as is and transposed on the way in
