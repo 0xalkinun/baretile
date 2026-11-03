@@ -41,8 +41,8 @@ the next runtime on the chip, once Python has collected the dropped one, or an
 allocation of DRAM or of a host page that finds no room, which collects first. A
 dropped runtime is usually in a reference cycle through its cached number
 tensors, so call `close()` to release it promptly. Under
-`python3 -m baretile.viz`, viz holds every runtime the script makes until it
-writes the page, so those aren't reaped when dropped. If a multicast never
+`python3 -m baretile.viz` a dropped runtime is reaped the same way, and viz
+reads its launch records as Python collects it. If a multicast never
 finishes or the NoC never drains, closing resets the cores anyway and keeps the
 runtime's host page and DRAM for the rest of the process, so a new runtime can
 still take over a hung rectangle. One whose kernel hung inside a Tensix program
@@ -193,8 +193,8 @@ python3 -m baretile.viz -m baretile.models.llama /path/to/SmolLM-135M "The meani
 The script runs as it would under `python3`. If it creates a runtime, the
 wrapper writes `viz.html` in the current directory when the script returns or
 raises an exception, including Ctrl-C. The page includes the completed launches
-of each runtime still open when the script ends. A runtime the script closed, or
-replaced with an overlapping one, has no records left. From Python, call
+of each runtime the script made, also one it dropped. A runtime the script
+closed, or replaced with an overlapping one, has no records left. From Python, call
 `viz.save(path, rt, since=saved)`. Call `rt.wait()` first to include all queued
 work. `save` doesn't wait, so you can also call it after a launch times out.
 
