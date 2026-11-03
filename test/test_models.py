@@ -2602,10 +2602,11 @@ def test_schema_edges():
   def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
   for schema in ({"$ref": "#/$defs/loop", "$defs": {"loop": {"$ref": "#/$defs/loop"}}},
                  {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}},
-                 {"type": 3}, {"type": []}, {"anyOf": []}, {"allOf": []}, {"items": 3}, {"maxItems": -1}):
+                 {"type": 3}, {"type": []}, {"anyOf": []}, {"allOf": []}, {"items": 3}, {"maxItems": -1}, {"minLength": 1.5},
+                 {"minLength": 2, "maxLength": 1}, {"minimum": "1"}, {"exclusiveMinimum": True}, {"multipleOf": 0}):
     with pytest.raises(ValueError): fits(schema)
-  # A keyword that formatted would ignore is refused by name. Annotations and the bounds it documents as unenforced are accepted
-  for schema, named in (({"not": {"type": "string"}}, "not"),
+  # A keyword that formatted would ignore is refused by name. Annotations are accepted, format among them
+  for schema, named in (({"not": {"type": "string"}}, "not"), ({"type": "string", "pattern": "^a"}, "pattern"),
                         ({"type": "array", "prefixItems": [True], "uniqueItems": True}, "prefixItems, uniqueItems"),
                         ({"properties": {"a": {"if": {}, "then": {}}}}, "if, then"), ({"anyOf": [{"minProperties": 1}]}, "minProperties"),
                         ({"allOf": [{"patternProperties": {}}]}, "patternProperties")):
@@ -2613,7 +2614,7 @@ def test_schema_edges():
   marked = {"title": "T", "description": "d", "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "x", "examples": [1],
             "default": 1, "deprecated": False, "readOnly": True, "writeOnly": False, "$comment": "c", "type": "integer"}
   assert fits(marked)("1") == 2 and fits(marked)('"1"') == 0
-  assert fits({"type": "string", "pattern": "^a", "format": "date", "minLength": 3})('"b"') == 2 and fits({"minimum": 5})("1") == 2
+  assert fits({"type": "string", "format": "date"})('"b"') == 2
   every = fits({"allOf": [{"type": "integer"}, {"enum": [1, 2, "x"]}]})
   assert every("1") == 2 and every('"x"') == 0 and every("3") == 0
   # older pydantic puts a described $ref in allOf
@@ -2627,6 +2628,30 @@ def test_schema_edges():
   one = fits({"oneOf": [{"type": "number"}, {"type": "integer"}]})
   assert one("1") == 1 and one("1.5") == 2 and one("1 ") == 0
   assert fits({"oneOf": [{"type": "boolean"}, {"enum": [True]}]})("true") == 0
+
+def test_schema_bounds(tmp_path):
+  # formatted enforces string lengths, in code points, and numeric bounds. A number stops where no more digits could
+  # meet its bounds, so random logits still finish an answer that meets them all.
+  def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
+  whole = fits({"type": "integer", "minimum": 10, "exclusiveMaximum": 20, "multipleOf": 3})
+  assert [whole(t) for t in ("1", "12", "13", "1 ", "12 ", "-", "2", "1.5", "15")] == [1, 2, 0, 0, 2, 0, 0, 0, 2]
+  part = fits({"type": "number", "exclusiveMinimum": 0, "maximum": 1, "multipleOf": 0.25})
+  assert [part(t) for t in ("0", "0.2", "0.3", "0.75", "1.0", "1.25", "1e0", "-0.5")] == [1, 1, 0, 2, 2, 0, 0, 0]
+  assert fits({"type": "number", "minimum": -2.5, "maximum": -2.4})("-2.45") == 2 and fits({"type": "number", "maximum": -3})("-2") == 1
+  text = fits({"type": "string", "minLength": 2, "maxLength": 3})
+  for t, want in (('"a"', 0), ('"ab"', 2), ('"abc', 1), ('"abcd', 0), ('"abc\\', 0), ('"😀é"', 2), ('"ab\\ud83d\\ude00"', 2),
+                  ('"ab\\ud83d\\u00', 0), ('"\\u00e9\\ud83d\\ude00\\n"', 2)):
+    assert text(t) == want, t
+  schema = {"type": "object", "properties": {"n": {"type": "integer", "minimum": 3, "maximum": 250, "multipleOf": 7},
+                                             "x": {"type": "number", "exclusiveMinimum": -1, "exclusiveMaximum": 1},
+                                             "s": {"type": "string", "minLength": 3, "maxLength": 5}},
+            "required": ["n", "x", "s"], "additionalProperties": False}
+  tok, shape = bytes_tokenizer(tmp_path), fits(schema)
+  for seed in range(5):  # with random logits most bytes don't fit, so most tokens are drawn again
+    rng, r = np.random.default_rng(seed), serve.Request(tok, [], 300, 1.0, eos=[0], seed=seed, shape=shape)
+    while not r.take(rng.normal(0, 1, 256).astype(np.float32), True): pass
+    got = json.loads(tok.decode(r.made))
+    assert r.finish == "stop" and 3 <= got["n"] <= 250 and got["n"] % 7 == 0 and -1 < got["x"] < 1 and 3 <= len(got["s"]) <= 5, got
 
 def test_schema_intersections():
   def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})

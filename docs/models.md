@@ -251,8 +251,8 @@ constrain which tokens can be sampled. `test_chat_tools`, `test_serve_http`,
 when adding a model or client.
 
 JSON schemas support types, properties, required fields, additional properties,
-arrays, enums, constants, alternatives, `allOf` and nonrecursive local
-references. Sibling constraints intersect, including fields beside `$ref`,
+arrays, string lengths in code points, numeric bounds and `multipleOf`, enums,
+constants, alternatives, `allOf` and nonrecursive local references. Sibling constraints intersect, including fields beside `$ref`,
 following the
 [JSON Schema 2020-12 reference rules](https://json-schema.org/draft/2020-12/json-schema-core#section-8.2.3.1).
 Enums and constants match decoded JSON values; strings accept literal Unicode
@@ -263,13 +263,15 @@ string, say), the request ends with an error: HTTP 500, or `finish_reason`
 `error` in a stream. When a stop string cuts the text, logprobs cover only the
 returned text's tokens.
 
-`serve.formatted` documents the supported subset. Patterns, formats, string
-lengths and numeric bounds are accepted but not enforced, and annotations such
-as `title` and `description` change nothing. Any other keyword, such as `not`,
-`prefixItems`, `uniqueItems`, `if`/`then`/`else` or `patternProperties`, gets
-HTTP 400 naming it. Generation allows at most one whitespace character between
-tokens and 32 characters per number; integer schemas use spellings without
-fractions or exponents. Arrays and objects nest at most 32 deep
+`serve.formatted` documents the supported subset. Annotations such as `title`,
+`description` and `format` change nothing; draft 2020-12 makes `format` an
+annotation unless a validator opts in. Any other keyword, such as `pattern`,
+`not`, `prefixItems`, `uniqueItems`, `if`/`then`/`else` or `patternProperties`,
+gets HTTP 400 naming it. Generation allows at most one whitespace character
+between tokens and 32 characters per number; integer schemas use spellings
+without fractions or exponents, and numbers with bounds spellings without
+exponents. A number goes on only while more digits could still meet its bounds,
+so it never starts down a spelling it can't finish. Arrays and objects nest at most 32 deep
 (`serve.NESTING`). A deeper bracket is never sampled, and if no other token
 fits, the request ends with an error. Schemas nest at most 32 levels, counting
 each subschema and reference, and an enum or constant value only as deep as its
