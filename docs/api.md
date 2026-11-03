@@ -15,8 +15,8 @@ compiles tinygrad's graphs to `Tensor` operations.
 A **stable** name keeps its meaning across 0.x releases. When one has to change,
 the release's [changelog](../CHANGELOG.md) says so under "Changed" and says how
 to update. An **experimental** name can change in any release, and the changelog
-still lists the change. The version stays below 0.1 until baretile is tested on
-a P150a.
+still lists the change. The version stays below 0.1 until the first launch,
+which [#7](https://github.com/0xalkinun/baretile/issues/7) defines.
 
 ## What's public
 
