@@ -185,7 +185,8 @@ jobs:
       - run: python -m baretile.chip ttsim
       - run: >-
           python -m pytest -n auto -rs --durations=20 -o faulthandler_timeout=600 test/test_models.py::test_train test/test_models.py::test_train_gpt2
-          test/test_models.py::test_llama_frequencies test/test_models.py::test_tokenizer test/test_models.py::test_hf_families
+          test/test_models.py::test_llama_frequencies test/test_models.py::test_tokenizer test/test_models.py::test_tokenizer_gate
+          test/test_models.py::test_hf_families
           test/test_models.py::test_qwen3_moe test/test_models.py::test_qwen3_5_moe test/test_models.py::test_mxfp4
           test/test_models.py::test_torch_frontend test/test_models.py::test_autonomous_generation
         env:

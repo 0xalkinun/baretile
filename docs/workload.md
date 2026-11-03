@@ -109,7 +109,7 @@ the failing evidence and a numerical explanation, before resuming optimization.
 
 | Gate | Required result |
 | --- | --- |
-| Tokenizer | Exact token IDs and decoded text against Hugging Face's tokenizer from the same revision, with `add_special_tokens=False`, for the three prompts below and `"  café İstanbul 12345\n\tHello!"`. No script runs this gate yet |
+| Tokenizer | Exact token IDs and decoded text against Hugging Face's tokenizer from the same revision, with `add_special_tokens=False`, for the three prompts below and `"  café İstanbul 12345\n\tHello!"`, as `test/tokenizer.py` checks |
 | SmolLM checkpoint smoke | Existing `test_llama_model` passes: two decisions match NumPy's argmax, maximum absolute logit error is below 1, and the second chosen token is 1962 |
 | SmolLM autonomous generation, bf16 | Three prompts × 32 decisions; each run feeds its own selected tokens back. At every step, relative maximum logit error is at most 3%, and the selected token is within 1% of the reference logit span of the reference maximum |
 | Llama B2 reference agreement, `tt` | At least 450/500 top-1 matches (90%) and 490/500 top-5 matches (98%), using integer counts without rounding percentages upward |
@@ -154,7 +154,15 @@ comparison alone proves that the device implementation is correct.
 
 ## Commands and remaining checks
 
-First run the small checkpoint smoke on ttsim. This exercises the full SmolLM
+The tokenizer gate needs no chip. `test/tokenizer.py` encodes and decodes each
+text with baretile's tokenizer and with transformers' from the same folder, and
+exits with an error on any difference:
+
+```sh
+python3 test/tokenizer.py "$SMOLLM_DIR" "$LLAMA_DIR"
+```
+
+Then run the small checkpoint smoke on ttsim. This exercises the full SmolLM
 checkpoint but only two decisions. It does not complete the autonomous gate.
 
 ```sh
