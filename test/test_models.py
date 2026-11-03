@@ -1153,6 +1153,26 @@ def test_tokenizer(tmp_path):
   ours = llama.Tokenizer(str(tmp_path))
   assert ours.encode("the", special=True) == ours.encode("the") == [258], "no special tokens must leave BPE merges intact"
 
+def test_tokenizer_gate(tmp_path, monkeypatch):
+  # test/tokenizer.py, the first workload's tokenizer gate, finds no difference on tokenizers that Hugging Face's
+  # tokenizers library trains, with GPT-2's pre-tokenizer and with Llama 3's split before it. It reports IDs that differ.
+  pytest.importorskip("transformers")
+  from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, trainers
+  import tokenizer
+  llama3 = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+  byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+  for pre in (pre_tokenizers.ByteLevel(add_prefix_space=False),
+              pre_tokenizers.Sequence([pre_tokenizers.Split(Regex(llama3), "isolated"), byte_level])):
+    t = Tokenizer(models.BPE())
+    t.pre_tokenizer, t.decoder = pre, decoders.ByteLevel()
+    t.train_from_iterator(list(tokenizer.TEXTS) * 20, trainers.BpeTrainer(vocab_size=320, special_tokens=["<|end|>"],
+                                                                        initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
+    t.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"tokenizer_class": "PreTrainedTokenizerFast"}))
+    assert tokenizer.check(str(tmp_path)) == [], pre
+  monkeypatch.setattr(llama.Tokenizer, "encode", lambda self, text, special=False: [0])
+  assert len(tokenizer.check(str(tmp_path))) == len(tokenizer.TEXTS)
+
 @pytest.mark.parametrize("n", [16, 40])
 def test_llama_layer(chip, n):
   # A Llama block in SmolLM-135M's shapes on n tokens, against the same code in numpy float64. The intermediates are
