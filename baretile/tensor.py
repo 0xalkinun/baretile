@@ -1011,8 +1011,8 @@ def _backward(t, g):
 def _fit(t):
   """Realize subexpressions until the remaining tree fits a kernel. Realize long matmuls (K over 256) before
   reductions to avoid recomputing them on each pass. Also realize elementwise values shared with work outside
-  the reduction. Above MAX_OPS, prefer the largest shared value; otherwise choose a subtree that fits along the
-  heaviest branch."""
+  the reduction. Then split what's left from the operands up: where the ops a kernel for an op would compute are
+  more than MAX_OPS, realize the largest value in them that other ops also read, or else the op's largest operand."""
   matmuls = lambda: [v for v in _lazy(t, set()) if v.op == "matmul" and id(v) not in kept]
   indexed, block, kept = False, None, set()
   while todo := matmuls():
@@ -1032,13 +1032,34 @@ def _fit(t):
     for x in [u.srcs[0] for u in lazy if u.op in COMBINE]:  # a cast of a realized tensor is only a read, though
       if (reads[id(x)] > 1 and not (x.op == "cast" and x.srcs[0].op is None) and
           all(u.op not in COMBINE and u.op != "matmul" for u in _lazy(x, set()))): x.realize()
-  while _ops(t) > MAX_OPS:
-    lazy = list(_lazy(t, set()))
-    readers = collections.Counter(i for u in lazy for i in {id(s) for s in u.srcs})
-    shared = [u for u in lazy[1:] if readers[id(u)] > 1 and _ops(u) <= MAX_OPS]
-    u = max(shared, key=_ops) if shared else t
-    while _ops(u) > MAX_OPS: u = max((s for s in u.srcs if s.op), key=_ops)
-    u.realize()
+  # The rest splits in one pass from the operands up: an op's region, the ops a kernel for it would compute, is made to
+  # fit before its readers' regions are counted. A region then holds at most MAX_OPS ops from each operand, so the
+  # pass takes time linear in t's graph.
+  wide = _computes(t) == "fp32"
+  below = lambda u: [s for s in _below(u, u is t, wide) if s.op]
+  lazy = list(_lazy(t, set()))
+  first = {id(u): i for i, u in enumerate(lazy)}  # a tie goes to the op _lazy reaches first
+  readers = collections.Counter(i for u in lazy for i in {id(s) for s in u.srcs})
+  def region(u):  # the ops a kernel for u would compute, by id
+    out, stack = {}, [u]
+    while stack:
+      v = stack.pop()
+      if v.op and id(v) not in out: out[id(v)] = v; stack += below(v)
+    return out
+  def size(u): return sum(v.op not in ("lead", "spread") for v in region(u).values())
+  seen, stack = set(), [(t, False)]
+  while stack:  # each of t's ops, after its operands
+    u, ready = stack.pop()
+    if not ready and id(u) not in seen: seen.add(id(u)); stack += [(u, True)] + [(s, False) for s in reversed(below(u))]
+    while ready and u.op and size(u) > MAX_OPS:
+      shared = [v for i, v in region(u).items() if v is not u and readers[i] > 1]
+      v = max(shared, key=lambda v: (size(v), -first[id(v)])) if shared else max((s for s in u.srcs if s.op), key=size)
+      gone = list({id(s): s for s in v.srcs}.values())
+      v.realize()
+      while gone:  # v's operands lose a reader, and an op that t no longer reaches stops reading its own
+        s = gone.pop()
+        readers[id(s)] -= 1
+        if not readers[id(s)] and s.op and id(s) in first: gone += {id(x): x for x in s.srcs}.values()
 def _terms(t):  # the terms of t, if it's an unrealized sum of realized tensors of its shape, else None
   if t.op != "add" or any(s.shape != t.shape or s.dtype != t.dtype for s in t.srcs): return None
   terms = [[s] if s.op is None else _terms(s) for s in t.srcs]
@@ -1094,8 +1115,6 @@ def _computes(t):
   ops = list(_lazy(t, set(), False))[1:] if dtype == "bf16" else []
   narrows = any(u.op == "cast" and _floats(u) and _bare(u.srcs[0]).op not in (None, "spread", *WHOLE) for u in ops)
   return "fp32" if narrows and all(u.op != "matmul" for u in ops) else dtype
-
-def _ops(t): return sum(u.op not in ("lead", "spread") for u in _lazy(t, set()))  # the most ops a kernel for t holds
 
 def _tree(t, inputs):
   """The expression that fused_kernel computes for t, with realized tensors as indices into inputs, and the dtype it

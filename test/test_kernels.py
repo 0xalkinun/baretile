@@ -1964,8 +1964,9 @@ def test_autograd(chip):
   assert np.allclose(value((tc - ta).mean().gradient(tc)[0]), 1 / 40, rtol=1e-6), "20 rows of a mean over 800"
 
 def test_long_autograd_history(chip):
-  # Graphs deeper than Python's recursion limit realize and differentiate. A long chain takes long to realize, so that
-  # one is shorter, under a lower limit.
+  # Graphs deeper than Python's recursion limit realize and differentiate. A long chain splits into kernels in time
+  # linear in its length: 3,000 adds split in about 0.05 s, where a split that started from the root again for each
+  # kernel took 14 s for 1,100 (#21).
   rt = Runtime(chip)
   x = Tensor.full(rt, 1, 1, 2, "fp32").requires_grad_()
   y = x
@@ -1973,9 +1974,9 @@ def test_long_autograd_history(chip):
   g, = y.gradient(x)
   assert g.tolist() == [[1.0]]
   y, limit = x, sys.getrecursionlimit()
-  for _ in range(400): y = y + 1
-  sys.setrecursionlimit(len(inspect.stack(0)) + 200)  # room for 200 more frames, half the chain
-  try: assert y.tolist() == [[402.0]], "a deep lazy expression also realizes without Python recursion"
+  for _ in range(3000): y = y + 1
+  sys.setrecursionlimit(len(inspect.stack(0)) + 200)  # room for 200 more frames, a fifteenth of the chain
+  try: assert y.tolist() == [[3002.0]], "a deep lazy expression also realizes without Python recursion"
   finally: sys.setrecursionlimit(limit)
   # Realized steps still retain their gradient history. backward must traverse that history without recursion too.
   y = x

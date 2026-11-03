@@ -72,7 +72,11 @@ frames alternate so BRISC can fetch the next tile while Tensix computes. The
 semaphore that counts intermediates can hold fifteen reports, so a kernel can
 have at most fifteen operations. The compiler splits larger expressions, and
 also those with several indexed matmuls or with block-float weights in more than
-one format, which one kernel can't unpack.
+one format, which one kernel can't unpack. A large expression splits from the
+operands up, in time linear in its size. Where an operation's kernel would hold
+more than fifteen, the largest value in it that other operations also read gets
+a kernel of its own first, since each kernel that reads it would otherwise
+compute it. Otherwise the operation's largest operand does.
 
 A kernel computes in one dtype, and a cast at its root is part of it: the
 packer writes the result in the cast's format. An fp32 kernel also computes
