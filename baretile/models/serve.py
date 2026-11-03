@@ -97,7 +97,7 @@ class Request:
     self.shape = shape
     self.made, self.said, self.out, self.finish, self.gone, self.cached, self.probs, self.marks = [], "", queue.Queue(), None, False, 0, [], []
     self.text, self.utf8 = "", codecs.getincrementaldecoder("utf-8")("replace")  # the text so far, except a character that's still coming
-    self.room, self.error = None, None
+    self.room, self.error, self.ended = None, None, None  # ended: the EOS that ended the request, which made leaves out
 
   def whole(self):
     """Whether sampling needs the full logit row. Penalties or shape constraints can select tokens outside the
@@ -195,6 +195,7 @@ class Request:
     head = head if isinstance(head, Head) else Head.of(head, scale(self))
     token = self.pick(head)
     end = token is None or token in self.eos
+    if end: self.ended = token
     if not end:
       self.made.append(token)
       if self.logprobs is not None:  # from the raw logits, before any penalty or temperature. vLLM does the same
@@ -222,6 +223,8 @@ class Request:
       return True
     self.say(self.text[:len(self.text) - unsure(self.text, self.stop)])  # hold back what may begin a stop string
     return False
+
+  def sequence(self): return self.ids + self.made + ([] if self.ended is None else [self.ended])  # an EOS it picked too
 
   def say(self, text):
     if len(text) > len(self.said): self.marks.append(len(self.probs)); self.out.put(text[len(self.said):]); self.said = text
@@ -411,7 +414,7 @@ class Engine:
     final = len(self.held[u]) == len(r.ids)
     self.coherent[u] = not self.spec  # until the prediction layer has seen this chunk too
     done = final and self.take(u, gpt2.values(out)[0], 1 + self.spec, end=False)
-    after = (r.ids + r.made)[at + 1:at + len(ids) + 1]
+    after = r.sequence()[at + 1:at + len(ids) + 1]
     if self.spec and r.finish != "error" and len(after) == len(ids):
       drafts = gpt2.values(qwen.draft(self.on(after), places, h, self.t, self.c, self.slot[u], length=n, every=False))
       self.coherent[u] = True
@@ -492,23 +495,31 @@ class Engine:
     self.replay(self.check, m)(self.on(ids), self.on(places), self.on(self.taken, "fp32"), self.column(ts))
     rows = self.rows(self.check, m)
     pairs = [[0, 0, self.places - 1, self.places - 1] for _ in range(n)]  # the next tokens of each slot and their positions, for the drafts
+    ended = set()  # slots whose request ended. They're released once the guesses have updated their last rows
     for u, r in enumerate(live):
       if not r: continue
       self.held[u].append(r.made[-1])
       self.taken[u] = 0.0
-      if self.take(u, rows[2 * u], 2): continue
-      self.drafted += 1
-      if r.made[-1] != self.drafts[u]: pairs[u] = [r.made[-1], r.made[-1], at[u], at[u]]; continue
-      self.held[u].append(r.made[-1])
-      self.taken[u], self.agreed = 1.0, self.agreed + 1
-      if not self.take(u, rows[2 * u + 1], 2): pairs[u] = [self.drafts[u], r.made[-1], at[u], at[u] + 1]
-    if not any(self.busy[u] is r for u, r in enumerate(live) if r): return
+      if self.take(u, rows[2 * u], 2, end=False): ended.add(u)
+      else:
+        self.drafted += 1
+        if r.made[-1] == self.drafts[u]:
+          self.held[u].append(r.made[-1])
+          self.taken[u], self.agreed = 1.0, self.agreed + 1
+          if self.take(u, rows[2 * u + 1], 2, end=False): ended.add(u)
+      # the token after held, which the prediction layer's row for held's last position reads. A request that ended
+      # with none, as when its client left, leaves that row out, and the slot is rebuilt before it's reused
+      seq, fed = r.sequence(), len(self.held[u])
+      if len(seq) == fed: self.coherent[u] = False
+      elif self.taken[u]: pairs[u] = [self.drafts[u], seq[fed], at[u], at[u] + 1]
+      else: pairs[u] = [seq[fed], seq[fed], at[u], at[u]]
     tokens, at = self.on([x for p in pairs for x in p[:2]]), self.on([q for p in pairs for q in p[2:]])
     self.replay(self.guesses, m)(tokens, at, self.on(self.taken, "fp32"))
     logits, made = self.made[self.guesses, m]
     best = gpt2.values(made[1])[:, 0] if made else gpt2.values(logits).argmax(1)  # the best token of each row is its draft
     for u, r in enumerate(live):
-      if r and self.busy[u] is r: self.drafts[u] = self.guess(u, int(best[2 * u + 1]))
+      if u in ended: self.release(u)
+      elif r: self.drafts[u] = self.guess(u, int(best[2 * u + 1]))
 
   def run(self):  # the thread of the engine: admit while a slot is free, prefill a chunk, take a step. On an error, the requests end
     admitting = None

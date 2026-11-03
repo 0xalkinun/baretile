@@ -215,9 +215,14 @@ limit too, past which the oldest sessions are dropped; a session too large for
 it isn't saved, and its request still succeeds. Restoring a session from host
 memory uploads all of it before it changes the slot. If DRAM can't hold it, the
 server frees what it uploaded, drops the session and prefills the prompt from
-the start. With speculation, a session saved after its prompt includes the
-prediction layer's cache rows for that prompt. The response's usage field counts
-the prompt tokens that were reused.
+the start. With speculation, a session includes the prediction layer's cache
+rows for its tokens. The row for its last position reads the token picked after
+it, an EOS too, so a prompt that goes on with that token drafts from the rows a
+fresh slot would have. One that goes on with another token reads that row
+anyway, which costs accepted drafts but not correctness, since every draft is
+verified. A slot whose request ended without that token, as when its client
+left, is rebuilt before it's reused. The response's usage field counts the
+prompt tokens that were reused.
 
 ## Sampling and API limits
 

@@ -3025,14 +3025,54 @@ def test_prompt_snapshot_includes_prediction(chip, tmp_path):
     engine.restore(0, key)
     assert engine.slot[0][-1][:, :32, :].tobytes() == wanted
     if engine.busy[0] is not None: r.gone = True; engine.take(0, None)
-  # If the first prediction is EOS, there is no next embedding for the draft update. Do not reuse that prefix.
+  # If the first prediction is EOS, the draft update reads EOS, and a prompt that goes on from it reuses the prefix
   r = serve.Request(tok, [7, 200, 31, 64, 5], temperature=0, eos=range(256))
   engine = serve.Engine(rt, t, c, tok, slots=1, places=64, chunk=16)
   engine.admit(r); engine.fill(0)
-  assert r.finish == "stop" and not engine.sessions and not engine.coherent[0]
-  next_request = serve.Request(tok, r.ids + [1], temperature=0)
+  assert r.finish == "stop" and tuple(r.ids) in engine.sessions and engine.coherent[0]
+  next_request = serve.Request(tok, r.sequence() + [1], temperature=0)
   engine.admit(next_request)
-  assert next_request.cached == 0 and engine.coherent[0], "incomplete prediction history must be rebuilt"
+  assert next_request.cached == len(r.ids)
+  # A client that leaves on a speculative step leaves no token for the draft update of the last row. The slot is
+  # rebuilt, and the next prompt reuses only the prefix of a session that's whole
+  r = serve.Request(tok, [7, 200, 31, 64, 5], max_tokens=8, temperature=0)
+  engine = serve.Engine(rt, t, c, tok, slots=1, places=64, chunk=16)
+  engine.admit(r); engine.fill(0); engine.advance()
+  r.gone = True
+  engine.advance()
+  assert r.finish == "gone" and engine.busy[0] is None and not engine.coherent[0]
+  next_request = serve.Request(tok, r.sequence() + [1], temperature=0)
+  engine.admit(next_request)
+  assert next_request.cached == len(r.ids) and engine.coherent[0], "incomplete prediction history must be rebuilt"
+
+def test_prediction_rows_after_a_speculative_end(chip, tmp_path):
+  # The multi-token prediction layer's row for a position is built from the hidden state there and the token after it.
+  # A request that ends on a speculative step, at max_tokens or on an EOS, updates the rows of its last positions
+  # before its slot is released, so a prompt that goes on from it drafts from the rows a fresh slot has. A random
+  # layer accepts almost no drafts either way, so this compares the rows that acceptance depends on. They differ from a
+  # fresh slot's by at most 0.8% of the largest, and by 77% or more when the last row is left out.
+  rt, rng = Runtime(chip), np.random.default_rng(31)
+  c, weights = qwen35(rng)
+  tok, t = bytes_tokenizer(tmp_path), llama.upload(rt, weights)
+  def engine():
+    e = serve.Engine(rt, t, c, tok, slots=1, places=64, chunk=16)
+    threading.Thread(target=e.run, daemon=True).start()
+    return e
+  def rows(e, r):  # the prediction rows of r's prompt, once e has served r
+    served(e, r)
+    assert e.coherent[0]
+    return value(e.slot[0][-1])[:, :len(r.ids), :]
+  prompt = [7, 200, 31, 64, 5]
+  first = serve.Request(tok, prompt, max_tokens=4, temperature=0)
+  served(engine(), first)
+  stop = next(x for x in first.made[1:] if x != first.made[0])  # an EOS that comes on a speculative step
+  for ends in (serve.Request(tok, prompt, max_tokens=4, temperature=0), serve.Request(tok, prompt, temperature=0, eos=[stop])):
+    e = engine()
+    served(e, ends)
+    after = serve.Request(tok, ends.sequence() + [9, 8], max_tokens=2, temperature=0)
+    got, want = rows(e, after), rows(engine(), serve.Request(tok, after.ids, max_tokens=2, temperature=0))
+    assert after.cached == len(ends.sequence()) - 1, (ends.finish, after.cached)
+    assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (ends.finish, np.abs(got - want).max() / np.abs(want).max())
 
 def test_chat_tools(tmp_path, start):
   # serve.qwen_chat must give the strings that Qwen3.6's chat_template.jinja makes through transformers'
