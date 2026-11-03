@@ -6,7 +6,7 @@
 # format (bf16, bfp8, bfp4, or "" for the mode's), and connections the most connections served at once, of which one
 # client address may hold a quarter (serve.server has the default).
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import codecs, collections, functools, itertools, json, math, os, queue, re, select, shutil, socket, sys, tempfile, threading, time, uuid
+import codecs, collections, decimal, functools, itertools, json, math, os, queue, re, select, shutil, socket, sys, tempfile, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
@@ -671,31 +671,64 @@ def chosen(choice, tools):
   return fits
 
 NESTING = 32  # how deeply formatted lets schemas and generated arrays and objects nest. Its checks recurse at each level
-# The schema keywords formatted accepts: those it enforces, annotations, which constrain nothing (discriminator is pydantic's hint
-# beside a oneOf), and value bounds it doesn't enforce. A schema with any other is refused rather than silently loosened
+# The schema keywords formatted accepts: those it enforces, and annotations, which constrain nothing (discriminator is pydantic's
+# hint beside a oneOf, and format is an annotation in draft 2020-12's default vocabulary). A schema with any other is refused
+# rather than silently loosened
+BOUNDS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf")
 KEYWORDS = {"type", "properties", "required", "additionalProperties", "items", "minItems", "maxItems", "enum", "const", "anyOf", "oneOf",
             "allOf", "$ref", "$defs", "definitions", "title", "description", "$schema", "$id", "examples", "default", "deprecated",
-            "readOnly", "writeOnly", "$comment", "discriminator", "pattern", "format", "minLength", "maxLength", "minimum", "maximum",
-            "exclusiveMinimum", "exclusiveMaximum", "multipleOf"}
+            "readOnly", "writeOnly", "$comment", "discriminator", "format", "minLength", "maxLength", *BOUNDS}
 class Short(Exception): pass  # the text ends inside a value that could still fit
 class Bad(Exception): pass  # the text can't begin a value that fits
+
+def inside(x, b):  # whether the Decimal x meets the numeric keywords b, as Decimals
+  meets = {"minimum": lambda v: x >= v, "maximum": lambda v: x <= v, "exclusiveMinimum": lambda v: x > v,
+           "exclusiveMaximum": lambda v: x < v, "multipleOf": lambda v: x % v == 0}
+  with decimal.localcontext(prec=100): return all(meets[k](v) for k, v in b.items())
+
+def reaches(number, b, integer):
+  """Whether number, a JSON number begun without an exponent, can go on, within 32 characters and without one, to a
+  number that meets the numeric keywords b. Each way it can go on gives the multiples of a step in a range."""
+  D, flip = decimal.Decimal, {"minimum": "maximum", "maximum": "minimum", "exclusiveMinimum": "exclusiveMaximum",
+                              "exclusiveMaximum": "exclusiveMinimum"}
+  if number.startswith("-"): b = {flip.get(k, k): v if k == "multipleOf" else -v for k, v in b.items()}  # its magnitude, then
+  digits, room = number.lstrip("-"), 32 - len(number)
+  def hits(a, end, step):  # whether a multiple of step in [a, end) meets b
+    if "multipleOf" in b:
+      places = max(-step.as_tuple().exponent, -b["multipleOf"].as_tuple().exponent, 0)
+      step = D(math.lcm(int(step.scaleb(places)), int(b["multipleOf"].scaleb(places)))).scaleb(-places)
+    low = max(a, b.get("minimum", a), b.get("exclusiveMinimum", a))
+    x = (low / step).to_integral_value(decimal.ROUND_CEILING) * step
+    if x == b.get("exclusiveMinimum"): x += step
+    return x < end and inside(x, b)
+  with decimal.localcontext(prec=100):
+    if "." in digits:  # a fraction with more digits to come
+      whole, frac = digits.split(".")
+      a = D(f"{whole}.{frac or 0}")
+      return bool(frac or room) and hits(a, a + D(10) ** -len(frac), D(10) ** -(len(frac) + room))
+    for n in range(max(len(digits), 1), 2 if digits.startswith("0") else 33 - len(number) + len(digits)):  # integer digits
+      a = D(digits) * 10 ** (n - len(digits)) if digits else D(0 if n == 1 else 10 ** (n - 1))
+      end, left = (a + 10 ** (n - len(digits))) if digits else D(10 ** n), room - n + len(digits)
+      if hits(a, end, D(10) ** -(left - 1) if not integer and left >= 2 else D(1)): return True
+    return False
 
 def formatted(form):
   """Build a prefix validator for response_format, or None for unrestricted text. json_object requires an
   object; json_schema requires a value matching the supported schema fields.
 
   Supported fields are type (one or a list), properties, required, additionalProperties, items, minItems,
-  maxItems, enum, const, anyOf, oneOf, allOf and nonrecursive local $ref into $defs or definitions. String patterns,
-  formats and lengths (pattern, format, minLength, maxLength) and numeric bounds (minimum, maximum, exclusiveMinimum,
-  exclusiveMaximum, multipleOf) are accepted but not enforced, and annotations (title, description, $schema, $id,
-  examples, default, deprecated, readOnly, writeOnly, $comment, discriminator) change nothing. Any other keyword, such
-  as not, prefixItems or uniqueItems, is a ValueError that names it. Sibling fields intersect, including siblings of $ref
-  as in draft 2020-12. Strings may use literal Unicode or equivalent JSON escapes, including in enum and const.
+  maxItems, minLength, maxLength (in code points), minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf,
+  enum, const, anyOf, oneOf, allOf and nonrecursive local $ref into $defs or definitions. Annotations (title,
+  description, format, $schema, $id, examples, default, deprecated, readOnly, writeOnly, $comment, discriminator)
+  change nothing. Any other keyword, such as pattern, not, prefixItems or uniqueItems, is a ValueError that names it.
+  Sibling fields intersect, including siblings of $ref as in draft 2020-12. Strings may use literal Unicode or
+  equivalent JSON escapes, including in enum and const.
 
   Allow at most one whitespace character between tokens and 32 characters per number to prevent unbounded
-  generation. Allow commas only where another key or item can follow, so a valid prefix can still be
-  completed. Arrays and objects nest at most NESTING deep, so a deeper bracket is an invalid prefix. A schema may
-  nest NESTING levels of subschemas, counting references, and an enum or const value only what its level leaves."""
+  generation. A number with numeric bounds is written without an exponent, and only as far as it can still meet
+  them. Allow commas only where another key or item can follow, so a valid prefix can still be completed. Arrays
+  and objects nest at most NESTING deep, so a deeper bracket is an invalid prefix. A schema may nest NESTING levels
+  of subschemas, counting references, and an enum or const value only what its level leaves."""
   kind = (form or {}).get("type", "text")
   if kind == "text": return None
   if kind not in ("json_object", "json_schema"): raise ValueError(f"response_format: unknown type {kind}")
@@ -725,9 +758,13 @@ def formatted(form):
     if not isinstance(sc.get("properties", {}), dict): raise ValueError("schema properties must be an object")
     required = sc.get("required", [])
     if not isinstance(required, list) or any(not isinstance(k, str) for k in required): raise ValueError("required must be a list of property names")
-    for k in ("minItems", "maxItems"):
+    for k in ("minItems", "maxItems", "minLength", "maxLength"):
       if k in sc and (type(sc[k]) is not int or sc[k] < 0): raise ValueError(f"{k} must be a nonnegative integer")
-    if sc.get("minItems", 0) > sc.get("maxItems", math.inf): raise ValueError("minItems exceeds maxItems")
+    for low, high in (("minItems", "maxItems"), ("minLength", "maxLength")):
+      if sc.get(low, 0) > sc.get(high, math.inf): raise ValueError(f"{low} exceeds {high}")
+    for k in BOUNDS:
+      if k in sc and (type(sc[k]) not in (int, float) or not math.isfinite(sc[k])): raise ValueError(f"{k} must be a finite number")
+    if sc.get("multipleOf", 1) <= 0: raise ValueError("multipleOf must be positive")
     for k in ("enum", "anyOf", "oneOf", "allOf"):
       if k in sc and (not isinstance(sc[k], list) or not sc[k]): raise ValueError(f"{k} must be a nonempty list")
     for v in [*sc.get("enum", []), *([sc["const"]] if "const" in sc else [])]:
@@ -753,16 +790,18 @@ def formatted(form):
       if not w.startswith(text[i:i + len(w)]): raise Bad
       if i + len(w) > len(text): raise Bad if pending else Short
       i += len(w)
-    def string(allowed=None):
-      # Compare UTF-16 units so a partial surrogate escape can still become an allowed non-BMP character.
+    def string(allowed=None, least=0, most=math.inf):
+      # Compare UTF-16 units so a partial surrogate escape can still become an allowed non-BMP character. n counts code
+      # points: a low surrogate after a high one joins it
       nonlocal i
-      start, i, units = i, i + 1, b""
+      start, i, units, n, last = i, i + 1, b"", 0, 0
       allowed = None if allowed is None else [a.encode("utf-16-le", "surrogatepass") for a in allowed]
       while i < len(text) and text[i] != '"':
         c = text[i]
         if ord(c) < 32: raise Bad
         if c == "\\":
           if allowed is not None and not any(a.startswith(units) and len(a) > len(units) for a in allowed): raise Bad
+          if n >= most and not 0xd800 <= last <= 0xdbff: raise Bad  # only a low surrogate's escape adds no code point
           i += 1
           if i == len(text): raise Bad if pending else Short
           c = text[i]
@@ -770,7 +809,7 @@ def formatted(form):
             digits = text[i + 1:i + 5]
             if not re.fullmatch("[0-9a-fA-F]*", digits): raise Bad
             if len(digits) < 4:
-              if pending: raise Bad
+              if pending or n >= most and not re.fullmatch("(d([c-f][0-9a-f]{0,2})?)?", digits.lower()): raise Bad
               if allowed is not None and not any(a.startswith(units) and len(a) > len(units) and
                   f"{int.from_bytes(a[len(units):len(units) + 2], 'little'):04x}".startswith(digits.lower()) for a in allowed): raise Bad
               raise Short
@@ -778,14 +817,15 @@ def formatted(form):
           elif c in '"\\/bfnrt': c = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}[c]
           else: raise Bad
         units += c.encode("utf-16-le", "surrogatepass")
-        i += 1
-        if allowed is not None and not any(a.startswith(units) for a in allowed): raise Bad
+        n, last, i = n + (not (0xdc00 <= ord(c) <= 0xdfff and 0xd800 <= last <= 0xdbff)), ord(c), i + 1
+        if n > most or allowed is not None and not any(a.startswith(units) for a in allowed): raise Bad
       if i == len(text):
+        if pending and n >= most: raise Bad
         if pending and allowed is not None:
           remaining = [a[len(units):].decode("utf-16-le", "surrogatepass") for a in allowed if a.startswith(units)]
           if not any(r and not 0xd800 <= ord(r[0]) <= 0xdfff and r[0].encode("utf-8").startswith(pending) for r in remaining): raise Bad
         raise Short
-      if allowed is not None and units not in allowed: raise Bad
+      if n < least or allowed is not None and units not in allowed: raise Bad
       i += 1
       return json.loads(text[start:i])
     def combine(parsers, mode="all"):
@@ -846,18 +886,18 @@ def formatted(form):
         return
       c, kinds = peek(), sc.get("type") or ["object", "array", "string", "number", "boolean", "null"]
       kinds = [kinds] if isinstance(kinds, str) else kinds
-      if c == '"' and "string" in kinds: string()
+      if c == '"' and "string" in kinds: string(None, sc.get("minLength", 0), sc.get("maxLength", math.inf))
       elif c in "-0123456789" and {"number", "integer"} & set(kinds):
         start = i
         while i < len(text) and text[i] in "-+0123456789.eE": i += 1
-        number = text[start:i]
-        if len(number) > 32: raise Bad
-        # If it isn't a complete number, it may be the start of one that more digits complete
-        if not re.fullmatch(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?", number):
-          begun = re.fullmatch(r"-?((0|[1-9][0-9]*)(\.[0-9]*|(\.[0-9]+)?[eE][-+]?[0-9]*)?)?", number)
-          if not pending and i == len(text) and begun and len(number) < 32 and ("number" in kinds or not re.search("[.eE]", number)): raise Short
-          raise Bad
-        if "number" not in kinds and re.search("[.eE]", number): raise Bad
+        number, integer, bounds = text[start:i], "number" not in kinds, {k: decimal.Decimal(repr(sc[k])) for k in BOUNDS if k in sc}
+        more = not pending and i == len(text) and len(number) < 32  # more digits may follow
+        if len(number) > 32 or integer and re.search("[.eE]", number) or bounds and re.search("[eE]", number): raise Bad
+        whole = re.fullmatch(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?", number)
+        # If it isn't a complete number, or one that meets the bounds, more digits may still make one
+        if not whole and not (more and re.fullmatch(r"-?((0|[1-9][0-9]*)(\.[0-9]*|(\.[0-9]+)?[eE][-+]?[0-9]*)?)?", number)): raise Bad
+        if not whole or bounds and not inside(decimal.Decimal(number), bounds):
+          raise Short if more and (not bounds or reaches(number, bounds, integer)) else Bad
       elif c in "tfn":
         if ("null" if c == "n" else "boolean") not in kinds: raise Bad
         word({"t": "true", "f": "false", "n": "null"}[c])
