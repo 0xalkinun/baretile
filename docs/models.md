@@ -251,8 +251,8 @@ constrain which tokens can be sampled. `test_chat_tools`, `test_serve_http`,
 when adding a model or client.
 
 JSON schemas support types, properties, required fields, additional properties,
-arrays, string lengths in code points, numeric bounds and `multipleOf`, enums,
-constants, alternatives, `allOf` and nonrecursive local references. Sibling constraints intersect, including fields beside `$ref`,
+arrays, string lengths in code points, patterns, numeric bounds and `multipleOf`,
+enums, constants, alternatives, `allOf` and nonrecursive local references. Sibling constraints intersect, including fields beside `$ref`,
 following the
 [JSON Schema 2020-12 reference rules](https://json-schema.org/draft/2020-12/json-schema-core#section-8.2.3.1).
 Enums and constants match decoded JSON values; strings accept literal Unicode
@@ -265,9 +265,21 @@ returned text's tokens.
 
 `serve.formatted` documents the supported subset. Annotations such as `title`,
 `description` and `format` change nothing; draft 2020-12 makes `format` an
-annotation unless a validator opts in. Any other keyword, such as `pattern`,
-`not`, `prefixItems`, `uniqueItems`, `if`/`then`/`else` or `patternProperties`,
-gets HTTP 400 naming it. Generation allows at most one whitespace character
+annotation unless a validator opts in. Any other keyword, such as `not`,
+`prefixItems`, `uniqueItems`, `if`/`then`/`else` or `patternProperties`, gets
+HTTP 400 naming it.
+
+A `pattern` is a regular expression in the part of ECMA-262, JSON Schema's
+dialect, that schemas use: characters and escapes, `.`, `\d`, `\w`, `\s`,
+classes in brackets, quantifiers, groups, alternation, and `^` and `$` for the
+string's start and end. It matches code points, anywhere in the string unless
+anchored. A string goes on only while it can still end in a match, within its
+`minLength` and `maxLength` together, so generation never starts down a string
+it can't finish. Lookarounds, backreferences, word boundaries (`\b`), Unicode
+property escapes (`\p`) and control escapes (`\c`) get HTTP 400 naming them, and
+so do a schema's patterns past 4,096 NFA states together
+(`serve.PATTERN_STATES`). With a pattern, a character beyond the BMP is a
+literal or an escaped surrogate pair, never half of one. Generation allows at most one whitespace character
 between tokens and 32 characters per number; integer schemas use spellings
 without fractions or exponents, and numbers with bounds spellings without
 exponents. A number goes on only while more digits could still meet its bounds,

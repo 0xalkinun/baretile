@@ -677,7 +677,7 @@ NESTING = 32  # how deeply formatted lets schemas and generated arrays and objec
 BOUNDS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf")
 KEYWORDS = {"type", "properties", "required", "additionalProperties", "items", "minItems", "maxItems", "enum", "const", "anyOf", "oneOf",
             "allOf", "$ref", "$defs", "definitions", "title", "description", "$schema", "$id", "examples", "default", "deprecated",
-            "readOnly", "writeOnly", "$comment", "discriminator", "format", "minLength", "maxLength", *BOUNDS}
+            "readOnly", "writeOnly", "$comment", "discriminator", "format", "minLength", "maxLength", "pattern", *BOUNDS}
 class Short(Exception): pass  # the text ends inside a value that could still fit
 class Bad(Exception): pass  # the text can't begin a value that fits
 
@@ -712,15 +712,222 @@ def reaches(number, b, integer):
       if hits(a, end, D(10) ** -(left - 1) if not integer and left >= 2 else D(1)): return True
     return False
 
+# The pattern keyword's regular expressions, in the part of ECMA-262 that schemas use: characters, escapes and classes
+# (., \d, \w, \s and [...]), quantifiers, groups, alternation, and ^ and $ for the string's start and end. They match code
+# points, and anywhere in the string unless anchored, as JSON Schema says. Anything else is refused by name
+UNICODE = 0x10FFFF
+LINES, DIGITS, WORD = [(10, 10), (13, 13), (0x2028, 0x2029)], [(48, 57)], [(48, 57), (65, 90), (95, 95), (97, 122)]  # . leaves out LINES
+SPACES = [(9, 13), (32, 32), (0xa0, 0xa0), (0x1680, 0x1680), (0x2000, 0x200a), (0x2028, 0x2029), (0x202f, 0x202f), (0x205f, 0x205f),
+          (0x3000, 0x3000), (0xfeff, 0xfeff)]
+CHARACTERS = [(0, 0xd7ff), (0xe000, UNICODE)]  # what a string can hold: a surrogate only joins a pair
+PATTERN_STATES = 4096  # the most NFA states a schema's patterns may take together, so a request can't make a huge one
+
+def merged(rs):  # code point ranges, sorted and merged
+  out = []
+  for a, b in sorted(rs):
+    if out and a <= out[-1][1] + 1: out[-1] = (out[-1][0], max(out[-1][1], b))
+    else: out.append((a, b))
+  return out
+
+def outside(rs):  # the code points not in the ranges rs
+  out, at = [], 0
+  for a, b in merged(rs):
+    if a > at: out.append((at, a - 1))
+    at = b + 1
+  return out + ([(at, UNICODE)] if at <= UNICODE else [])
+
+def regex(p):
+  """Parse pattern p into a tree of ("set", ranges), ("cat", parts), ("alt", parts), ("rep", part, least, most) and
+  ("anchor", "^" or "$"). Raise ValueError for what isn't in the subset, naming it."""
+  i = 0
+  bad = lambda what: ValueError(f"pattern {p!r}: {what}")
+  refuse = lambda what: bad(f"{what} aren't supported")
+  def hexa(n, c):  # n hex digits at i, after \c
+    nonlocal i
+    digits, i = p[i:i + n], i + n
+    if not re.fullmatch(f"[0-9a-fA-F]{{{n}}}", digits): raise bad(f"\\{c} needs {n} hex digits")
+    return int(digits, 16)
+  def escape(inside):  # after a backslash: (ranges, whether it's a class like \d rather than one character)
+    nonlocal i
+    if i == len(p): raise bad("it ends in a backslash")
+    c, i = p[i], i + 1
+    classes = {"d": DIGITS, "w": WORD, "s": SPACES}
+    if c.lower() in classes: return (classes[c] if c in classes else outside(classes[c.lower()])), True
+    if c == "b" and inside: return [(8, 8)], False  # backspace, in a class
+    if c in "bB": raise refuse("word boundaries (\\b, \\B)")
+    if c in "123456789": raise refuse("backreferences")
+    if c == "k": raise refuse("named backreferences (\\k)")
+    if c in "pP": raise refuse("Unicode property escapes (\\p, \\P)")
+    if c == "c": raise refuse("control escapes (\\c)")
+    if c == "0" and p[i:i + 1].isdigit(): raise refuse("octal escapes")
+    if c == "x": v = hexa(2, c)
+    elif c == "u":
+      v = hexa(4, c)
+      if 0xd800 <= v <= 0xdbff and re.match(r"\\u[dD][c-fC-F]", p[i:]): i += 2; v = 0x10000 + (v - 0xd800 << 10) + hexa(4, c) - 0xdc00
+    elif c in "0tnvfr": v = {"0": 0, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}[c]
+    elif c.isalnum(): raise bad(f"\\{c} isn't an escape")
+    else: v = ord(c)
+    return [(v, v)], False
+  def klass():  # after [
+    nonlocal i
+    negated, rs = p[i:i + 1] == "^", []
+    i += negated
+    def item():
+      nonlocal i
+      c, i = p[i], i + 1
+      return escape(True) if c == "\\" else ([(ord(c), ord(c))], False)
+    while True:
+      if i == len(p): raise bad("a character class isn't closed")
+      if p[i] == "]": i += 1; break
+      low, wide = item()
+      if p[i:i + 1] == "-" and p[i + 1:i + 2] not in ("]", ""):
+        i += 1
+        high, wider = item()
+        if wide or wider: raise bad("a range can't have a class like \\d at its end")
+        if low[0][0] > high[0][0]: raise bad("a range is out of order")
+        rs.append((low[0][0], high[0][0]))
+      else: rs += low
+    return outside(rs) if negated else merged(rs)
+  def atom():
+    nonlocal i
+    c, i = p[i], i + 1
+    if c == "(":
+      if p.startswith("?:", i): i += 2
+      elif p.startswith(("?=", "?!", "?<=", "?<!"), i): raise refuse("lookarounds")
+      elif p.startswith("?<", i) and (end := p.find(">", i)) > 0: i = end + 1  # a named group
+      elif p.startswith("?", i): raise bad("an unknown group")
+      inner = alternatives()
+      if p[i:i + 1] != ")": raise bad("a group isn't closed")
+      i += 1
+      return inner
+    if c in "^$": return ("anchor", c)
+    if c == ".": return ("set", outside(LINES))
+    if c == "[": return ("set", klass())
+    if c == "\\": return ("set", escape(False)[0])
+    if c in "*+?" or c == "{" and re.match(r"\d+(,\d*)?\}", p[i:]): raise bad("a quantifier has nothing to repeat")
+    return ("set", [(ord(c), ord(c))])
+  def repeat(part):  # part with the quantifier after it, if any. A lazy one (*?) allows the same strings
+    nonlocal i
+    if (c := p[i:i + 1]) and c in "*+?": (least, most), i = {"*": (0, math.inf), "+": (1, math.inf), "?": (0, 1)}[c], i + 1
+    elif m := re.match(r"\{(\d+)(,(\d*))?\}", p[i:]):
+      least, most, i = int(m[1]), int(m[1]) if m[2] is None else int(m[3]) if m[3] else math.inf, i + m.end()
+      if most < least: raise bad("a quantifier's range is out of order")
+    else: return part
+    if part[0] == "anchor": raise bad("an anchor can't be repeated")
+    if p[i:i + 1] == "?": i += 1
+    if (c := p[i:i + 1]) and c in "*+?" or re.match(r"\{\d+(,\d*)?\}", p[i:]): raise bad("a quantifier follows another")
+    return ("rep", part, least, most)
+  def alternatives():
+    nonlocal i
+    parts = [sequence()]
+    while p[i:i + 1] == "|": i += 1; parts.append(sequence())
+    return parts[0] if len(parts) == 1 else ("alt", parts)
+  def sequence():
+    parts = []
+    while i < len(p) and p[i] not in "|)": parts.append(repeat(atom()))
+    return ("cat", parts)
+  tree = alternatives()
+  if i < len(p): raise bad("a parenthesis isn't opened")
+  return tree
+
+class Pattern:
+  """A pattern as an NFA over code points. edges[s] lists (low, high, next) for a code point from low to high, free[s]
+  lists the states s reaches without one, and anchor[s] is "^" or "$" when those moves need the string's start or end.
+  Any code point loops before the match and after it, so it can be anywhere in the string. It may take room states."""
+  def __init__(self, source, room=PATTERN_STATES):
+    self.edges, self.free, self.anchor, self.moves, self.ends, self.lives, self.room = [], [], [], {}, {}, {}, room
+    tree, before, self.accept = regex(source), self.state(), self.state()
+    first, last = self.build(tree)
+    self.edges[before].append((0, UNICODE, before)); self.free[before].append(first)
+    self.free[last].append(self.accept); self.edges[self.accept].append((0, UNICODE, self.accept))
+    self.start = self.closure({before}, start=True)
+  def state(self):
+    if len(self.edges) >= self.room: raise ValueError(f"a schema's patterns may take at most {PATTERN_STATES} NFA states together")
+    self.edges.append([]); self.free.append([]); self.anchor.append(None)
+    return len(self.edges) - 1
+  def build(self, t):  # the first and last states of tree t's part of the NFA
+    first = last = self.state()
+    def then(part):  # part after what's built so far
+      nonlocal last
+      a, b = self.build(part)
+      self.free[last].append(a)
+      last = b
+    if t[0] == "set": last = self.state(); self.edges[first] = [(a, b, last) for a, b in t[1]]
+    elif t[0] == "anchor": last = self.state(); self.anchor[first] = t[1]; self.free[first].append(last)
+    elif t[0] == "cat":
+      for part in t[1]: then(part)
+    elif t[0] == "alt":
+      last = self.state()
+      for part in t[1]:
+        a, b = self.build(part)
+        self.free[first].append(a); self.free[b].append(last)
+    else:  # least copies of the part, then a loop of it, or most - least copies that can each be skipped
+      _, part, least, most = t
+      for _ in range(least): then(part)
+      if most == math.inf:
+        a, b = self.build(part)
+        self.free[last].append(a); self.free[b].append(last)
+      for _ in range(0 if most == math.inf else most - least):
+        a, b = self.build(part)
+        skip = self.state()
+        self.free[last] += [a, skip]; self.free[b].append(skip)
+        last = skip
+    return first, last
+  def closure(self, states, start=False, end=False):  # states and those they reach freely, at the string's start or end
+    seen, todo = set(states), list(states)
+    while todo:
+      s = todo.pop()
+      if self.anchor[s] == "^" and not start or self.anchor[s] == "$" and not end: continue
+      for t in self.free[s]:
+        if t not in seen: seen.add(t); todo.append(t)
+    return frozenset(seen)
+  def step(self, states, low, high):  # the states after any code point from low to high
+    if (key := (states, low, high)) not in self.moves:
+      if len(self.moves) >= 1 << 16: self.moves.clear()
+      self.moves[key] = self.closure({t for s in states for a, b, t in self.edges[s] if a <= high and low <= b})
+    return self.moves[key]
+  def done(self, states, empty=False):  # whether a string that left the NFA in states matches. empty: it's ""
+    if (key := (states, empty)) not in self.ends:
+      if len(self.ends) >= 1 << 16: self.ends.clear()
+      self.ends[key] = self.accept in self.closure(states, empty, True)
+    return self.ends[key]
+  def live(self, states, n, least=0, most=math.inf):
+    """Whether a string of n code points that left the NFA in states can go on to one that matches, of least to most
+    code points. The states after k more code points, any of them, repeat with a period, so the states up to the first
+    repeat answer for every k. If none repeats within PATTERN_STATES code points, only those are searched."""
+    key = states, n == 0, max(least - n, 0), most - n  # what the answer depends on, so each token after the same text asks once
+    if key not in self.lives:
+      if len(self.lives) >= 1 << 16: self.lives.clear()
+      self.lives[key] = self.search(*key)
+    return self.lives[key]
+  def search(self, states, empty, need, room):  # live, for an empty string or not, and need to room more code points
+    sets, at = [], {}
+    while states and states not in at and len(sets) <= min(room, PATTERN_STATES):
+      at[states] = len(sets)
+      sets.append(states)
+      states = frozenset().union(*(self.step(states, a, b) for a, b in CHARACTERS))
+    first, period = (at[states], len(sets) - at[states]) if states in at else (len(sets), 0)
+    for k, s in enumerate(sets):
+      if k >= need and k <= room and self.done(s, empty and k == 0): return True
+      if period and first <= k < need and self.done(s) and k + -(-(need - k) // period) * period <= room: return True
+    return False
+
+def begun(pending):  # the code points whose UTF-8 starts with the bytes pending, from low to high (high < low if none)
+  lead, size = pending[0], 2 if 0xc0 <= pending[0] <= 0xdf else 3 if 0xe0 <= pending[0] <= 0xef else 4 if 0xf0 <= pending[0] <= 0xf7 else 0
+  if not size or len(pending) >= size or any(not 0x80 <= b <= 0xbf for b in pending[1:]): return 1, 0
+  v, shift = lead & 0x7f >> size, 6 * (size - len(pending))
+  for b in pending[1:]: v = v << 6 | b & 0x3f
+  return max(v << shift, (0x80, 0x800, 0x10000)[size - 2]), min((v + 1 << shift) - 1, (0x7ff, 0xffff, UNICODE)[size - 2])
+
 def formatted(form):
   """Build a prefix validator for response_format, or None for unrestricted text. json_object requires an
   object; json_schema requires a value matching the supported schema fields.
 
   Supported fields are type (one or a list), properties, required, additionalProperties, items, minItems,
-  maxItems, minLength, maxLength (in code points), minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf,
-  enum, const, anyOf, oneOf, allOf and nonrecursive local $ref into $defs or definitions. Annotations (title,
-  description, format, $schema, $id, examples, default, deprecated, readOnly, writeOnly, $comment, discriminator)
-  change nothing. Any other keyword, such as pattern, not, prefixItems or uniqueItems, is a ValueError that names it.
+  maxItems, minLength, maxLength (in code points), pattern (see regex), minimum, maximum, exclusiveMinimum,
+  exclusiveMaximum, multipleOf, enum, const, anyOf, oneOf, allOf and nonrecursive local $ref into $defs or definitions.
+  Annotations (title, description, format, $schema, $id, examples, default, deprecated, readOnly, writeOnly, $comment,
+  discriminator) change nothing. Any other keyword, such as not, prefixItems or uniqueItems, is a ValueError that names it.
   Sibling fields intersect, including siblings of $ref as in draft 2020-12. Strings may use literal Unicode or
   equivalent JSON escapes, including in enum and const.
 
@@ -733,6 +940,7 @@ def formatted(form):
   if kind == "text": return None
   if kind not in ("json_object", "json_schema"): raise ValueError(f"response_format: unknown type {kind}")
   root = {"type": "object"} if kind == "json_object" else form["json_schema"]["schema"]
+  patterns = {}  # each pattern's NFA, by its source
   def target(ref):
     if not isinstance(ref, str) or not re.fullmatch(r"#/(\$defs|definitions)/[^/]+", ref): raise ValueError(f"unsupported schema reference: {ref}")
     group, name = ref[2:].split("/")
@@ -765,6 +973,10 @@ def formatted(form):
     for k in BOUNDS:
       if k in sc and (type(sc[k]) not in (int, float) or not math.isfinite(sc[k])): raise ValueError(f"{k} must be a finite number")
     if sc.get("multipleOf", 1) <= 0: raise ValueError("multipleOf must be positive")
+    if "pattern" in sc:  # every pattern of the schema shares PATTERN_STATES
+      if not isinstance(sc["pattern"], str): raise ValueError("pattern must be a string")
+      room = PATTERN_STATES - sum(len(q.edges) for q in patterns.values())
+      if sc["pattern"] not in patterns: patterns[sc["pattern"]] = Pattern(sc["pattern"], room)
     for k in ("enum", "anyOf", "oneOf", "allOf"):
       if k in sc and (not isinstance(sc[k], list) or not sc[k]): raise ValueError(f"{k} must be a nonempty list")
     for v in [*sc.get("enum", []), *([sc["const"]] if "const" in sc else [])]:
@@ -790,12 +1002,22 @@ def formatted(form):
       if not w.startswith(text[i:i + len(w)]): raise Bad
       if i + len(w) > len(text): raise Bad if pending else Short
       i += len(w)
-    def string(allowed=None, least=0, most=math.inf):
+    def string(allowed=None, least=0, most=math.inf, pattern=None):
       # Compare UTF-16 units so a partial surrogate escape can still become an allowed non-BMP character. n counts code
-      # points: a low surrogate after a high one joins it
+      # points: a low surrogate after a high one joins it. A pattern follows the code points through its NFA's states,
+      # and a string goes on only while it can still end in a match of least to most code points
       nonlocal i
-      start, i, units, n, last = i, i + 1, b"", 0, 0
+      start, i, units, n, last, states = i, i + 1, b"", 0, 0, pattern and pattern.start
       allowed = None if allowed is None else [a.encode("utf-16-le", "surrogatepass") for a in allowed]
+      def could(cps, count):  # whether the string can match once a code point in the ranges cps makes it count long
+        return any(pattern.live(pattern.step(states, max(a, c), min(b, d)), count, least, most)
+                   for a, b in cps for c, d in CHARACTERS if max(a, c) <= min(b, d))
+      def unit(low, high):  # could, for a next UTF-16 unit from low to high, written as an escape
+        if 0xd800 <= last <= 0xdbff:  # it can only be the low surrogate that completes a pair
+          pair = 0x10000 + (last - 0xd800 << 10) - 0xdc00
+          return could([(max(low, 0xdc00) + pair, min(high, 0xdfff) + pair)], n)
+        beyond = (0x10000 + (max(low, 0xd800) - 0xd800 << 10), 0x10000 + (min(high, 0xdbff) - 0xd800 << 10) + 0x3ff)  # from a high one
+        return could([(low, high), beyond], n + 1)
       while i < len(text) and text[i] != '"':
         c = text[i]
         if ord(c) < 32: raise Bad
@@ -803,7 +1025,7 @@ def formatted(form):
           if allowed is not None and not any(a.startswith(units) and len(a) > len(units) for a in allowed): raise Bad
           if n >= most and not 0xd800 <= last <= 0xdbff: raise Bad  # only a low surrogate's escape adds no code point
           i += 1
-          if i == len(text): raise Bad if pending else Short
+          if i == len(text): raise Bad if pending or pattern and not unit(0, 0xffff) else Short
           c = text[i]
           if c == "u":
             digits = text[i + 1:i + 5]
@@ -812,10 +1034,18 @@ def formatted(form):
               if pending or n >= most and not re.fullmatch("(d([c-f][0-9a-f]{0,2})?)?", digits.lower()): raise Bad
               if allowed is not None and not any(a.startswith(units) and len(a) > len(units) and
                   f"{int.from_bytes(a[len(units):len(units) + 2], 'little'):04x}".startswith(digits.lower()) for a in allowed): raise Bad
+              low = int(digits or "0", 16) << 4 * (4 - len(digits))
+              if pattern and not unit(low, low + (1 << 4 * (4 - len(digits))) - 1): raise Bad
               raise Short
             c, i = chr(int(digits, 16)), i + 4
           elif c in '"\\/bfnrt': c = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}[c]
           else: raise Bad
+        if pattern:  # a high surrogate waits for the low one that pairs with it, and one without the other can't match
+          o, paired = ord(c), 0xd800 <= last <= 0xdbff
+          if paired != (0xdc00 <= o <= 0xdfff): raise Bad
+          if paired: states = pattern.step(states, *[0x10000 + (last - 0xd800 << 10) + o - 0xdc00] * 2)
+          elif not 0xd800 <= o <= 0xdbff: states = pattern.step(states, o, o)
+          if not states: raise Bad
         units += c.encode("utf-16-le", "surrogatepass")
         n, last, i = n + (not (0xdc00 <= ord(c) <= 0xdfff and 0xd800 <= last <= 0xdbff)), ord(c), i + 1
         if n > most or allowed is not None and not any(a.startswith(units) for a in allowed): raise Bad
@@ -824,8 +1054,13 @@ def formatted(form):
         if pending and allowed is not None:
           remaining = [a[len(units):].decode("utf-16-le", "surrogatepass") for a in allowed if a.startswith(units)]
           if not any(r and not 0xd800 <= ord(r[0]) <= 0xdfff and r[0].encode("utf-8").startswith(pending) for r in remaining): raise Bad
+        if pattern:  # pending bytes begin a character of their own, after which no low surrogate's escape can come
+          paired = 0xd800 <= last <= 0xdbff
+          if not (not paired and could([begun(pending)], n + 1) if pending else
+                  unit(0xdc00, 0xdfff) if paired else pattern.live(states, n, least, most)): raise Bad
         raise Short
       if n < least or allowed is not None and units not in allowed: raise Bad
+      if pattern and (0xd800 <= last <= 0xdbff or not pattern.done(states, n == 0)): raise Bad
       i += 1
       return json.loads(text[start:i])
     def combine(parsers, mode="all"):
@@ -886,7 +1121,7 @@ def formatted(form):
         return
       c, kinds = peek(), sc.get("type") or ["object", "array", "string", "number", "boolean", "null"]
       kinds = [kinds] if isinstance(kinds, str) else kinds
-      if c == '"' and "string" in kinds: string(None, sc.get("minLength", 0), sc.get("maxLength", math.inf))
+      if c == '"' and "string" in kinds: string(None, sc.get("minLength", 0), sc.get("maxLength", math.inf), patterns.get(sc.get("pattern")))
       elif c in "-0123456789" and {"number", "integer"} & set(kinds):
         start = i
         while i < len(text) and text[i] in "-+0123456789.eE": i += 1
