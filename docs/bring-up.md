@@ -8,8 +8,8 @@ failure, since the later tests need the earlier ones to work.
 ## Before you start
 
 Check that the card appears in `lspci -d 1e52:b140`, has the required power,
-and has working board firmware. Install tt-kmd, Tenstorrent's kernel driver, and
-check the firmware with Tenstorrent's tools. Then check what baretile needs:
+and has working board firmware. Install tt-kmd 2.5 or later, Tenstorrent's
+kernel driver, and check the firmware with Tenstorrent's tools. Then check what baretile needs:
 
 ```sh
 python3 -m baretile.chip check
@@ -21,7 +21,8 @@ error if anything would stop baretile.
 
 With tt-kmd driving the card, baretile opens its device file,
 `/dev/tenstorrent/0`, as `pci.Kmd`, which needs no root. The check reports
-tt-kmd's version and whether you can open the file. kmd pins the memory that the
+tt-kmd's version, fails one older than 2.5, and checks that you can open the
+file. `Kmd` refuses an older tt-kmd too, asking tt-kmd for its version. kmd pins the memory that the
 card reaches by DMA. With an IOMMU translating, that's ordinary memory;
 otherwise it's a hugepage, so the check also counts the free ones. tt-smi can
 use the card at the same time.

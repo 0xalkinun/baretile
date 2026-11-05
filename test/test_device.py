@@ -319,6 +319,10 @@ def test_preflight(tmp_path, monkeypatch):
   assert {level for level, _ in found} == {"ok"}, found
   text = " ".join(message for _, message in found)
   assert all(s in text for s in ("tt-kmd 2.11.0", "without root", "4 free", "32.0 GT/s PCIe x16", "18.12.0.0")), text
+  (module / "version").write_text("2.4.1\n")
+  failed = [message for level, message in pci.preflight(bdf) if level == "fail"]
+  assert len(failed) == 1 and "tt-kmd 2.4.1 is older than 2.5" in failed[0], failed
+  (module / "version").write_text("2.11.0\n")
   (pages / "free_hugepages").write_text("0\n")
   assert [level for level, _ in pci.preflight(bdf)].count("fail") == 1, "no IOMMU translating and no hugepage to pin"
   (dev / "iommu_group/type").write_text("DMA\n")
@@ -347,15 +351,18 @@ def test_preflight(tmp_path, monkeypatch):
 
 class FakeKmd:
   """tt-kmd as Kmd sees it: a file for the device, BAR0 at its start and TLB windows after it, and ioctls that answer as
-  kmd's do. CONFIGURE_TLB writes the registers as kmd's blackhole.c does, without the static VC class."""
+  kmd's do. CONFIGURE_TLB writes the registers as kmd's blackhole.c does, without the static VC class. version is the
+  release GET_DRIVER_INFO reports."""
   def __init__(self, tmp_path):
     self.fd = os.memfd_create("tenstorrent")
     os.ftruncate(self.fd, 1 << 30)  # BAR0's 512 MiB, then room for the windows; sparse, so nothing is written yet
     self.path, self.tlbs, self.unpinned, self.polls = f"/proc/self/fd/{self.fd}", 0, [], 0
     self.power, self.posted, self.abandoned, self.refuse = None, None, 0, 0  # refuse: an errno for the next POST
+    self.version = (2, 12, 0)
   def ioctl(self, fd, request, buf):
     name = {0xFA << 8 | n: name for name, n in pci.KMD.items()}[request]
     if name == "QUERY_MAPPINGS": struct.pack_into("<IIQQ", buf, 8, pci.KMD_MAPPING_BAR0, 0, 0, 512 << 20)
+    elif name == "GET_DRIVER_INFO": struct.pack_into("<II3B", buf, 4, 12, 2, *self.version)  # out's size, the API's version
     elif name == "ALLOCATE_TLB":
       self.tlbs += 1
       struct.pack_into("<IIQQQ", buf, 16, self.tlbs, 0, (512 << 20) + self.tlbs * bh.TLB_WINDOW, 0, 0)
@@ -387,9 +394,14 @@ def test_kmd(tmp_path, monkeypatch):
   # the 96 bits that Card writes, including the static VC class that CONFIGURE_TLB leaves out. Pinned DMA memory goes
   # back when its memoryview does, and an ARC message waits for kmd's answer. One Kmd has a device at a time, and a
   # dropped one lets the next one open it. Opening asks kmd for the busy AI clock, which it doesn't give a client by
-  # default, and keeps the other power flags on.
+  # default, and keeps the other power flags on. A kmd older than 2.5, which leaves a TLB's strided multicast word as it
+  # finds it, is refused, and the refused open lets the next one have the device.
   kmd = FakeKmd(tmp_path)
   monkeypatch.setattr(pci.fcntl, "ioctl", kmd.ioctl)
+  for version, named in (((2, 4, 1), "this one is 2.4.1"), ((0, 0, 0), "this one is older than 2.0")):  # 1.x leaves the bytes 0
+    kmd.version = version
+    with pytest.raises(RuntimeError, match=f"needs tt-kmd 2.5 or later, and {named}"): pci.Kmd("0000:01:00.0", kmd.path)
+  kmd.version = (2, 5, 0)
   card = pci.Kmd("0000:01:00.0", kmd.path)
   assert kmd.power == (40, 0, 0, 4, 0b1111), "argsz, flags, reserved, four valid flags: busy clock, PHYs, Tensix, L2CPU"
   with pytest.raises(RuntimeError, match="already open"): pci.Kmd("0000:01:00.0", kmd.path)
