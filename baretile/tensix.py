@@ -155,12 +155,12 @@ def fill(slot, row):
 # through SrcA, plus zeros in SrcB. Unpacker 0 can't widen bf16 into Dst (ISA FormatConversion.md), so it switches to
 # bf16 and to context 0 for the tile, with the thread config that unpacking into SrcA takes, and back once the tile is
 # in. A bf16 tile takes half an fp32 slot, so slot s is bf16 tile 2s.
-def widen(slots, slot, d):
+def widen(replays, slot, d):
   fmt = lambda f: reconfigure(SEC0_format=f, SEC0_out_format=f)
   srca = lambda on: [ins("SETC16", setc16_reg=bh.THREAD_CFG[r], setc16_value=v) for r, v in
                      (("UNPACK_MISC", 1 - on), ("SRCA_SET", bh.SRCA_SET_BY_ADDR * on))]
   z = 2 * slot if isinstance(slot, int) else f"2 * ({slot})"
-  return fmt(bh.BF16) + srca(1) + unpack(z, ZERO_SLOT) + fmt(bh.FP32) + srca(0) + elementwise("add", slots, dst=d)
+  return fmt(bh.BF16) + srca(1) + unpack(z, ZERO_SLOT) + fmt(bh.FP32) + srca(0) + elementwise("add", replays, dst=d)
 # the SFPU and the sync unit wait for the fills
 FILLED = [ins("STALLWAIT", stall_res=bh.STALL_SFPU | bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK0)]
 def reconfigure(**fields):  # rewrites config fields of the unpackers from the thread that unpacks, a byte at a time
@@ -238,7 +238,7 @@ def matmul_phase(transposed=False):
 
   With transposed, B came in as it lies and unpacker 0 transposed each face (haloize). Face (k, j) of B^T is then face
   2j + k of SrcA. SrcA steps by 32 for the next j or h, by -16 for the next k and by 16 for the next i. That takes five
-  modes instead of four (TRANSPOSED rewrites slots 4-6 and 2 around the matmul's steps), but no read has to be split
+  modes instead of four (TRANSPOSED rewrites modes 4-6 and 2 around the matmul's steps), but no read has to be split
   to move faces around."""
   phase = []
   for i, k, h, j in [(i, k, h, j) for i in (0, 1) for k in (0, 1) for h in (0, 1) for j in (0, 1)]:
@@ -597,39 +597,39 @@ def allocate(names):
   ops on its result once. Then allocate the longest first. Matmul phases repeat up to four times a step and mul's
   four times a tile, and they get the remaining space. The first run that doesn't fit records the words that still
   do, so its TRISC pushes only the rest, after a REPLAY. Other runs that don't fit are pushed one word at a time."""
-  slots, at = {}, 0
+  replays, at = {}, 0
   # the name breaks ties, so different processes build the same kernel
   order = sorted(names, key=lambda n: (n in ("mm", "mmT", "mul"), n not in COMBINE, -len(MATH_RUNS[n]), n))
   for name in order:
-    if at + len(MATH_RUNS[name]) <= 32: slots[name], at = (at, len(MATH_RUNS[name])), at + len(MATH_RUNS[name])
-  rest = next((name for name in order if name not in slots), None)
-  if rest and at < 32: slots[rest] = (at, 32 - at)
-  return slots
-def run(slots, name, count=None):  # the first count words of a run: a REPLAY of those recorded, then the others
+    if at + len(MATH_RUNS[name]) <= 32: replays[name], at = (at, len(MATH_RUNS[name])), at + len(MATH_RUNS[name])
+  rest = next((name for name in order if name not in replays), None)
+  if rest and at < 32: replays[rest] = (at, 32 - at)
+  return replays
+def run(replays, name, count=None):  # the first count words of a run: a REPLAY of those recorded, then the others
   words = MATH_RUNS[name][:count]
-  if name not in slots: return words
-  at, n = slots[name]
+  if name not in replays: return words
+  at, n = replays[name]
   return [replay(at, min(n, len(words)))] + words[n:]
 # a C loop is fine, since the math TRISC runs ahead of its pushes
-def runs(slots, name, times): return [Loop(times, run(slots, name))]
+def runs(replays, name, times): return [Loop(times, run(replays, name))]
 # recorded at setup
-def math_runs(slots): return [w for name, (at, n) in slots.items() for w in record(at, MATH_RUNS[name][:n])]
+def math_runs(replays): return [w for name, (at, n) in replays.items() for w in record(at, MATH_RUNS[name][:n])]
 
 def release(word):  # the same ELW*/MVMUL with clear_dvalid set, so both Src banks go back to the unpackers
   first, width = bh.TENSIX_OPS["MVMUL"][1]["clear_dvalid"]
   return word | ((1 << width) - 1) << first
-def phased(slots, name, phases):  # a run of MATH_RUNS for each fidelity phase. its last word releases both Src banks
+def phased(replays, name, phases):  # a run of MATH_RUNS for each fidelity phase. its last word releases both Src banks
   words = MATH_RUNS[name]
-  return ([ins("SETRWC", bit_mask=0b1111)] + run(slots, name) * (phases - 1) + run(slots, name, len(words) - 1)
+  return ([ins("SETRWC", bit_mask=0b1111)] + run(replays, name) * (phases - 1) + run(replays, name, len(words) - 1)
           + [release(words[-1])])
-# The address mode slots that the walk of a transposed B rewrites (see matmul_phase), as (SrcA step, SrcB step). The
+# The address modes that the walk of a transposed B rewrites (see matmul_phase), as (SrcA step, SrcB step). The
 # rest of the time they hold what ADDR_MODES says.
 TRANSPOSED = {4: (32, 0), 5: (32, 8), 6: (48, 8), 2: (16, 8)}
 def walk(transposed):  # sets the math thread's address modes for the steps of a transposed B, or back
   return [ins("SETC16", setc16_reg=bh.ADDR_MOD_AB + m, setc16_value=a | b << 8)
           for m, (a, b) in ((m, TRANSPOSED[m] if transposed else ADDR_MODES[m][0]) for m in sorted(TRANSPOSED))]
 
-def matmul(slots, phases=4, transposed=False):
+def matmul(replays, phases=4, transposed=False):
   """One matmul step with its first `phases` fidelity phases. SETRWC starts each step at phase 0.
 
   A phase multiplies some of the 8 significand bits of A (in SrcB) by some of B's (in SrcA) (ISA SrcASrcB.md):
@@ -639,33 +639,33 @@ def matmul(slots, phases=4, transposed=False):
     phase 3: A's last bit by B's last 3
   Four phases leave nothing out, and three leave out under 2^-11 of the product. Two drop A's last bit, which truncates
   by 2^-7 at most. One keeps only 5 bits of B."""
-  return phased(slots, "mmT" if transposed else "mm", phases)
+  return phased(replays, "mmT" if transposed else "mm", phases)
 
-def elementwise(op, slots, dst=0):
+def elementwise(op, replays, dst=0):
   """Math for a tile of SrcA op SrcB at Dst row dst, 8 rows of 16 per instruction. Address mode 0 steps 8 rows.
   ELWMUL always accumulates, and each fidelity phase multiplies a slice of the mantissas, so mul runs all 4 phases on
   a zeroed Dst."""
-  if op == "mul": return phased(slots, "mul", 4)
+  if op == "mul": return phased(replays, "mul", 4)
   fpu = {"add": "ELWADD", "sub": "ELWSUB"}[op]
   return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [release(ins(fpu, dst=dst))]
 
-def reduce_step(kind, slots, acc, first, edge=0, src=None, wide=False):
+def reduce_step(kind, replays, acc, first, edge=0, src=None, wide=False):
   """Accumulate one tile of a reduction. Load bf16 through SrcA plus zeros in SrcB, or fill fp32 from L1 slot
   src, or with wide widen bf16 from it. Put the first tile in the accumulator after waiting for it to become free.
   Load subsequent tiles into scratch and combine them with the SFPU. For a partial final tile, edge gives the number
   of valid rows or columns along the reduction axis."""
   row, sem = ACCS[acc]
   mask = lambda d: MASK[FOLDS[kind]](kind, edge, d) if edge else []
-  from_slot = lambda d: widen(slots, src, d) if wide else fill(src, row + d) + FILLED
-  put = lambda d: from_slot(d) if src is not None else elementwise("add", slots, dst=d)
+  from_slot = lambda d: widen(replays, src, d) if wide else fill(src, row + d) + FILLED
+  put = lambda d: from_slot(d) if src is not None else elementwise("add", replays, dst=d)
   if first: return take(sem) + aim(row) + put(0) + mask(0)
-  return aim(row) + put(128) + mask(128) + SFPU_START + runs(slots, kind, 32)
+  return aim(row) + put(128) + mask(128) + SFPU_START + runs(replays, kind, 32)
 # folds across the tile and runs the SFPU ops on the result, before MATH_END
-def reduce_finish(kind, slots, acc, posts):
-  return [DST_FREE, *aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, slots)
+def reduce_finish(kind, replays, acc, posts):
+  return [DST_FREE, *aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, replays)
 
-def sfpu(posts, slots):  # runs the SFPU ops in order, over the Dst half that the FPU has written
-  return [w for u in posts for w in SFPU_START + SFPU[u][0] + runs(slots, u, 32)]
+def sfpu(posts, replays):  # runs the SFPU ops in order, over the Dst half that the FPU has written
+  return [w for u in posts for w in SFPU_START + SFPU[u][0] + runs(replays, u, 32)]
 
 def table(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
 BANKS = table("bank", [bh.noc_xy(x, y) for x, y in bh.DRAM]) + f"""
@@ -959,14 +959,14 @@ static unsigned landed_chunk(unsigned m, unsigned n) {{
 
 # TRISC1. With dst, it does the unpacking into Dst, so it waits for BRISC's fetches too. With wide, it also unpacks
 # bf16 inputs into SrcA and zeros into SrcB (widen).
-def math_program(slots, body, dst=False, decls="", wide=False):
+def math_program(replays, body, dst=False, decls="", wide=False):
   units = UNPACKERS if wide else bh.UNPACK0
   return TRISC + decls + f"""
 static unsigned needed;
 // waits for BRISC to fetch the next tiles
 static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}
 {KMAIN}
-  {tt(thread(dst) + (counters(units, 1024) if dst else []) + [CC_OFF])} {_pushes(math_runs(slots))}
+  {tt(thread(dst) + (counters(units, 1024) if dst else []) + [CC_OFF])} {_pushes(math_runs(replays))}
   while (!peek(READY)) {{}}  // waits for TRISC0 to set up the backend config and the semaphores
   unsigned tiles = 0, h = 0;  // h: the first row of the Dst half that the next op gets
 {body}

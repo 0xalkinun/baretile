@@ -188,7 +188,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   sfpu_op = lambda op: op["kind"] in BINARY or (dst and op.get("y", "zero") != "zero")
   assert dtype != "int32" or all(sfpu_name(op) for op in ops if sfpu_op(op)), (
     "an int32 kernel can only add, subtract, compare and pick")
-  slots = allocate({"mmT" if op["bt"] else "mm" for op in ops if op["kind"] == "matmul"} |
+  replays = allocate({"mmT" if op["bt"] else "mm" for op in ops if op["kind"] == "matmul"} |
                    {"mul" for op in ops if op["kind"] == "mul" and not dst} |
                    {u for op in ops for u in op["posts"]} | {op["kind"] for op in ops if op["kind"] in COMBINE} |
                    {sfpu_name(op) for op in ops if sfpu_op(op)})
@@ -579,32 +579,32 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
           c[U].append(f"{cond}{{ {tt([setadc(bh.UNPACK1, rows_at[q])])} {on} {walk_a} {off}{posted} }}")
         # Parts start from a zeroed Dst half, the last from the sum so far. The rest of the tree runs on the full sum.
         if parts:
-          reloaded, zeroed = tt(math_begin(False) + elementwise("add", slots)), tt(math_begin(True))
+          reloaded, zeroed = tt(math_begin(False) + elementwise("add", replays)), tt(math_begin(True))
           c[M].append(f"{cond}{{ if ({final}) {{ {reloaded} }} else {{ {zeroed} }} {tt(walk(True) * bt)} "
                       f"for (unsigned m = 0; "
-                      f"m < kn; m++) {{ {tt(matmul(slots, op['phases'], bt))} }} {tt(walk(False) * bt)} "
-                      f"if ({final}) {{ {tt(sfpu(op['posts'], slots))} {math_end(j)} }} "
+                      f"m < kn; m++) {{ {tt(matmul(replays, op['phases'], bt))} }} {tt(walk(False) * bt)} "
+                      f"if ({final}) {{ {tt(sfpu(op['posts'], replays))} {math_end(j)} }} "
                       f"else {{ {tt(MATH_END)} }} h ^= {DST_HALF}; }}")
         # walk a transposed B, then set the modes back
         else: c[M].append(f"{cond}{{ {tt(math_begin(True) + walk(True) * bt)} "
-                          f"{live}for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(slots, op['phases'], bt))} }} "
-                          f"{tt(walk(False) * bt + sfpu(op['posts'], slots))} {math_end(j)} h ^= {DST_HALF}; }}")
+                          f"{live}for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(replays, op['phases'], bt))} }} "
+                          f"{tt(walk(False) * bt + sfpu(op['posts'], replays))} {math_end(j)} h ^= {DST_HALF}; }}")
         continue
       drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
       x, y = slot(op["x"]), slot(op["y"])
-      prog = sfpu([sfpu_name(op)], slots) if sfpu_op(op) else []
+      prog = sfpu([sfpu_name(op)], replays) if sfpu_op(op) else []
       if dst:  # the math thread fills or widens x into the op's Dst half and y 128 rows on, then runs the SFPU
-        load = lambda r, s, d: widen(slots, s, d) if r in wide else fill(s, f"h + {d}" if d else "h")
+        load = lambda r, s, d: widen(replays, s, d) if r in wide else fill(s, f"h + {d}" if d else "h")
         fills = load(op["x"], x, 0) + (load(op["y"], y, 128) if op["y"] != "zero" else []) + FILLED
-        math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], slots))
+        math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], replays))
         c[M].append(f"{cond}{{ {drain}{math} {math_end(j)} h ^= {DST_HALF};{posted} }}")
         continue
       if op["kind"] in BINARY:  # x and y each go into Dst for the SFPU: x in the op's half, y 128 rows on
         unpacks, fpu = (unpack(x, ZERO_SLOT) + unpack(y, ZERO_SLOT),
-                        elementwise("add", slots) + elementwise("add", slots, dst=128))
-      else: unpacks, fpu = unpack(x, y), elementwise(op["kind"], slots)
+                        elementwise("add", replays) + elementwise("add", replays, dst=128))
+      else: unpacks, fpu = unpack(x, y), elementwise(op["kind"], replays)
       c[U].append(f"{cond}{{ {drain}{tt(unpacks)}{posted} }}")
-      math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], slots))
+      math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], replays))
       c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= {DST_HALF}; }}")
     for acc, j in enumerate(reductions):
       if acc >= len(ACCS): raise ValueError("at most two reductions in a pass")
@@ -615,9 +615,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       end = f"k == {L - 1}" if swept(x) else "k == 0"  # the line's last tile. A narrow operand is one tile a line
       src = slot(x) if dst else None
       def step(first):  # the last tile's padding must not count
-        part = lambda e: tt(reduce_step(kind, slots, acc, first, e, src, x in wide))  # e: rows or columns that count
+        part = lambda e: tt(reduce_step(kind, replays, acc, first, e, src, x in wide))  # e: rows or columns that count
         return f"if ({end}) {{ {part(edge)} }} else {{ {part(0)} }}" if edge else part(0)
-      finish, posted = (f'{tt(reduce_finish(kind, slots, acc, op["posts"]))} {math_end(j)}',
+      finish, posted = (f'{tt(reduce_finish(kind, replays, acc, op["posts"]))} {math_end(j)}',
                         "" if j == root else " posted++;")
       pk = repacked(j, pack(ACCS[acc][0], pslot(me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
       unpacks = "" if dst else tt(unpack(slot(x), ZERO_SLOT))  # with dst, math fills Dst and nothing is unpacked
@@ -732,7 +732,7 @@ j0 = {col0};
   brisc = brisc_program(total, first + program(B), dtype, out, decls + indices, tail, b8, wt, b8_at=b8_at,
                         near=bool(local))
   image = compile_kernel(brisc, unpack_program(program(U), cfg, indices + ours),
-                         math_program(slots, program(M), dst, indices + ours, bool(wide)),
+                         math_program(replays, program(M), dst, indices + ours, bool(wide)),
                          pack_program(program(P), decls=ours))
   return image, (nb * rt * w // L if reducing else nb * br * bcols)  # and the number of units in the result
 
@@ -857,7 +857,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   kept = f"(kt - k0 < {room})" if keep else "0"  # the key row is in the store
   cfg = kernel_config()
   first, onto = accumulating(oacc, False), accumulating(oacc, True)  # pack the output tiles in fp32, then add onto them
-  slots = allocate({"mmT", "mm", "exp", "one"} | ({"none"} if parts > 1 else set()))
+  replays = allocate({"mmT", "mm", "exp", "one"} | ({"none"} if parts > 1 else set()))
   # Row r's largest scores are a quarter of accumulator tile r / 4: the even columns of its left faces, moved on 16
   # rows to the right faces and 2 to the odd columns as r % 4 picks. A tile of scores is at S, past the halves.
   acc, S = ACCS[0][0], 2 * DST_HALF
@@ -943,12 +943,12 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
                    f" {off_v} " + each(tt(unpack(ones, f"{p_slot} + r"))) + f" {tt(REPORT)}", "")
   # skip the unit's frames, since math and pack needn't wait for them
   told = "fetched(); " + read + " needed += 2 * (k1 - k0 + 1);"
-  scores = lambda op, row: (f"{tt(aim(row) + elementwise(op, slots) + walk(True))} "
-                            f"for (unsigned m = 0; m < {ht}; m++) {{ {tt(matmul(slots, phases, True))} }} "
+  scores = lambda op, row: (f"{tt(aim(row) + elementwise(op, replays) + walk(True))} "
+                            f"for (unsigned m = 0; m < {ht}; m++) {{ {tt(matmul(replays, phases, True))} }} "
                            f"{tt(walk(False))}")
   begin = tt(math_begin(False))
   # p times a value tile, or times the ones
-  product = f"{tt(math_begin(True))} {tt(matmul(slots, phases))} {tt(MATH_END)} h ^= {DST_HALF};"
+  product = f"{tt(math_begin(True))} {tt(matmul(replays, phases))} {tt(MATH_END)} h ^= {DST_HALF};"
   # After across_rows, every lane of the scores at S holds its row's largest. The first key tile's is kept, later
   # ones are folded into it.
   kept_max = lambda first: tt(SFPU_START + [w for b in quarter for w in [
@@ -969,7 +969,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
                     f"if (kt == k0) {{ {kept_max(True)} }} else {{ {kept_max(False)} }}"),
                # each row's largest, for the packer
                each(f"{begin} {spread('0')} {tt(MATH_END)} h ^= {DST_HALF};") if parts > 1 else "",
-               each(f"{begin} {scores('add', 'h')} {spread(f'{S} - h')} {subtract} {tt(sfpu(['exp'], slots))} "
+               each(f"{begin} {scores('add', 'h')} {spread(f'{S} - h')} {subtract} {tt(sfpu(['exp'], replays))} "
                     f"{tt(MATH_END)} h ^= {DST_HALF};") +
                " " + each(f"for (unsigned j = 0; j < {ht}; j++) {{ {product} }}") + " " + each(product), "")
   out = lambda j: f"r * {T} + {j}"  # row r's output tile j. Its sums are at j = ht and its largest at ht + 1
@@ -991,7 +991,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
                       f"{tt([ins('SEMPOST', sem_sel=SEM_PACKED)])} }}"))
   # The SFPU makes two tiles once a launch: ones for the sums, and -inf for the mask of an empty part.
   made = [("one", ones)] + [("none", none)] * (parts > 1)
-  math = "".join(f"{tt(math_begin(False) + sfpu([p], slots) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math
+  math = "".join(f"{tt(math_begin(False) + sfpu([p], replays) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math
   packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer
   hide = 0xFF80  # bf16 -inf
   decls = "static unsigned expect;" + (table("store", store) if keep and wt else "") + f"""
@@ -1009,7 +1009,7 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
 }}"""
   return compile_kernel(brisc_program("expect", brisc, "bf16", "fp32", decls, b8=2 * ht if wt else 0, wt=wt or "bfp8",
                                       outs=oacc),
-                        unpack_program(f"posted += {len(made)}; drain();" + unpacker, cfg), math_program(slots, math),
+                        unpack_program(f"posted += {len(made)}; drain();" + unpacker, cfg), math_program(replays, math),
                         pack_program("static unsigned needed;" + packer))
 
 def gather_kernel(dtype):

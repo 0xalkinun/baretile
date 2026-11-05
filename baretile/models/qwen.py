@@ -524,20 +524,20 @@ def chip_experts(h, p, ids, w, phases, limit=None):
   terms = [y.gather(places[:, :, j * run:j * run + n]) * w[:, :, j:j + 1] for j in range(k)]
   return sum(terms[1:], terms[0])
 
-# The tiles of slots that group needs for any choices: a tile for each 32 choices, plus one for each value that can
+# The tiles of entries that group needs for any choices: a tile for each 32 choices, plus one for each value that can
 # come, since its run may end partway through a tile. Also the length of a run of places, the rows rounded up to a tile.
-def group_slots(rows, k, n): return -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32
+def group_sizes(rows, k, n): return -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32
 
 def group_kernel(rows, k, n):
   """Sort token choices by expert on one BRISC worker. Arguments are [first unit, units, order address, tiles
   address, places address, choices address, choices row tile stride, choices tile offset].
 
-  Read rows x k choices with values below n. Count each expert, assign consecutive slots, and pad each
-  expert's group to 32. Build order (token per slot), tiles (expert per tile) and places (slot per choice,
+  Read rows x k choices with values below n. Count each expert, assign consecutive entries, and pad each
+  expert's group to 32. Build order (token per entry), tiles (expert per tile) and places (entry per choice,
   grouped by choice index) as flat arrays in L1. Send them as tiles, repeating rows or columns to match
   tensor storage."""
-  t, rp = group_slots(rows, k, n)
-  fills = DATA + -(-rows // 32) * 4096  # after the choices: the count of each value, then its next slot
+  t, rp = group_sizes(rows, k, n)
+  fills = DATA + -(-rows // 32) * 4096  # after the choices: the count of each value, then its next entry
   out = (fills + 4 * (n + 33 * t + k * rp) + 63) // 64 * 64
   if out + 4096 > OUTS: raise ValueError("group_kernel: the choices and their arrays don't fit in L1")
   return compile_kernel(f"""
@@ -586,14 +586,14 @@ def group(ids, n):
   """Group rows x k int32 choices by expert, with IDs below n. Return (order, tiles, places), all int32.
   group_kernel runs this on BRISC.
 
-  order is a row of 32*t slots, where t is group_slots. Each slot holds the source token row, or zero for
+  order is a row of 32*t entries, with t from group_sizes. Each entry holds the source token row, or zero for
   padding. Expert groups start on tile boundaries. tiles is a column of t expert IDs, with n for unused
-  tiles. places has k runs, one slot index per token per choice, with each run padded to a tile. Indexed
+  tiles. places has k runs, one entry index per token per choice, with each run padded to a tile. Indexed
   matmul uses tiles to select the expert weights."""
   if not (ids.dtype == "int32" and ids.batch == 1 and ids.cols <= 32):
     raise ValueError("group needs ids as a matrix of int32 choices, at most 32 to a row")
   x, rows, k = ids.realize(), ids.rows, ids.cols  # a matrix, so there's no repeat to copy
-  t, rp = group_slots(rows, k, n)
+  t, rp = group_sizes(rows, k, n)
   order, tiles, places = Tensor(ids.rt, 1, 32 * t, dtype="int32"), Tensor(ids.rt, t, 1, dtype="int32"), Tensor(ids.rt, 1, k * rp, dtype="int32")
   order.run(("group", rows, k, n), lambda: group_kernel(rows, k, n), order.addr, tiles.addr, places.addr, x.addr, x.stride, x.offset,
             units=1, name="group")
@@ -619,7 +619,7 @@ def touched_kernel(rows, k, n):
   it), across the row. The first entry of each 32 also writes its tile of the experts column, each expert across its
   row, as the tile of a column holds it."""
   out = touched_l1(rows, k, n)
-  tr, slots = -(-rows // 32), min(rows * k, n)
+  tr, entries = -(-rows // 32), min(rows * k, n)
   return compile_kernel(f"""
 #define IDS {DATA:#x}
 #define WEIGHTS {DATA + tr * 4096:#x}
@@ -636,7 +636,7 @@ static unsigned lowest(unsigned m) {{
   return place[(m & -m) * 0x077CB531u >> 27];
 }}
 void kmain(volatile unsigned *a) {{
-  unsigned *list = (unsigned *)LIST, *mark = list + {slots}, *out = (unsigned *)OUT;
+  unsigned *list = (unsigned *)LIST, *mark = list + {entries}, *out = (unsigned *)OUT;
   if (!a[1]) return;
   for (unsigned i = 0; i < {tr}; i++) {{
     unsigned u = a[6] + i * a[5], v = a[9] + i * a[8];
@@ -649,7 +649,7 @@ void kmain(volatile unsigned *a) {{
     for (unsigned j = 0; j < {k}; j++) if (weight(r, j)) {{ unsigned e = choice(r, j); mark[e / 32] |= 1u << e % 32; }}
   unsigned count = 0;
   for (unsigned w = 0; w < {-(-n // 32)}; w++) for (unsigned m = mark[w]; m; m &= m - 1) list[count++] = w * 32 + lowest(m);
-  for (; count < {slots}; count++) list[count] = {n};
+  for (; count < {entries}; count++) list[count] = {n};
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned s = a[0] + u, e = list[s];
     for (unsigned i = 0; i < {tr}; i++) {{  // tile row i of its weights: the weight of each row for e, across the row
@@ -664,7 +664,7 @@ void kmain(volatile unsigned *a) {{
     }}
     if (s % 32) continue;
     // the tile of the experts column for entries s to s + 31, each expert across its row
-    for (unsigned r = 0; r < 32; r++) for (unsigned *row = out + at(r, 0), e = s + r < {slots} ? list[s + r] : {n}, c = 0; c < 16; c++)
+    for (unsigned r = 0; r < 32; r++) for (unsigned *row = out + at(r, 0), e = s + r < {entries} ? list[s + r] : {n}, c = 0; c < 16; c++)
       row[c] = row[256 + c] = e;
     l1_settle(OUT);
     noc_write(OUT, BANK(s / 32), AT(a[2], s / 32, 4096), 4096), noc_wait();
@@ -686,10 +686,10 @@ def touched(ids, n, weights):
   touched_l1(ids.rows, ids.cols, n)
   if ids.rt is not weights.rt: raise ValueError("touched needs ids and weights on the same runtime")
   x, w, rows, k = ids.realize(), weights.realize(), ids.rows, ids.cols  # matrices, so there are no repeats to copy
-  slots = min(rows * k, n)
-  experts, out = Tensor(ids.rt, slots, 1, dtype="int32"), Tensor(ids.rt, rows, 1, batch=slots)
+  entries = min(rows * k, n)
+  experts, out = Tensor(ids.rt, entries, 1, dtype="int32"), Tensor(ids.rt, rows, 1, batch=entries)
   experts.run(("touched", rows, k, n), lambda: touched_kernel(rows, k, n), experts.addr, out.addr, x.addr, x.stride, x.offset,
-              w.addr, w.stride, w.offset, units=slots, name="touched")
+              w.addr, w.stride, w.offset, units=entries, name="touched")
   return experts, out
 
 def mxfp4(blocks, scales):

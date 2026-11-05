@@ -392,7 +392,7 @@ def read_json(path):
 # with none of the extras.
 DEFAULTS = dict(head_dim=None, rope=None, partial=None, sliding=None, layer_types=None, gated=False, centered=False, k=0, experts=0, moe=0,
                 shared=0, dense=(), norm_topk=True, limit=None, conv=None, kh=None, vh=None, kd=None, vd=None, mtp=0, tied=False, precision=None)
-def model(**c): return SimpleNamespace(**DEFAULTS | c)  # a config with the given fields, and DEFAULTS for the rest
+def custom(**c): return SimpleNamespace(**DEFAULTS | c)  # a config with the given fields, and DEFAULTS for the rest
 
 # The model_type of each family that config reads, or of a multimodal model's text_config. Another one, such as Gemma's,
 # may have weights of the same names but compute differently, so it's refused rather than run wrong.
@@ -421,7 +421,7 @@ def config(folder, places=4096):
   if rope["rope_type"] not in ("default", "llama3", "yarn"): raise ValueError(f"RoPE scaling {rope} isn't supported")
   if rope["rope_type"] != "default": rope.setdefault("original_max_position_embeddings", j["max_position_embeddings"])  # as Hugging Face has it
   experts, layers = j.get("num_experts") or j.get("num_local_experts") or 0, j["num_hidden_layers"]
-  return model(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=layers, eps=j["rms_norm_eps"], theta=theta,
+  return custom(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=layers, eps=j["rms_norm_eps"], theta=theta,
                places=min(j["max_position_embeddings"], places), vocab=j["vocab_size"], ffn=j.get("intermediate_size"), head_dim=j.get("head_dim"),
                rope=rope if rope["rope_type"] != "default" else None, partial=partial, layer_types=j.get("layer_types"),
                sliding=j.get("sliding_window") if j.get("use_sliding_window", True) else None,

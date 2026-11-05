@@ -43,8 +43,8 @@ unpacks = unpack_program(loop(*[f"fetched(); {tt(unpack(slot(f, 0), slot(f, 1)) 
 
 # 4. TRISC1. math_begin waits for a free half of Dst, the FPU adds the two tiles into it, and the SFPU applies relu
 # there in fp32. MATH_END hands the half to pack, and h moves on to the other half.
-slots = allocate({"relu"})  # where relu's program goes in the math thread's replay buffer
-maths = math_program(slots, loop(*[tt(math_begin(False) + elementwise("add", {}) + sfpu(["relu"], slots) + MATH_END) + f" h ^= {DST_HALF};"] * 2))
+replays = allocate({"relu"})  # where relu's program goes in the math thread's replay buffer
+maths = math_program(replays, loop(*[tt(math_begin(False) + elementwise("add", {}) + sfpu(["relu"], replays) + MATH_END) + f" h ^= {DST_HALF};"] * 2))
 
 # 5. TRISC2. output(f, slot, t) queues the result in that slot for DRAM tile t, once BRISC has written what the slot
 # held before. pack rounds the Dst half to bf16 into the slot and posts SEM_PACKED, which tells BRISC it's there.
