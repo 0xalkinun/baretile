@@ -951,7 +951,7 @@ def test_gpt2_model(chip):
     ids.append(int(want.argmax()))
 
 def smol(rng, layers, vocab=256, places=64):  # SmolLM-135M's config, and random weights in its shapes with llama.py's names
-  c = llama.model(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)
+  c = llama.custom(dim=576, heads=9, kv=3, layers=layers, eps=1e-5, theta=10000.0)
   shapes = {"input_layernorm": (1, 576, 1), "post_attention_layernorm": (1, 576, 1), "q_proj": (576, 576, 0), "k_proj": (576, 192, 0),
             "v_proj": (576, 192, 0), "o_proj": (576, 576, 0), "gate_proj": (576, 1536, 0), "up_proj": (576, 1536, 0), "down_proj": (1536, 576, 0)}
   w = {f"layers.{l}.{k}": bf16(rng.normal(mean, 0.1 if r == 1 else 0.02, (r, n))) for l in range(layers) for k, (r, n, mean) in shapes.items()}
@@ -967,7 +967,7 @@ def qwen35(rng, vocab=256, places=64):
   It has 3 Gated DeltaNet blocks, a gated attention block, and the multi-token prediction layer as block 4. Tokens use
   all 8 experts, so a near tie between experts can't decide a test. The embedding is small next to what the
   blocks add, so losing the Gated DeltaNet states moves the logits by 100%."""
-  c = llama.model(dim=128, heads=4, kv=2, head_dim=64, layers=4, eps=1e-6, theta=1e7, partial=0.25, gated=True, centered=True, conv=4,
+  c = llama.custom(dim=128, heads=4, kv=2, head_dim=64, layers=4, eps=1e-6, theta=1e7, partial=0.25, gated=True, centered=True, conv=4,
                   kh=2, vh=4, kd=32, vd=32, k=8, norm_topk=True, layer_types=["linear_attention"] * 3 + ["full_attention"], mtp=1)
   bits = lambda *shape, mean=0.0, sd=0.05: llama.Weight(lambda a=gpt2.bf16_bits(rng.normal(mean, sd, shape)): a)
   # embed.T is a separate output layer, untied from embed
@@ -996,9 +996,9 @@ def test_llama_frequencies():
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   hf = transformers.LlamaConfig(hidden_size=4096, num_attention_heads=32, rope_theta=500000.0, rope_scaling=rope, max_position_embeddings=131072)
   want = m.ROPE_INIT_FUNCTIONS["llama3"](hf, "cpu")[0].numpy()
-  got = llama.frequencies(llama.model(dim=4096, heads=32, theta=500000.0, rope=rope))
+  got = llama.frequencies(llama.custom(dim=4096, heads=32, theta=500000.0, rope=rope))
   assert got.dtype == np.float32 and np.allclose(got, want, rtol=1e-6, atol=0), np.abs(got / want - 1).max()
-  plain = llama.frequencies(llama.model(dim=4096, heads=32, theta=500000.0))
+  plain = llama.frequencies(llama.custom(dim=4096, heads=32, theta=500000.0))
   assert plain[0] == got[0] and plain[-1] == 8 * got[-1], "short wavelengths kept, long ones slowed by the factor"
 
 def safetensors(path, tensors):  # writes {name: (dtype "BF16" or "F32", array of bits or values)} as a safetensors file
@@ -1218,7 +1218,7 @@ def test_moe(chip):
   rt, rng = Runtime(chip), np.random.default_rng(31)
   experts = lambda dim, n, m: {"router": bf16(rng.normal(0, 0.5, (dim, n))), "experts.gate_up": bf16(rng.normal(0, 0.1, (n, dim, 2 * m))),
                                "experts.down": bf16(rng.normal(0, 0.1, (n, m, dim)))}
-  c, w = llama.model(dim=64, k=4), experts(64, 16, 64)
+  c, w = llama.custom(dim=64, k=4), experts(64, 16, 64)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
   for n in (1, 3, 8, 40, 160):  # row 1, if there is one, is a free slot
     h, live = bf16(rng.normal(0, 1, (n, 64))), np.float32(np.arange(n) != 1).reshape(n, 1)
@@ -1661,7 +1661,7 @@ for dtype in ("bfp8", "bfp4"):
 import numpy as np  # a model split across the two chips: its first block on chip 0, its second and its head on chip 1
 from types import SimpleNamespace
 from baretile.models import gpt2, llama
-c, rng = llama.model(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
+c, rng = llama.custom(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
 draw = lambda mean, std, shape: gpt2.bf16_floats(gpt2.bf16_bits(rng.normal(mean, std, shape)))
 w = {f"layers.{l}.{k}": draw(*how) for l in range(2) for k, how in (("input_layernorm", (1, 0.1, (1, 128))), ("qkv_proj", (0, 0.05, (128, 256))),
      ("o_proj", (0, 0.05, (128, 128))), ("post_attention_layernorm", (1, 0.1, (1, 128))), ("gate_up_proj", (0, 0.05, (128, 512))),
@@ -1762,7 +1762,7 @@ def test_llama_8b_shapes(chip):
   # for them. The MLP's 4096 x 28672 in bfp4 is 114,688 tiles.
   rt, rng = Runtime(chip), np.random.default_rng(8)
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
-  c = llama.model(dim=4096, heads=32, kv=8, layers=1, eps=1e-5, theta=500000.0, rope=rope, vocab=2048, ffn=14336, places=96)
+  c = llama.custom(dim=4096, heads=32, kv=8, layers=1, eps=1e-5, theta=500000.0, rope=rope, vocab=2048, ffn=14336, places=96)
   bits = lambda shape, scale, mean=0.0: gpt2.bf16_bits(rng.normal(mean, scale, shape))
   w = {"layers.0.input_layernorm": bits((1, 4096), 0.1, 1), "layers.0.post_attention_layernorm": bits((1, 4096), 0.1, 1),
        "layers.0.qkv_proj": bits((4096, 6144), 0.02), "layers.0.o_proj": bits((4096, 4096), 0.02), "layers.0.gate_up_proj": bits((4096, 28672), 0.02),
@@ -1824,7 +1824,7 @@ def test_benchmark_table():
   assert all(r.count("|") == 5 for r in rows) and "MemoryError" in rows[4], rows
   flops = cost.CARD["tflops"] / 2  # a second of a two-phase matmul at the peak
   assert benchmark.roofline(flops * 2, 1.0) == 1
-  c = llama.model(layers=2, dim=256, heads=4, kv=2, ffn=512, vocab=1000)
+  c = llama.custom(layers=2, dim=256, heads=4, kv=2, ffn=512, vocab=1000)
   s, attention = cost.shape(c, "tt"), 2 * 4 * 4 * llama.head(c) * 10 * 11 // 2  # two blocks, scores and values, 4 heads, causal over 10 tokens
   assert benchmark.prefill_work(c, 10) == 2 * 10 * (s.work - s.head_work) + 2 * s.head_work + s.prefill_phases * attention
 
@@ -1944,7 +1944,7 @@ def test_llama_precision(chip):
   # TT's performance precision puts the MLP's gate and up in bfp4 and the rest in bfp8, except in Llama-3.1-8B's last
   # block. numpy with the same block-float values but exact products must pick the same tokens, within 1% of the span.
   # upload waits for each cast, so the bf16 copy of the next weight reuses the same DRAM.
-  big = llama.model(layers=32, dim=4096)
+  big = llama.custom(layers=32, dim=4096)
   assert llama.precision(big, "tt")["gate_up", 31] == ("bfp8", 2) and llama.precision(big, "tt")["gate_up", 30] == ("bfp4", 1)
   assert llama.precision(big, "tt")["head", None] == ("bfp8", 2) and llama.precision(big, "bf16")["qkv", 0] == ("bf16", 4)
   tt = llama.precision(big, "tt")
@@ -2013,7 +2013,7 @@ def test_benchmark_quick_accuracy():
 def test_benchmark_bytes():
   # The bytes a decode token reads, which B2's effective DRAM bandwidth comes from. Llama-3.1-8B reads 6.20 GB a token,
   # so 41.3 tokens/s is half the card's 512 GB/s.
-  c = llama.model(dim=4096, heads=32, kv=8, layers=32, vocab=128256, ffn=14336, places=736)
+  c = llama.custom(dim=4096, heads=32, kv=8, layers=32, vocab=128256, ffn=14336, places=736)
   c.precision = llama.precision(c, "tt")
   t = benchmark.weights(c)
   names = ("layers.0.gate_up_proj", "layers.31.gate_up_proj", "layers.0.down_proj", "embed.T", "embed")
@@ -2957,7 +2957,7 @@ def test_session_snapshot_without_device_space(chip):
   rt, engine = Runtime(chip), object.__new__(serve.Engine)
   conv = Tensor.of(rt, np.arange(3 * 2 * 32, dtype=np.float32).reshape(3, 2, 32).tolist(), "fp32")
   state, kv = Tensor.full(rt, 32, 32, 3, "fp32"), Tensor.full(rt, 32, 32, 7)
-  engine.rt, engine.c = rt, llama.model(layer_types=["linear_attention", "full_attention"])
+  engine.rt, engine.c = rt, llama.custom(layer_types=["linear_attention", "full_attention"])
   engine.slot, engine.held, engine.taken, engine.coherent = [[(qwen.Row(conv, 1), state), kv]], [[1, 2]], [1.0], [True]
   engine.sessions, engine.park, engine.keep = collections.OrderedDict(), 0, 1 << 20
   want = [tuple(x.tobytes() for x in engine.slot[0][0]), kv.tobytes()]
@@ -2995,7 +2995,7 @@ def test_session_restore_without_device_space(chip):
   conv = lambda v: Tensor.of(rt, np.full((3, 2, 32), v, np.float32).tolist(), "fp32")
   slot = lambda v: [(qwen.Row(conv(v), 1), Tensor.full(rt, 32, 32, v, "fp32")), Tensor.full(rt, 64, 32, v)]
   contents = lambda s: [value(s[0][0].t), value(s[0][1]), value(s[1])]
-  engine.rt, engine.c, engine.linear = rt, llama.model(layer_types=["linear_attention", "full_attention"]), True
+  engine.rt, engine.c, engine.linear = rt, llama.custom(layer_types=["linear_attention", "full_attention"]), True
   engine.slot, engine.held, engine.taken, engine.coherent, engine.busy, engine.used = [slot(7)], [[1, 2]], [1.0], [True], [None], [0]
   engine.sessions, engine.park, engine.keep = collections.OrderedDict(), 0, 1 << 20
   engine.save(0)  # to host memory, since park is 0
@@ -3168,14 +3168,14 @@ def test_attention_cost_units():
   # cost.attention counts reads in kernels.attention_plan's units. A unit reads each key and value tile once for all its
   # tile rows of queries. While there are fewer units than workers, a unit takes one tile row, so more workers share the
   # work. With a unit for every worker, a unit takes up to 8 tile rows, and they share its reads.
-  c, n = llama.model(dim=64, heads=1, kv=1, layers=1), cost.WORKERS
+  c, n = llama.custom(dim=64, heads=1, kv=1, layers=1), cost.WORKERS
   units = lambda entries, queries: cost.attention(c, entries, queries, 32, "bf16") / (2 * 32 * 64 * 2)  # a unit reads a key and a value tile
   assert [units(1, queries) for queries in (1, 64, 65, 256)] == [1, 2, 3, 8], "one tile row a unit"
   assert [units(n, queries) for queries in (32, 256, 257, 1024)] == [n, n, 2 * n, 4 * n], "up to 8 tile rows a unit"
 
 def test_cost_fidelity():
   # Make DRAM negligible so the estimate exposes the phase cost, including TT's mixed MLP and attention phases.
-  c = llama.model(dim=64, heads=1, kv=1, layers=2, ffn=128, vocab=256)
+  c = llama.custom(dim=64, heads=1, kv=1, layers=2, ffn=128, vocab=256)
   use, card = cost.USE | {"context": 64}, cost.CARD | {"bandwidth": 1e30, "tflops": 1e12}
   for mode in ("bf16", "bfp8", "bfp4"):
     s = cost.shape(c, mode)
@@ -3197,7 +3197,7 @@ def test_cost_fidelity():
   singles = cost.prompt(c, s, use | {"context": 3}, card, 1)
   assert singles.work == 2 * 3 * s.work + c.layers * 4 * c.heads * llama.head(c) * (1 + 2 + 3) * s.decode_phases
   # Llama-3.1-8B's last gate/up uses two phases rather than TT's usual one.
-  large = llama.model(dim=4096, heads=32, kv=8, layers=32, ffn=14336, vocab=128256)
+  large = llama.custom(dim=4096, heads=32, kv=8, layers=32, ffn=14336, vocab=128256)
   s = cost.shape(large, "tt")
   assert s.work == 2 * s.values - 31 * 2 * 4096 * 14336
   # B3's mixed-phase roofline uses causal attention and phase-weighted work against the one-phase peak.
@@ -3208,12 +3208,12 @@ def test_cost_fidelity():
 def test_cost_draft_head():
   # Experts use one phase, projections two, routers and MTP inputs four, and the draft head one. The draft
   # vocabulary projection runs once per prompt chunk, including a short final chunk, while its layers run per token.
-  c = llama.model(dim=64, heads=1, kv=1, layers=1, ffn=128, vocab=256, experts=4, k=2, moe=64, shared=32, mtp=1)
+  c = llama.custom(dim=64, heads=1, kv=1, layers=1, ffn=128, vocab=256, experts=4, k=2, moe=64, shared=32, mtp=1)
   s, use, card = cost.shape(c, "experts"), cost.USE | {"context": 10}, cost.CARD | {"bandwidth": 1e30, "tflops": 1e12}
   mixer, mlp, router, head = 4 * 64 * 64, 3 * 64 * (32 + 2 * 64), 64 * 4, 256 * 64
   assert s.work == 2 * mixer + mlp + 4 * router + 2 * head
   assert s.draft_work == 2 * mixer + mlp + 4 * router + 4 * 2 * 64 * 64 and s.draft_head_work == head
-  base = llama.model(**(vars(c) | {"mtp": 0}))
+  base = llama.custom(**(vars(c) | {"mtp": 0}))
   for chunk in (1, 4, 16):
     plain, draft = cost.prompt(base, cost.shape(base, "experts"), use, card, chunk), cost.prompt(c, s, use, card, chunk)
     chunks = math.ceil(use["context"] / chunk)
@@ -3280,7 +3280,7 @@ def test_cost(tmp_path):
   assert "each operation's precision phases" in cost.report(str(tmp_path / "llama"))
   assert "4 phases for every operation (override)" in cost.report(str(tmp_path / "llama"), phases=4)
   with pytest.raises(ValueError, match="precision"): llama.precision(c, "bpf8")
-  windowed = llama.model(dim=128, heads=4, kv=2, layers=2, sliding=32, layer_types=["sliding_attention", "full_attention"])
+  windowed = llama.custom(dim=128, heads=4, kv=2, layers=2, sliding=32, layer_types=["sliding_attention", "full_attention"])
   assert cost.session(windowed, use | {"context": 1024}).kv == 2 * 1024 * 2 * 2 * 32 * 2, "reserve full KV rows, even with a sliding window"
   held = cost.shape(l8).bytes
   result = cost.report(str(tmp_path / "llama"), dram=held + card["reserve"] + 1)

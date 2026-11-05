@@ -54,19 +54,19 @@ void kmain(volatile unsigned *a) {{
   if (first) a[8] = CLOCK - t0;
 }}"""
 
-def tensix(unpacks="", maths="", packs="", slots=None):
+def tensix(unpacks="", maths="", packs="", replays=None):
   """Build a kernel from C bodies for the three TRISCs. Each body runs a[2] times, on the half of Dst in h. The last
   TRISC that has work times its loop, up to the last instruction of its thread, and writes the cycles into a[3]."""
   timed = [i for i, body in enumerate((unpacks, maths, packs)) if body][-1]
   loop = lambda i, body: (f"unsigned t0 = CLOCK; for (unsigned i = 0; i < a[2]; i++) {{ {body} }}" +
                           (" tensix_idle(); args[3] = CLOCK - t0;" if i == timed else "")) if body else ""
-  return compile_kernel(None, unpack_program(loop(0, unpacks), kernel_config()), math_program(slots or {}, loop(1, maths)),
+  return compile_kernel(None, unpack_program(loop(0, unpacks), kernel_config()), math_program(replays or {}, loop(1, maths)),
                         pack_program(loop(2, packs)))
 
 @functools.cache
 def kernels():
   mm = allocate({"mm"})
-  steps = {p: tensix(tt(unpack(1, 2)), tt(matmul(mm, p)), slots=mm) for p in (1, 2, 4)}  # a matmul step: two tiles in, p phases
+  steps = {p: tensix(tt(unpack(1, 2)), tt(matmul(mm, p)), replays=mm) for p in (1, 2, 4)}  # a matmul step: two tiles in, p phases
   # MVMULs alone. The Src banks are filled once and kept, since the replayed phases don't give them back, and they're
   # released at the end.
   mvmul = compile_kernel(None, unpack_program(tt(unpack(1, 2)), kernel_config()),
@@ -75,7 +75,7 @@ def kernels():
                                        " } " + tt(matmul(mm, 1)) + " tensix_idle(); args[3] = CLOCK - t0;"), pack_program(""))
   packs = tensix(maths=tt(math_begin(False) + MATH_END) + f" h ^= {DST_HALF};", packs=tt(pack("h", FRAMES)) + f" h ^= {DST_HALF};")
   ex = allocate({"exp"})
-  return dict(steps=steps, mvmul=mvmul, pack=packs, exp=tensix(maths=tt(sfpu(["exp"], ex)), slots=ex),
+  return dict(steps=steps, mvmul=mvmul, pack=packs, exp=tensix(maths=tt(sfpu(["exp"], ex)), replays=ex),
               empty=compile_kernel(EMPTY), ping=compile_kernel(PING))
 
 def probe(chip, n=64, rounds=32, upload=8 << 20):

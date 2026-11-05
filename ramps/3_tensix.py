@@ -37,8 +37,9 @@ def to_l1(slot, m):  # writes a 32 x 32 matrix into an L1 slot as bf16, in four 
 def from_l1(slot):  # reads a bf16 tile back from an L1 slot as a 32 x 32 matrix
   words = struct.unpack("<1024H", chip.read(x, y, slot_base("bf16") + slot * 2048, 2048))
   return [[from_bf16(words[(r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16]) for c in range(32)] for r in range(32)]
-def run(unpacks, maths, packs, slots=None):  # builds the three TRISC programs from lists of words and runs them on one worker
-  rt.launch(compile_kernel(None, unpack_program(tt(unpacks), kernel_config()), math_program(slots or {}, tt(maths)), pack_program(tt(packs))), (), 1)
+def run(unpacks, maths, packs, replays=None):  # builds the three TRISC programs from lists of words and runs them on one worker
+  kernel = compile_kernel(None, unpack_program(tt(unpacks), kernel_config()), math_program(replays or {}, tt(maths)), pack_program(tt(packs)))
+  rt.launch(kernel, (), 1)
   rt.wait()
 
 a = [[float((r * 32 + c) % 7 - 3) for c in range(32)] for r in range(32)]
@@ -54,15 +55,15 @@ print("2. unpacked two tiles, added them in Dst and packed the sum")
 # together give the exact product. ELWMUL adds to Dst, so math_begin(True) zeroes the half first. The phases are
 # recorded in the math thread's replay buffer once, then each replay costs the TRISC one word: allocate() chooses
 # where each sequence goes in that buffer.
-slots = allocate({"mul"})
-run(unpack(1, 2), math_begin(True) + elementwise("mul", slots) + MATH_END, pack("h", 3), slots)
+replays = allocate({"mul"})
+run(unpack(1, 2), math_begin(True) + elementwise("mul", replays) + MATH_END, pack("h", 3), replays)
 check(from_l1(3) == [[p * q for p, q in zip(ra, rb)] for ra, rb in zip(a, b)])
 print(f"3. multiplied in 4 phases of {len(MUL_PHASE) - 1} ELWMULs each")
 
 # 4. The matrix unit computes Dst += SrcB @ SrcA, so the left matrix goes in SrcB: unpack(2, 1) puts B in SrcA and A in
 # SrcB to compute A @ B. The sums of these small integers are exact in bf16.
-slots = allocate({"mm"})
-run(unpack(2, 1), math_begin(True) + matmul(slots) + MATH_END, pack("h", 3), slots)
+replays = allocate({"mm"})
+run(unpack(2, 1), math_begin(True) + matmul(replays) + MATH_END, pack("h", 3), replays)
 check(from_l1(3) == [[sum(a[r][k] * b[k][c] for k in range(32)) for c in range(32)] for r in range(32)])
 print("4. A @ B with A in SrcB and B in SrcA")
 
@@ -70,8 +71,8 @@ print("4. A @ B with A in SrcB and B in SrcA")
 # half, before pack rounds the result to bf16. Dst holds fp32, so the sum isn't rounded between the two operations.
 c = [[(r - k) / 16 for k in range(32)] for r in range(32)]  # exact in bf16, from -1.9375 to 1.9375
 to_l1(4, c)
-slots = allocate({"exp"})
-run(unpack(1, 4), math_begin(False) + elementwise("add", {}) + sfpu(["exp"], slots) + MATH_END, pack("h", 5), slots)
+replays = allocate({"exp"})
+run(unpack(1, 4), math_begin(False) + elementwise("add", {}) + sfpu(["exp"], replays) + MATH_END, pack("h", 5), replays)
 by_hand = from_l1(5)
 check(all(abs(got / math.exp(p + q) - 1) < 2**-7 for rg, ra, rc in zip(by_hand, a, c) for got, p, q in zip(rg, ra, rc)))
 print(f"5. exp(a + c) in Dst: exp({a[0][1] + c[0][1]}) = {by_hand[0][1]}")

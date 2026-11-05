@@ -41,7 +41,7 @@ the loop wait on those counters:
 | --- | --- | --- |
 | BRISC | `reached(frame_done[f])` waits until the frame's last tiles are unpacked, writing finished results to DRAM meanwhile. Two `get`s fetch the inputs, `ready()` waits for them to land and tells TRISC0, and `frame_done[f] = ++events` names the unpack that will free the frame. | `brisc_program("a[1]", ...)`, which writes the remaining results after the loop |
 | TRISC0 | `fetched()` waits for BRISC. `unpack(a_slot, b_slot)` fills SrcA and SrcB, and `REPORT` tells BRISC the slots are free. | `unpack_program(..., kernel_config())` |
-| TRISC1 | `math_begin` waits for a free half of Dst, `elementwise("add")` adds on the FPU, `sfpu(["relu"])` applies relu in fp32, and `MATH_END` hands the half to pack. `h` moves on to the other half. | `math_program(slots, ...)`, where `allocate({"relu"})` places relu's program in the math thread's replay buffer |
+| TRISC1 | `math_begin` waits for a free half of Dst, `elementwise("add")` adds on the FPU, `sfpu(["relu"])` applies relu in fp32, and `MATH_END` hands the half to pack. `h` moves on to the other half. | `math_program(replays, ...)`, where `allocate({"relu"})` places relu's program in the math thread's replay buffer |
 | TRISC2 | `output(f, slot, t)` queues the result for DRAM tile `t`, once BRISC has written what that slot held before. `pack` rounds the half to bf16 into the slot and posts `SEM_PACKED` for BRISC. | `pack_program(...)` |
 
 A missing wait shows up as a wrong tile or a hang, but not always on ttsim,
