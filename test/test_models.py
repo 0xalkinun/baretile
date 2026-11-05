@@ -2606,7 +2606,7 @@ def test_schema_edges():
                  {"minLength": 2, "maxLength": 1}, {"minimum": "1"}, {"exclusiveMinimum": True}, {"multipleOf": 0}):
     with pytest.raises(ValueError): fits(schema)
   # A keyword that formatted would ignore is refused by name. Annotations are accepted, format among them
-  for schema, named in (({"not": {"type": "string"}}, "not"), ({"type": "string", "pattern": "^a"}, "pattern"),
+  for schema, named in (({"not": {"type": "string"}}, "not"),
                         ({"type": "array", "prefixItems": [True], "uniqueItems": True}, "prefixItems, uniqueItems"),
                         ({"properties": {"a": {"if": {}, "then": {}}}}, "if, then"), ({"anyOf": [{"minProperties": 1}]}, "minProperties"),
                         ({"allOf": [{"patternProperties": {}}]}, "patternProperties")):
@@ -2652,6 +2652,44 @@ def test_schema_bounds(tmp_path):
     while not r.take(rng.normal(0, 1, 256).astype(np.float32), True): pass
     got = json.loads(tok.decode(r.made))
     assert r.finish == "stop" and 3 <= got["n"] <= 250 and got["n"] % 7 == 0 and -1 < got["x"] < 1 and 3 <= len(got["s"]) <= 5, got
+
+def test_schema_pattern(tmp_path):
+  # formatted enforces pattern, in ECMA-262's regular expressions, over code points. A string goes on only while it can
+  # still end in a match within its lengths, whether its next character is begun as an escape or as a token's bytes
+  def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
+  for schema, cases in (({"pattern": r"^[a-z]+-\d{2,3}$"}, [('"ab-1', 1), ('"ab-12"', 2), ('"ab-1234', 0), ('"Ab', 0), ('"ab-"', 0)]),
+                        ({"pattern": "b+"}, [('"xyz', 1), ('"xyz"', 0), ('"abb"', 2), ('""', 0), ("1", 2)]),  # unanchored, on strings only
+                        ({"pattern": "^a*b$", "maxLength": 3}, [('"aa', 1), ('"aaa', 0), ('"aab"', 2)]),  # each alone allows "aaa
+                        ({"pattern": "^(ab)+$", "minLength": 3}, [('"ab"', 0), ('"aba', 1), ('"abab"', 2)]),
+                        ({"pattern": "^(ab)+$", "minLength": 3, "maxLength": 3}, [('"', 0)]),
+                        ({"pattern": "^(ab)*$", "minLength": 10**9}, [('"aba', 1), ('"abb', 0)]),
+                        ({"pattern": "^é$"}, [('"\\u00e9"', 2), ('"\\u00', 1), ('"\\u01', 0), ('"\\', 1), ('"\\n', 0)]),
+                        ({"pattern": "^😀$"}, [('"😀"', 2), ('"\\ud83d\\ude00"', 2), ('"\\ud83d\\u', 1), ('"\\ud83d\\ude01"', 0),
+                                               ('"\\ud83d"', 0), ('"\\ud', 1), ('"\\ud83e', 0)]),
+                        ({"pattern": '^"\\\\$'}, [('"\\"\\\\"', 2), ('"\\"', 1)]),
+                        ({"pattern": "^.$"}, [('"a"', 2), ('"\\r"', 0), ('"\\u2028"', 0)]),  # . leaves out line terminators
+                        ({"pattern": r"^\s$"}, [('"\\u00a0"', 2), ('"\\ufeff"', 2), ('"\\u001c"', 0)]),
+                        ({"enum": ["ab", "ac"], "pattern": "c$"}, [('"ab"', 0), ('"ac"', 2)])):
+    for text, want in cases: assert fits(schema)(text) == want, (schema, text)
+  assert fits({"pattern": "^é$"})('"', b"\xc3") == 1 and fits({"pattern": "^é$"})('"', b"\xe2") == 0
+  assert fits({"pattern": "^😀$"})('"', b"\xf0\x9f") == 1 and fits({"pattern": "^😀$"})('"\\ud83d', b"\xf0") == 0
+  for pattern, named in (("(?=a)", "lookarounds"), ("(a)\\1", "backreferences"), ("\\k<x>", "named backreferences"),
+                         ("\\bx", "word boundaries"), ("\\p{L}", "Unicode property escapes"), ("\\cA", "control escapes"),
+                         ("\\q", "\\\\q isn't an escape"), ("(a", "a group isn't closed"), ("[z-a]", "a range is out of order"),
+                         ("*a", "a quantifier has nothing to repeat"), ("a**", "a quantifier follows another"), ("a{5000}", "4096 NFA states")):
+    with pytest.raises(ValueError, match=named): fits({"type": "string", "pattern": pattern})
+  with pytest.raises(ValueError, match="together"): fits({"anyOf": [{"pattern": f"a{{{n}}}"} for n in range(1000, 1010)]})
+  with pytest.raises(ValueError, match="pattern must be a string"): fits({"pattern": ["a"]})
+  # Random logits finish a string that matches, checked with re: ASCII for \d and \w, and \Z for ECMA-262's $
+  tok = bytes_tokenizer(tmp_path)
+  for pattern, least, most in ((r"^[a-z]{2,4}-\d+$", 0, 8), (r"^(foo|ba[rz])+$", 0, 9), (r"x.?y", 0, 6),
+                               (r"^\w+@\w+\.(com|org)$", 0, 12), (r'^[^"\\]{3}$', 0, None), (r"^(ab)+$", 3, 7)):
+    shape = fits({"type": "string", "pattern": pattern, "minLength": least, **({"maxLength": most} if most else {})})
+    for seed in range(3):
+      rng, r = np.random.default_rng(seed), serve.Request(tok, [], 200, 1.0, eos=[0], seed=seed, shape=shape)
+      while not r.take(rng.normal(0, 1, 256).astype(np.float32), True): pass
+      got = json.loads(tok.decode(r.made))
+      assert r.finish == "stop" and re.search(pattern.replace("$", r"\Z"), got, re.ASCII) and least <= len(got) <= (most or 200), (pattern, got)
 
 def test_schema_intersections():
   def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
