@@ -180,12 +180,15 @@ class Card:
 # tt-kmd's ioctls, _IO(0xFA, n) in its ioctl.h, and their arguments as (C type, [(member, struct code)]), with the
 # padding the C compiler adds. PIN_PAGES asks for the extended output, which carries the NoC address. test_kmd_layouts
 # checks each member's offset against the header.
-KMD = {"QUERY_MAPPINGS": 2, "PIN_PAGES": 7, "UNPIN_PAGES": 10, "ALLOCATE_TLB": 11, "CONFIGURE_TLB": 13,
-       "SET_POWER_STATE": 15, "SMC_MSG": 17}
+KMD = {"QUERY_MAPPINGS": 2, "GET_DRIVER_INFO": 5, "PIN_PAGES": 7, "UNPIN_PAGES": 10, "ALLOCATE_TLB": 11,
+       "CONFIGURE_TLB": 13, "SET_POWER_STATE": 15, "SMC_MSG": 17}
 KMD_ARGS = {
   "QUERY_MAPPINGS": ("struct tenstorrent_query_mappings", [("in.output_mapping_count", "I"), ("in.reserved", "I")]),
   "MAPPING": ("struct tenstorrent_mapping",
               [("mapping_id", "I"), ("reserved", "I"), ("mapping_base", "Q"), ("mapping_size", "Q")]),
+  "GET_DRIVER_INFO": ("struct tenstorrent_get_driver_info",  # driver_version_major is major, minor, patch, reserved0
+                      [("in.output_size_bytes", "I"), ("out.output_size_bytes", "I"), ("out.driver_version", "I"),
+                       ("out.driver_version_major", "4B")]),
   "PIN_PAGES": ("struct { struct tenstorrent_pin_pages_in in; struct tenstorrent_pin_pages_out_extended out; }",
                 [("in.output_size_bytes", "I"), ("in.flags", "I"), ("in.virtual_address", "Q"), ("in.size", "Q"),
                  ("out.physical_address", "Q"), ("out.noc_address", "Q")]),
@@ -206,6 +209,9 @@ KMD_ARGS = {
   "SMC_MSG": ("struct tenstorrent_smc_msg",
               [("argsz", "I"), ("flags", "I"), ("queue_index", "I"), ("reserved0", "I"), ("message", "8I")]),
 }
+# The oldest tt-kmd that baretile runs on. From 2.5, CONFIGURE_TLB clears the strided multicast word of the TLB it
+# configures, so a multicast skips no tiles of its rectangle
+KMD_OLDEST = (2, 5)
 KMD_MAPPING_BAR0 = 1  # TENSTORRENT_MAPPING_RESOURCE0_UC: BAR0, uncached
 KMD_PIN_CONTIGUOUS, KMD_PIN_NOC_DMA = 1, 2  # the pages are physically contiguous; the card reaches them through the NoC
 KMD_SMC_POST, KMD_SMC_POLL, KMD_SMC_ABANDON = 1, 2, 4
@@ -219,13 +225,17 @@ class Kmd:
   """A card through tt-kmd's device file, /dev/tenstorrent/N, which any user can open. kmd maps DMA memory for the
   card, through the IOMMU when it translates, and hands out TLB windows, so this needs neither root nor iommu=pt, and
   tt-smi can use the card at the same time. Opening the file without O_APPEND has kmd power the chip up for us, but at
-  the minimum AI clock, so Kmd asks kmd for the busy one. Needs tt-kmd 2.0 or later, and 2.11 for arc_msg."""
+  the minimum AI clock, so Kmd asks kmd for the busy one. Needs tt-kmd 2.5 (KMD_OLDEST) or later, and 2.11 for
+  arc_msg."""
   counts = True  # see Sim
   def __init__(self, bdf, path):
     self.fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
     try:
       # one baretile opener at a time, as for Card. Other kmd clients don't take it
       _claim(lambda: _flock(self.fd), path)
+      v = self.call("GET_DRIVER_INFO", **{"in.output_size_bytes": 12})["out.driver_version_major"][:3]  # 1.x leaves 0s
+      if v < KMD_OLDEST: raise RuntimeError(f"baretile needs tt-kmd {'%d.%d' % KMD_OLDEST} or later, and this one is "
+                                            f"{'%d.%d.%d' % v if v[0] else 'older than 2.0'}. Update it")
       self.sys = f"{SYS}/devices/{bdf}"
       bar0 = next((m for m in self.mappings() if m["mapping_id"] == KMD_MAPPING_BAR0), None)
       if bar0 is None: raise RuntimeError(f"tt-kmd offers no BAR0 mapping for {bdf}")
@@ -292,8 +302,6 @@ class Kmd:
     config = {f"in.config.{k}": fields.get(k, 0) for k in ("x_end", "y_end", "x_start", "y_start", "mcast", "ordering",
                                                            "static_vc")}
     self.call("CONFIGURE_TLB", **{"in.id": id, "in.config.addr": fields.get("addr", 0) << 21}, **config)
-    # skip no tiles of a multicast, as Card leaves them
-    if id < 32: _store(self.bar0 + bh.TLB_STRIDED + 4 * id, bytes(4))
     if fields.get("vc_class"):
       first, width = bh.TLB_FIELDS["vc_class"]
       at = self.bar0 + bh.TLB_CONFIG + 12 * id + 8  # the high word holds bits 64 to 95
@@ -424,6 +432,8 @@ def preflight(bdf):
     version = read(pathlib.Path(MODULE, "version"))
     found.append(("ok", f"tt-kmd {version or '(version unknown)'} drives the card, "
                         f"and baretile opens it through {path}, without root"))
+    if all(map(str.isdigit, v := (version or "").split(".")[:2])) and tuple(map(int, v)) < KMD_OLDEST:
+      found.append(("fail", f"tt-kmd {version} is older than {'%d.%d' % KMD_OLDEST}, which baretile needs. Update it"))
     found.append(("ok", f"this user can open {path}") if os.access(path, os.R_OK | os.W_OK) else
                  ("fail", f"this user can't open {path}. tt-kmd's udev rule makes it 0666: reinstall tt-kmd, "
                           f"or check /etc/udev/rules.d"))

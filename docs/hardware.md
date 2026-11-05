@@ -42,7 +42,10 @@ buddy bit at 75 and the class at 76 and 77.
 A TLB maps a BAR window to a tile and address on the NoC. The configuration
 starts at BAR0 `0x1FC00000`, with three 32-bit words per entry. Write those
 words separately: odd entries aren't aligned to eight bytes. Strided multicast
-words for entries 0 through 31 start at `0x1FC009D8`.
+words for entries 0 through 31 start at `0x1FC009D8`. With 0, a multicast skips
+no tiles of its rectangle. tt-kmd writes 0 to an entry's word whenever it
+configures the entry, from tt-kmd 2.5 on, and `pci.Card` writes 0 to all 32 when
+it opens the card.
 
 The 2 MiB format comes from `PCIExpressTile/HostToDeviceTLBs.md`:
 
