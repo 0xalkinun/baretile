@@ -138,9 +138,9 @@ only check on a card.
 ## ttsim-chaos
 
 [test/ttsim-chaos.patch](../test/ttsim-chaos.patch) adds NoC delays, FPU and
-SFPU latency, random pauses, a 140-tile option and the NIU counter for read
-bytes to ttsim v1.11.5 at commit `464814f`. Apply it to a separate ttsim
-checkout and build the Blackhole library there:
+SFPU latency, random pauses, a 140-tile option, the NIU counter for read bytes
+and a tile's NoC counters left nonzero to ttsim v1.11.5 at commit `464814f`.
+Apply it to a separate ttsim checkout and build the Blackhole library there:
 
 ```sh
 git clone --branch v1.11.5 https://github.com/tenstorrent/ttsim ttsim-chaos
@@ -161,6 +161,15 @@ TTSIM=/path/to/ttsim-chaos/src/_out/release_bh/libttsim.so \
 range. The RISC-V and Tensix settings give the probability of skipping a turn.
 Set `TTSIM_CHAOS_SEED` to repeat a run. `TTSIM_CHAOS_UNHARVESTED=1` enables all
 140 Tensix tiles, so you can check the code with a larger grid.
+
+`TTSIM_CHAOS_OUTSTANDING=x,y` starts Tensix tile (x, y) with 200 requests
+counted as outstanding on NoC 0 for transaction ID 0, and `x,y,n` with n, up to
+255. A P150a's firmware leaves that tile's counter nonzero after a reset, which
+hangs a runtime that waits for it to reach 0
+([#4](https://github.com/0xalkinun/baretile/issues/4)). With
+`TTSIM_CHAOS_OUTSTANDING=1,2`, `python3 -m baretile.hello` hangs at launch 1 on
+(1, 2), and the report lists `NoC requests in flight by id: {0: 200}`. CI
+doesn't set it until the runtime clears the counters itself.
 
 CI builds ttsim-chaos this way for every push to main and every pull request
 that changes more than Markdown. With the four delay settings above and the run

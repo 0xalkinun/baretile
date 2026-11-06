@@ -257,7 +257,7 @@ index 04e04c2..df191d1 100644
 +    return ran;
 +}
 diff --git a/src/tile.cpp b/src/tile.cpp
-index 4d19315..6dcc50f 100644
+index 4d19315..2b6bcd5 100644
 --- a/src/tile.cpp
 +++ b/src/tile.cpp
 @@ -2,6 +2,8 @@
@@ -269,7 +269,7 @@ index 4d19315..6dcc50f 100644
  #include "sim.h"
  #include "topology.h"
  #include "eth_fw_blob.h" // generated
-@@ -24,7 +26,108 @@ static inline auto get_tile(uint32_t tile_id) {
+@@ -24,7 +26,119 @@ static inline auto get_tile(uint32_t tile_id) {
      }
  }
  
@@ -323,6 +323,17 @@ index 4d19315..6dcc50f 100644
 +            s_chaos.noc_lo, s_chaos.noc_hi, s_chaos.tensix_stall / 1e6, s_chaos.rv32_skip / 1e6, seed ? seed : "default");
 +    }
 +    if (getenv("TTSIM_CHAOS_UNHARVESTED")) fprintf(stderr, "ttsim-chaos: a p150 of 140 Tensix, none harvested\n");
++    // With TTSIM_CHAOS_OUTSTANDING=x,y[,n], Tensix tile (x, y) starts with n requests outstanding on NoC 0 for transaction
++    // ID 0, 200 unless n is given, as a card's firmware leaves them after it clears L1 with a broadcast (baretile#4)
++    if (const char *outstanding = getenv("TTSIM_CHAOS_OUTSTANDING")) {
++        uint32_t x = 0, y = 0, n = 200;
++        TTSIM_VERIFY(sscanf(outstanding, "%u,%u,%u", &x, &y, &n) >= 2 && n > 0 && n < 256, ConfigurationError,
++            "TTSIM_CHAOS_OUTSTANDING=%s: want x,y or x,y,n with n from 1 to 255", outstanding);
++        auto [tile_type, tile_id] = coord_to_tile(x | y << 6);
++        TTSIM_VERIFY(tile_type == 'T', ConfigurationError, "TTSIM_CHAOS_OUTSTANDING=%s: (%u, %u) isn't a Tensix tile", outstanding, x, y);
++        g_t_tiles[tile_id].niu_mst_reqs_outstanding[0][0] = n;
++        fprintf(stderr, "ttsim-chaos: Tensix (%u, %u) starts with %u requests outstanding for NoC 0's transaction ID 0\n", x, y, n);
++    }
 +}
 +
 +bool chaos_skip_tensix() { return s_chaos.tensix_stall && chaos_rand() % 1000000 < s_chaos.tensix_stall; }
@@ -379,7 +390,7 @@ index 4d19315..6dcc50f 100644
      TTSIM_ASSERT(chip_id < NUM_CHIPS);
  #if TT_ARCH_VERSION == 0
  #if NUM_CHIPS == 1
-@@ -42,7 +145,7 @@ static constexpr uint32_t logical_harvesting_mask(uint32_t chip_id) {
+@@ -42,7 +156,7 @@ static constexpr uint32_t logical_harvesting_mask(uint32_t chip_id) {
      return LOGICAL_HARVESTING_MASKS[chip_id];
  #else
  #if NUM_CHIPS == 1
@@ -388,7 +399,7 @@ index 4d19315..6dcc50f 100644
  #elif NUM_CHIPS == 2
      constexpr uint32_t LOGICAL_HARVESTING_MASKS[] = {0x2080, 0x110}; // P300
  #elif NUM_CHIPS == 4
-@@ -1350,6 +1453,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1350,6 +1464,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
          case NOC_REGS_NIU_MST_ATOMIC_RESP_RECEIVED: return p_tile->niu_mst_atomic_resp_received[noc_instance];
          case NOC_REGS_NIU_MST_WR_ACK_RECEIVED: return p_tile->niu_mst_wr_ack_received[noc_instance];
          case NOC_REGS_NIU_MST_RD_RESP_RECEIVED: return p_tile->niu_mst_rd_resp_received[noc_instance];
@@ -396,7 +407,7 @@ index 4d19315..6dcc50f 100644
          case NOC_REGS_NIU_MST_POSTED_ATOMIC_SENT: return p_tile->niu_mst_posted_atomic_sent[noc_instance];
          case NOC_REGS_NIU_MST_NONPOSTED_WR_REQ_SENT: return p_tile->niu_mst_nonposted_wr_req_sent[noc_instance];
          case NOC_REGS_NIU_MST_POSTED_WR_REQ_SENT: return p_tile->niu_mst_posted_wr_req_sent[noc_instance];
-@@ -1386,7 +1490,8 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1386,7 +1501,8 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(13):
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(14):
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(15):
@@ -406,7 +417,7 @@ index 4d19315..6dcc50f 100644
          default:
              return base_noc_regs_rd32(&p_tile->base, tile_type, tile_id, noc_instance, offset);
      }
-@@ -1394,6 +1499,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1394,6 +1510,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
  
  template<char tile_type>
  static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
@@ -414,7 +425,7 @@ index 4d19315..6dcc50f 100644
      auto *p_tile = get_tile<tile_type>(tile_id);
      uint32_t noc_at_len_be = p_tile->noc_at_len_be[noc_instance][cmd_buf];
      uint32_t txn_id = bits<13,10>(p_tile->noc_packet_tag[noc_instance][cmd_buf]);
-@@ -1614,6 +1720,39 @@ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_b
+@@ -1614,6 +1731,39 @@ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_b
          }
          tile_rd_bytes(src_coordinate, src_addr, &p_tile->sram[dst_addr], noc_at_len_be);
          p_tile->niu_mst_rd_resp_received[noc_instance]++;
@@ -454,7 +465,7 @@ index 4d19315..6dcc50f 100644
      }
  }
  
-@@ -2497,7 +2636,7 @@ static uint32_t arc_reset_unit_rd32(uint32_t offset) {
+@@ -2497,7 +2647,7 @@ static uint32_t arc_reset_unit_rd32(uint32_t offset) {
      }
  }
  
