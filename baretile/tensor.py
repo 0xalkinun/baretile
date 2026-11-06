@@ -886,6 +886,7 @@ class Tensor:
     for t in reversed(_graph(self)):
       if t._ctx is None: continue
       if (g := grads.pop(id(t), None)) is None: continue
+      if t.dtype == "bf16" != g.dtype: g = g.cast("bf16")  # as in PyTorch, so a bf16 matmul's backward is bf16 matmuls
       if id(t) in wanted: found[id(t)] = g
       for s, gs in zip(t._ctx[1], _backward(t, g)):
         if gs is not None and s.requires_grad: grads[id(s)] = grads[id(s)] + gs if id(s) in grads else gs

@@ -24,13 +24,18 @@ def shard(path, tokens):  # write tokens as an llm.c .bin shard: 256 int32s of h
   path.write_bytes(np.array([20240520, 1, len(tokens)] + [0] * 253, np.int32).tobytes() + np.asarray(tokens, np.uint16).tobytes())
   return path
 
-def test_train_gpt2(chip, tmp_path):
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+def test_train_gpt2(chip, tmp_path, precision):
   # A small GPT-2 trains as baretile.models.train does, on a counting sequence in an llm.c shard, 2 sequences a step.
-  # Each step's loss and gradients match PyTorch's on the same weights and sequences. Each update is AdamW's, computed in
-  # float64 from the gradients the chip added up: the warmup and cosine, the clipping, and weight decay on the matrices
-  # only. The loss falls.
+  # Each step's loss and gradients match PyTorch's on the same weights and sequences, in bf16 under PyTorch's autocast.
+  # Each update is AdamW's, computed in float64 from the gradients the chip added up: the warmup and cosine, the
+  # clipping, and weight decay on the matrices only. The loss falls.
   torch, F = pytest.importorskip("torch"), pytest.importorskip("torch.nn.functional")
-  c = SimpleNamespace(**gpt2_train.GPT2 | dict(layers=2, dim=64, heads=2, ctx=32, vocab=96, accum=2, steps=5, lr=1e-2, warmup=2, clip=0.5))
+  c = SimpleNamespace(**gpt2_train.GPT2 | dict(layers=2, dim=64, heads=2, ctx=32, vocab=96, accum=2, steps=5, lr=1e-2, warmup=2, clip=0.5,
+                                                precision=precision))
+  # bf16 rounds each matmul's operands and result, as autocast does but not at the same points: on ttsim v1.11.5 the
+  # loss came within 5e-4 of PyTorch's and the gradients within 1.3e-2 of their largest, against 1e-5 and 1.5e-3 in fp32
+  loss_within, grads_within = {"fp32": (1e-3, 2e-3), "bf16": (2e-3, 3e-2)}[precision]
   path = shard(tmp_path / "train.bin", np.arange(2000) % 90)
   (tmp_path / "bad.bin").write_bytes(bytes(1024))
   with pytest.raises(ValueError, match="llm.c token shard"): gpt2_train.shard(tmp_path / "bad.bin")
@@ -41,12 +46,13 @@ def test_train_gpt2(chip, tmp_path):
     w, state = {k: gpt2.values(v).astype(np.float64) for k, v in t.w.items()}, {k: [gpt2.values(s) for s in ms] for k, ms in t.state.items()}
     pw = {k: torch.tensor(a, dtype=torch.float32, requires_grad=True) for k, a in w.items()}
     seqs = [next(same) for _ in range(c.accum)]
-    want = sum(F.cross_entropy(gpt2_train.forward(s[:-1].tolist(), pw, pmask, c), torch.tensor(s[1:].astype(np.int64))) for s in seqs) / c.accum
+    with torch.autocast("cpu", torch.bfloat16, enabled=precision == "bf16"):
+      want = sum(F.cross_entropy(gpt2_train.forward(s[:-1].tolist(), pw, pmask, c), torch.tensor(s[1:].astype(np.int64))) for s in seqs) / c.accum
     want.backward()
     loss = t.gradients(runs)
     g = {k: gpt2.values(v).astype(np.float64) for k, v in t.grads.items()}
-    assert abs(loss - want.item()) < 1e-3, (step, loss, want.item())
-    for k, a in g.items(): assert np.abs(a - pw[k].grad.numpy()).max() < 2e-3 * np.abs(pw[k].grad.numpy()).max(), (step, k)
+    assert abs(loss - want.item()) < loss_within, (step, loss, want.item())
+    for k, a in g.items(): assert np.abs(a - pw[k].grad.numpy()).max() < grads_within * np.abs(pw[k].grad.numpy()).max(), (step, k)
     total, lr = t.update()
     norm = math.sqrt(sum((a * a).sum() for a in g.values()))
     assert abs(total - norm) < 1e-4 * norm and lr == gpt2_train.rate(step, c), (step, total, norm)
@@ -71,6 +77,28 @@ def test_train_settings(tmp_path, monkeypatch):
   with pytest.raises(ValueError, match="8 tokens can't make a sequence of 16"): gpt2_train.main()
   monkeypatch.setattr(sys, "argv", ["train", str(train_bin), "val_every=0"])
   with pytest.raises(SystemExit, match="val_every"): gpt2_train.main()
+
+def test_training_cost():
+  # cost.training counts GPT-2 124M's step at baretile.models.train's defaults: 6 FLOPs a parameter a token for the
+  # matrices, attention's products over all 1,024 keys, and the embedding's gradient, a matmul by the tokens' one-hot
+  # rows, 0.49 PFLOP for 524,288 tokens. fp32 multiplies each matmul three times over, but the one-hot matmul reads the
+  # fp32 gradient in two parts in either precision. Its reads give back the ttsim-chaos counts they were fitted to, such
+  # as one block's sequence of 256 tokens with 1,024 entries: 380 MB in bf16, 815 MB in fp32. The report has a row for
+  # each precision, and refuses a width the reads weren't measured at.
+  c, card = SimpleNamespace(**gpt2_train.GPT2), dict(cost.CARD)
+  n, d, v = c.ctx, c.dim, c.vocab
+  forward, hot = 12 * (2 * n * 12 * d * d + 4 * n * n * d) + 2 * n * d * v, 2 * v * n * d
+  fp32, bf16 = (cost.training(SimpleNamespace(**vars(c) | dict(precision=p)), card) for p in ("fp32", "bf16"))
+  assert fp32.flops == bf16.flops == 512 * (3 * forward + hot) and 4.8e14 < fp32.flops < 4.9e14, fp32.flops
+  assert (fp32.work, bf16.work) == (512 * 4 * (9 * forward + 2 * hot), 512 * 4 * (3 * forward + 2 * hot))
+  for p, measured in (("bf16", 379.7e6), ("fp32", 815.4e6)):
+    one = cost.training(SimpleNamespace(**vars(c) | dict(precision=p, layers=1, ctx=256, vocab=1024)), card)
+    assert abs(one.sequence / measured - 1) < 0.01, (p, one.sequence)
+  rows = [line.split() for line in cost.training_report(steps=100).splitlines()[2:]]
+  assert [r[0] for r in rows] == ["fp32", "bf16"] and float(rows[1][5]) < float(rows[0][5]), rows  # bf16's step is shorter
+  assert [r[0] for r in (line.split() for line in cost.training_report(precision="bf16").splitlines()[2:])] == ["bf16"]
+  with pytest.raises(ValueError, match="width"): cost.training_report(dim=512, heads=8)
+  with pytest.raises(ValueError, match="unknown settings"): cost.training_report(width=512)
 
 def test_adam_original_gradients(chip):
   # Updating a in place doesn't change b's gradient, which backward() computed from a's value before the update
