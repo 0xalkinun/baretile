@@ -88,6 +88,11 @@ name, separated by commas. An unknown stage name is an error, and a stage that
     `--llama path/to/Llama-3.1-8B-Instruct` and
     `--reference path/to/Llama-3.1-8B-Instruct.refpt`. It passes at top-1 90%
     and top-5 98% over 500 steps.
+11. **timing** runs `test/workload.py time`, the first workload's timing
+    protocol in three fresh processes, and keeps its report as
+    `record/timing.json`.
+12. **http** runs `test/workload.py http`, the first workload's single-slot
+    HTTP gate, and keeps its report as `record/http.json`.
 
 The stages run on ttsim too, which is how they're tested. Once they pass on a
 card, run `python3 -m baretile.bench`, and pass `probe=record/probe.json` to
@@ -137,7 +142,7 @@ exists, it runs `test/bringup.py` from preflight through the model tests, keeps
 the record as an artifact, and fails at the first failing stage. It names the
 SmolLM stage in `--only`, and so runs it, only when the repository variable
 `SMOLLM` gives a SmolLM-135M folder on the card's machine. It leaves out the
-probe, which measures, and the Llama stage, which takes hours.
+probe, which measures, and the Llama stages, which take hours.
 
 To set it up on the card's machine:
 
