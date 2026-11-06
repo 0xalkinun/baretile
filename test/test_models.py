@@ -2087,10 +2087,10 @@ def test_serve_command(tmp_path):
     server.wait()
 
 @pytest.mark.skipif(pci.simulator() is None, reason="the commands open the device in processes of their own, and a card can't be open in two")
-def test_workload_commands(tmp_path):
+def test_workload_commands(tmp_path, monkeypatch):
   # test/workload.py runs the first workload's timing protocol and its HTTP gate, here on a small random Llama with a
-  # reference file of its own. time runs each process fresh, the first compiling its kernels and the second finding
-  # them, and both pick the same tokens. http passes the three prompts in both forms and gets its slot back from a
+  # reference file of its own. time runs each process fresh, the first compiling its kernels into a cache of the test's
+  # own and the second finding them, and both pick the same tokens. http passes the three prompts in both forms and gets its slot back from a
   # cancelled stream. A reference file that doesn't exist fails both runs, and the command exits with an error.
   torch = pytest.importorskip("torch")
   import workload
@@ -2107,9 +2107,12 @@ def test_workload_commands(tmp_path):
   bytes_tokenizer(tmp_path)
   torch.save({"reference_tokens": torch.tensor(rng.integers(0, vocab, (1, 1024))), "top5_tokens": torch.tensor(rng.integers(0, vocab, (1024, 5)))},
              tmp_path / "reference.refpt")
+  monkeypatch.setenv("TTSIM", pci.simulator())  # found before XDG_CACHE_HOME moves the cache it may be in
+  monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))  # other tests compile into the shared one meanwhile
   report = workload.timing(str(tmp_path), str(tmp_path / "reference.refpt"), runs=2, steps=4)
   assert report["passed"] and len(report["runs"]) == 2 and report["timed"] == 2 and report["median"]["tokens_per_s"] > 0, report["failures"]
-  assert report["runs"][1]["compiled"] == 0 and report["runs"][0]["kv"] == "bfp8" and len(report["runs"][0]["picks"]) == 5, report["runs"]
+  first, second = report["runs"]
+  assert first["compiled"] > 0 == second["compiled"] and first["kv"] == "bfp8" and len(first["picks"]) == 5, report["runs"]
   assert set(report["model"]) == {"config.json", "model.safetensors", "reference.refpt", "tokenizer.json"} and report["precision"] == "tt"
   report = workload.gate(str(tmp_path), tokens=4)
   assert report["passed"] and report["recovered"] and len(report["prompts"]) == 3, report["failures"]
