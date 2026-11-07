@@ -636,6 +636,10 @@ class Runtime:
       self.doorbell = chip.map(dx, dy, DISPATCH)
       for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
       chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
+      # A card's reset leaves the counts of NoC requests in flight as they were. Its firmware's clear of L1 from (1, 2)
+      # leaves that tile about 14,000 for transaction ID 0, which noc_wait would wait for forever (#4). The cores are
+      # halted, so none of theirs are in flight.
+      for x, y in [*self.cores, self.dispatcher]: chip.write32(x, y, bh.NIU + bh.NIU_REGS["CLEAR_OUTSTANDING"], 0xFFFF)
       self.resources.started = True
       chip.write32(*end, bh.SOFT_RESET, bh.NCRISC, start)  # BRISC and the TRISCs go, and NCRISC stays in reset
     except BaseException:
