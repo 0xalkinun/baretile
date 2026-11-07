@@ -63,8 +63,9 @@ CI's test job doesn't install these, so its `references` job does, at pinned
 versions, and runs the comparisons with `SKIPS=fail`: `test_train`,
 `test_train_gpt2`, `test_llama_frequencies`, `test_tokenizer`,
 `test_tokenizer_gate`, `test_hf_families`, `test_qwen3_moe`,
-`test_qwen3_5_moe`, `test_mxfp4`, `test_torch_frontend` and
-`test_autonomous_generation`. It downloads no checkpoints.
+`test_qwen3_5_moe`, `test_mxfp4`, `test_torch_frontend`,
+`test_autonomous_generation` and `test_workload_commands`. It downloads no
+checkpoints.
 
 To include pretrained checkpoint checks:
 

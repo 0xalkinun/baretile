@@ -228,6 +228,16 @@ in the [card acceptance record](https://github.com/0xalkinun/baretile/issues/5).
 The server binds to all interfaces and has no API-key check; run this local
 acceptance case on a trusted host as described in [serving](models.md#serving).
 
+`test/workload.py http` runs these checks as one command. It starts that
+server on a free port, sends the three prompts in both forms, cancels a stream
+after its first text and checks that the next request finishes, and writes
+each answer, its usage and its time to first text to the report. It exits with
+an error on any miss:
+
+```sh
+python3 test/workload.py http "$LLAMA_DIR" http.json
+```
+
 ## Timing and evidence
 
 Preserve the existing B2 protocol: prefill 512 reference tokens, then run 200
@@ -244,7 +254,20 @@ available workers, host, Python/NumPy/PyTorch/Transformers versions, model
 hashes, baretile and vendor commits, precision and command. HTTP first-text
 latency is time to the first nonempty SSE event, not a per-token timestamp.
 
-The existing broad benchmark command is:
+`test/workload.py time` runs this protocol in three fresh processes and writes
+the record. It reports each run's load, upload and first-token times and its
+rate over the 198 steps, their medians, whether each process found its kernels
+compiled already, and the environment above. It exits with an error if a run
+fails or the runs pick different tokens. On ttsim its times are ttsim's clock:
+
+```sh
+python3 test/workload.py time "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" timing.json
+```
+
+CI runs both commands on a small random Llama with a reference file of its own
+(`test_workload_commands`), not on these checkpoints.
+
+The broader benchmark command is:
 
 ```sh
 BOOK="$REF_DIR/tale-of-two-cities.txt.bz2" \
@@ -252,12 +275,13 @@ BOOK="$REF_DIR/tale-of-two-cities.txt.bz2" \
 ```
 
 It also runs B1, batch-32 B2, long-context B3 and multi-user B4. Those results
-are outside this specification; it is not yet an isolated first-workload
-command. [Benchmark task #10](https://github.com/0xalkinun/baretile/issues/10)
-must provide that isolation and a comparable vendor measurement before a
-performance claim. `--quick` cuts layers and sizes, so it cannot qualify a
-model. There is no tokens/s release floor yet: establish the hardware baseline
-before choosing an optimization target. Simulator times do not estimate card
+are outside this specification, so the first workload's own numbers come from
+`test/workload.py time`.
+[Benchmark task #10](https://github.com/0xalkinun/baretile/issues/10) must
+provide a comparable vendor measurement before a performance claim. `--quick`
+cuts layers and sizes, so it cannot qualify a model. There is no tokens/s
+release floor yet: establish the hardware baseline before choosing an
+optimization target. Simulator times do not estimate card
 speed.
 
 Publish a result for each gate as passed, failed or not run, with commands,

@@ -2086,6 +2086,39 @@ def test_serve_command(tmp_path):
     server.kill()
     server.wait()
 
+@pytest.mark.skipif(pci.simulator() is None, reason="the commands open the device in processes of their own, and a card can't be open in two")
+def test_workload_commands(tmp_path, monkeypatch):
+  # test/workload.py runs the first workload's timing protocol and its HTTP gate, here on a small random Llama with a
+  # reference file of its own. time runs each process fresh, the first compiling its kernels into a cache of the test's
+  # own and the second finding them, and both pick the same tokens. http passes the three prompts in both forms and gets its slot back from a
+  # cancelled stream. A reference file that doesn't exist fails both runs, and the command exits with an error.
+  torch = pytest.importorskip("torch")
+  import workload
+  rng, dim, ffn, vocab = np.random.default_rng(7), 128, 128, 256
+  w = lambda *shape: (rng.normal(0, 0.1, shape).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
+  weights = {"model.embed_tokens.weight": w(vocab, dim), "lm_head.weight": w(vocab, dim), "model.norm.weight": w(dim),
+             **{f"model.layers.0.{n}.weight": w(dim) for n in ("input_layernorm", "post_attention_layernorm")},
+             **{f"model.layers.0.self_attn.{n}_proj.weight": w(r, dim) for n, r in (("q", dim), ("k", 64), ("v", 64), ("o", dim))},
+             **{f"model.layers.0.mlp.{n}_proj.weight": w(*rc) for n, rc in (("gate", (ffn, dim)), ("up", (ffn, dim)), ("down", (dim, ffn)))}}
+  safetensors(tmp_path / "model.safetensors", {k: ("BF16", v) for k, v in weights.items()})
+  (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", "hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1,
+                                                    "num_hidden_layers": 1, "rms_norm_eps": 1e-5, "rope_theta": 1e4, "max_position_embeddings": 1024,
+                                                    "vocab_size": vocab, "intermediate_size": ffn}))
+  bytes_tokenizer(tmp_path)
+  torch.save({"reference_tokens": torch.tensor(rng.integers(0, vocab, (1, 1024))), "top5_tokens": torch.tensor(rng.integers(0, vocab, (1024, 5)))},
+             tmp_path / "reference.refpt")
+  monkeypatch.setenv("TTSIM", pci.simulator())  # found before XDG_CACHE_HOME moves the cache it may be in
+  monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))  # other tests compile into the shared one meanwhile
+  report = workload.timing(str(tmp_path), str(tmp_path / "reference.refpt"), runs=2, steps=4)
+  assert report["passed"] and len(report["runs"]) == 2 and report["timed"] == 2 and report["median"]["tokens_per_s"] > 0, report["failures"]
+  first, second = report["runs"]
+  assert first["compiled"] > 0 == second["compiled"] and first["kv"] == "bfp8" and len(first["picks"]) == 5, report["runs"]
+  assert set(report["model"]) == {"config.json", "model.safetensors", "reference.refpt", "tokenizer.json"} and report["precision"] == "tt"
+  report = workload.gate(str(tmp_path), tokens=4)
+  assert report["passed"] and report["recovered"] and len(report["prompts"]) == 3, report["failures"]
+  missing = workload.timing(str(tmp_path), str(tmp_path / "missing.refpt"), runs=2, steps=4)
+  assert not missing["passed"] and len(missing["failures"]) == 2 and "missing.refpt" in missing["failures"][0]["output"], missing["failures"]
+
 def test_serve_timeout(tmp_path, start):
   # A request that receives no text within wait seconds must release its slot. A complete response gets HTTP 504, and a
   # stream ends with a chunk whose finish_reason is error, then [DONE]. The stand-in engine accepts requests without answering.

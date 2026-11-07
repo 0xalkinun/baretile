@@ -6,9 +6,10 @@
 #     --reference path/to/Llama-3.1-8B-Instruct.refpt] [--from stage] [--only stage,stage]
 # On a card, run it from the checkout with TTSIM unset, and as root when tt-kmd doesn't drive the card. On ttsim every
 # stage runs too, but the later ones take hours there. CI's card job will run it on a P150a once it has a runner
-# (docs/bring-up.md). The SmolLM and Llama stages run when their files are given; the Llama one is the first workload's
-# token-accuracy gate (docs/workload.md). --only takes stage names, and a stage it names fails when its files aren't
-# given, so a misspelled or skipped stage can't pass a run that never ran it.
+# (docs/bring-up.md). The SmolLM and Llama stages run when their files are given; the Llama ones are the first
+# workload's token-accuracy gate, its timing protocol and its HTTP gate (docs/workload.md, test/workload.py). --only
+# takes stage names, and a stage it names fails when its files aren't given, so a misspelled or skipped stage can't
+# pass a run that never ran it.
 import argparse, json, os, pathlib, platform, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import pci
@@ -47,6 +48,12 @@ STAGES = [
   ("llama", "the first workload's token accuracy: top-1 90% and top-5 98% over 500 steps",
    [lambda a: a.llama and [PY, "-m", "baretile.models.llama", a.llama, a.reference, "500", "tt"]], 240,
    "the bf16 and NumPy runs that docs/workload.md describes, to tell weight precision from device arithmetic", accurate),
+  ("timing", "the first workload's decode rate and first-token latency, in three fresh processes",
+   [lambda a: a.llama and [PY, "test/workload.py", "time", a.llama, a.reference, str(a.record / "timing.json")]], 180,
+   "timing.json's failures, and whether the runs picked the same tokens"),
+  ("http", "the first workload's single-slot HTTP gate: three prompts with and without streaming, and a cancelled stream",
+   [lambda a: a.llama and [PY, "test/workload.py", "http", a.llama, str(a.record / "http.json")]], 120,
+   "http.json's failures, and the server's last lines of output that it keeps"),
 ]
 
 def run(args):
@@ -74,7 +81,7 @@ def run(args):
       continue
     if missing:  # --only names it, so skipping it would pass a run that never ran it
       entry["result"], passed = "failed: its files weren't given", False
-      print(f"{name:10s}{entry['result']} (--smollm for smollm, --llama and --reference for llama)", file=sys.stderr)
+      print(f"{name:10s}{entry['result']} (--smollm for smollm, --llama and --reference for llama and timing, --llama for http)", file=sys.stderr)
       continue
     log, start = args.record / f"{name}.log", time.monotonic()
     entry |= dict(commands=[" ".join(map(str, a)) for a in argv], log=log.name)
