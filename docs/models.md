@@ -418,17 +418,30 @@ matrix crosses PCIe.
 
 The tokens come from llm.c's `.bin` shards: a 1 KiB header whose first three
 int32s are 20240520, 1 and the token count, then the tokens as uint16s.
-FineWeb's 10B-token sample comes in that form, in shards of 100M tokens:
+FineWeb's 10B-token sample comes in that form, in shards of 100M tokens. The run
+reads its training shards in the order given, then the first again, and with two
+or more files the last is the validation shard. The first launch's run reads ten
+shards, 1B tokens:
 
 ```sh
-hf download kjj0/fineweb10B-gpt2 --repo-type dataset --local-dir fineweb fineweb_train_000001.bin fineweb_val_000000.bin
-python3 -m baretile.models.train fineweb/fineweb_train_000001.bin fineweb/fineweb_val_000000.bin log=train.json
+hf download kjj0/fineweb10B-gpt2 --repo-type dataset --local-dir fineweb fineweb_val_000000.bin $(seq -f fineweb_train_%06g.bin 1 10)
+python3 -m baretile.models.train fineweb/fineweb_train_*.bin fineweb/fineweb_val_000000.bin precision=bf16 steps=1907 log=train.json save=train.npz
 ```
 
 Settings go after the files as `key=value`. Run the command with no arguments to
 list them. Every 250 steps (`val_every`, at least 1) it reports the validation
-loss over the same 20 sequences of the second file, which it checks at the
-start, and `log` writes each step's numbers as a line of JSON. On ttsim, try a
+loss over the same 20 sequences of the validation shard, which it checks at the
+start, and `log` writes each step's numbers as a line of JSON.
+
+With `save`, the run keeps its weights, AdamW's state and its step in that file
+every 100 steps (`save_every`) and at the end, and replaces the file only once
+the new one is on disk. For GPT-2 124M it's 1.5 GB. The same command run again
+resumes after the saved step, reading on from where that step stopped. It
+refuses a file saved with other settings or shards, though `log`, `save`,
+`save_every`, `val_every` and `val_batches` may change. The steps that ran after
+the last save run again, so the log can hold such a step twice, with the same
+loss. `test_train_resume` checks that a run stopped and resumed ends as one that
+ran straight through, bit for bit. On ttsim, try a
 small model, such as `layers=2 dim=64 heads=2 ctx=32 accum=2 steps=10 warmup=2`,
 with a short warmup so the rate rises within its steps. A step of that model
 takes about half a minute on ttsim v1.11.5, most of it the output layer over the
