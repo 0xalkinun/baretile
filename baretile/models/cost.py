@@ -1,8 +1,9 @@
-# Estimate serving memory, throughput and cost from config.json, without loading weights.
+# Estimate serving memory, throughput and cost from config.json, without loading weights, or how long GPT-2 trains.
 # Count weight and cache traffic, matmuls and launches for the chosen precision. Launch counts come
 # from ttsim; default card rates use specifications and assumptions. To use hardware measurements,
 # run python3 -m baretile.probe 8 probe.json, then pass probe=probe.json here.
 #   python3 -m baretile.models.cost path/to/model [bf16|bfp8|bfp4|tt|experts] [key=value ...]
+#   python3 -m baretile.models.cost train [key=value ...]
 # Available settings are in CARD and USE.
 import json, math, os, sys
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from baretile import bh
 from baretile.kernels import attention_plan, grid_parts
 from baretile.tensix import CHUNKS, tile_bytes
 from baretile.tensor import FIDELITY
-from baretile.models import llama
+from baretile.models import llama, train
 
 BYTES = {d: tile_bytes(d) / 1024 for d in ("bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
 # Launches in a decode step, counted on ttsim at Qwen3.6's shapes with eight slots:
@@ -52,6 +53,15 @@ CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # 8 GDDR6 banks of 4 
 # context is the number of positions in a session's slot. They're all filled, so a step reads every row. kv is the KV
 # cache's format, and report uses the mode's unless you set it. accept is the share of drafts that get accepted.
 USE = dict(context=32768, kv="bf16", accept=0.0)
+# Bytes a training sequence of baretile.models.train reads, from ttsim-chaos's read counter, which counts every NoC read,
+# copies within a tile's L1 included, and no writes. A block reads a fixed amount, then some a token and some a pair of
+# tokens, as attention's scores do. The rest, the embeddings, the output layer and the loss, reads a fixed amount, some
+# a token, some a vocabulary entry and some a token and entry, as the logits do. AdamW's update reads TRAIN_UPDATE bytes
+# a parameter in either precision. Fitted at GPT-2's width, 768 with 12 heads, to a sequence and an update at 1 and 2
+# blocks, 128 to 1,024 tokens and 1,024 and 8,192 entries, all within 0.1% for a sequence and 7% for an update (#49).
+TRAIN_READS = {"fp32": dict(block=(2.88e8, 1.30e6, 1590), rest=(3.36e6, 5.69e4, 3.74e4, 131)),
+               "bf16": dict(block=(1.21e8, 5.76e5, 618), rest=(2.10e6, 8.72e4, 2.81e4, 67.4))}
+TRAIN_UPDATE = 42
 
 def probed(card, path):  # the card with the probe's numbers in place of the spec's (python3 -m baretile.probe 8 path)
   with open(path) as f: p = json.load(f)
@@ -206,6 +216,47 @@ def prompt(c, s, use, card, chunk, cards=1):
     seconds += max(reads / (card["bandwidth"] * card["reach"] * cards), work / (card["tflops"] * cards))
   return SimpleNamespace(seconds=seconds, rate=n / seconds, flops=total_flops, work=total_work)
 
+def training(c, card):
+  """Estimate a step of baretile.models.train with its settings c: c.accum sequences, then an update. Return FLOPs,
+  matmul work in phase-weighted FLOPs, the parameters, the bytes a sequence and the update read and the step's reads,
+  the seconds the matmuls and the reads take, and the step's seconds, the longer of the two. A matmul's backward is two more matmuls,
+  and the embedding's gradient is a matmul by the tokens' one-hot rows, which reads the fp32 gradient as two bf16
+  parts. An fp32 matmul is three bf16 ones. Launches, the SFPU's work and RISC-V control are left out."""
+  if (c.dim, c.heads) != (768, 12): raise ValueError("TRAIN_READS were measured at GPT-2's width, 768 with 12 heads")
+  n, d, v, r = c.ctx, c.dim, c.vocab, TRAIN_READS[c.precision]
+  forward = c.layers * (2 * n * 12 * d * d + 4 * n * n * d) + 2 * n * d * v  # attention's products cover all n keys
+  hot = 2 * v * n * d
+  flops = c.accum * (3 * forward + hot)
+  work = c.accum * FIDELITY * (3 * forward * (3 if c.precision == "fp32" else 1) + 2 * hot)
+  block = r["block"][0] + r["block"][1] * n + r["block"][2] * n * n
+  sequence = c.layers * block + sum(k * x for k, x in zip(r["rest"], (1, n, v, n * v)))
+  params = c.layers * (12 * d * d + 13 * d) + (v + n + 2) * d  # a block's matrices, biases and norms, the embeddings and ln_f
+  update = TRAIN_UPDATE * params
+  reads = c.accum * sequence + update
+  compute, dram = work / card["tflops"], reads / (card["bandwidth"] * card["reach"])
+  return SimpleNamespace(flops=flops, work=work, params=params, sequence=sequence, update=update, reads=reads, compute=compute,
+                         dram=dram, seconds=max(compute, dram))
+
+def training_report(**keys):
+  """Estimate baretile.models.train's step and run, in each precision unless keys set one. Keyword arguments override
+  its settings (train.GPT2) and CARD's, and probe=path takes the card's rates from a probe's record."""
+  card, c = dict(CARD), SimpleNamespace(**train.GPT2)
+  if unknown := keys.keys() - (card.keys() | train.GPT2.keys() | {"probe"}): raise ValueError(f"unknown settings: {', '.join(sorted(unknown))}")
+  if "probe" in keys: card = probed(card, keys["probe"])
+  for k, v in keys.items():
+    if k in train.GPT2: setattr(c, k, type(train.GPT2[k])(v))
+    elif k != "probe": card[k] = float(v)
+  if c.precision not in TRAIN_READS: raise ValueError(f"precision must be fp32 or bf16, not {c.precision}")
+  tokens = c.accum * c.ctx
+  rows = {p: training(SimpleNamespace(**vars(c) | dict(precision=p)), card) for p in ([c.precision] if "precision" in keys else TRAIN_READS)}
+  out = [f"GPT-2, {c.layers} blocks {c.dim} wide, {next(iter(rows.values())).params / 1e6:.1f}M parameters: {tokens:,} tokens a step, "
+         f"{c.steps:,} steps, {tokens * c.steps / 1e9:.1f}B tokens",
+         "  precision   TFLOP a step   matmuls, s   GB read   reads, s   step, s   tokens/s   all steps, hours"]
+  for p, t in rows.items():
+    out.append(f"  {p:9s} {t.flops / 1e12:14.1f} {t.compute:12.2f} {t.reads / 1e9:9,.0f} {t.dram:10.2f} {t.seconds:9.2f} "
+               f"{tokens / t.seconds:10,.0f} {c.steps * t.seconds / 3600:18.1f}")
+  return "\n".join(out)
+
 def hourly(card): return (card["price"] + card["host"]) / (card["years"] * 8766) + (card["watts"] + card["host_watts"]) / 1000 * card["kwh"]
 
 def report(folder, mode="bf16", **keys):
@@ -261,6 +312,7 @@ def report(folder, mode="bf16", **keys):
   return "\n".join(out)
 
 if __name__ == "__main__":
-  if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.models.cost model [mode] [key=value ...]")
-  args = [a for a in sys.argv[2:] if "=" not in a]
-  print(report(sys.argv[1], args[0] if args else "bf16", **dict(a.split("=", 1) for a in sys.argv[2:] if "=" in a)))
+  if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.models.cost model [mode] [key=value ...]\n"
+                                "       python3 -m baretile.models.cost train [key=value ...]")
+  args, keys = [a for a in sys.argv[2:] if "=" not in a], dict(a.split("=", 1) for a in sys.argv[2:] if "=" in a)
+  print(training_report(**keys) if sys.argv[1] == "train" else report(sys.argv[1], args[0] if args else "bf16", **keys))

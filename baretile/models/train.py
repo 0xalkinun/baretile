@@ -1,10 +1,10 @@
-# Train GPT-2 from scratch on GPT-2 tokens, in fp32 with AdamW. A step adds up the gradients of c.accum sequences of
-# c.ctx tokens, clips their norm and updates the weights, and each of those runs as a replayed recording (tensor.jit),
-# so the host only sends each sequence's tokens. The tokens come from llm.c's .bin shards, such as FineWeb's
-# (docs/models.md#training).
+# Train GPT-2 from scratch on GPT-2 tokens with AdamW, in fp32 or bf16. A step adds up the gradients of c.accum
+# sequences of c.ctx tokens, clips their norm and updates the weights, and each of those runs as a replayed recording
+# (tensor.jit), so the host only sends each sequence's tokens. The tokens come from llm.c's .bin shards, such as
+# FineWeb's (docs/models.md#training).
 #   python3 -m baretile.models.train train.bin [val.bin] [key=value ...]
 # GPT2 has the settings and their defaults: GPT-2 124M's shape, and nanoGPT's schedule and AdamW.
-import json, math, sys, time
+import json, math, operator, sys, time
 from types import SimpleNamespace
 import numpy as np
 from baretile.tensor import Tensor, jit
@@ -14,8 +14,10 @@ from baretile.models import gpt2
 # is 512 sequences, 524,288 tokens, and 19,073 steps read FineWeb's 10B tokens once. The learning rate warms up
 # linearly over warmup steps, then follows a cosine down to a tenth at the last step. AdamW decays the matrices and
 # embeddings, but not the biases or the layer norms. log names a file for each step's numbers, as JSON lines.
+# precision is fp32, or bf16 as PyTorch's autocast has it: the matmuls multiply bf16 operands, while the weights, their
+# gradients, AdamW's state and everything else stay fp32. An fp32 matmul is three bf16 ones (docs/compiler.md).
 GPT2 = dict(layers=12, dim=768, heads=12, ctx=1024, vocab=50304, accum=512, steps=19073, lr=6e-4, warmup=700, decay=0.1, b1=0.9, b2=0.95,
-            eps=1e-8, clip=1.0, val_every=250, val_batches=20, seed=0, log="")
+            eps=1e-8, clip=1.0, val_every=250, val_batches=20, seed=0, log="", precision="fp32")
 
 def shard(path):
   """The GPT-2 tokens in an llm.c .bin shard, memory-mapped. A shard has a 1 KiB header of 256 int32s, starting with
@@ -45,17 +47,21 @@ def init(c, seed=0):
 
 def decays(name): return name.endswith(".weight") and ".ln_" not in name and not name.startswith("ln_")  # AdamW decays the matrices
 
-def forward(ids, w, mask, c):  # like gpt2.forward, but returns logits for all positions and transposes wte for the output layer
+def forward(ids, w, mask, c, mm=operator.matmul):  # like gpt2.forward, but returns logits for all positions and transposes wte
   f = gpt2.fns(w["wte.weight"])
   x = f.rows(w["wte.weight"], ids) + w["wpe.weight"]  # x has c.ctx rows, as many as wpe, so the position embeddings add row by row
-  for l in range(c.layers): x = gpt2.layer(x, gpt2.block(w, f"h.{l}."), mask, c.heads)
-  return gpt2.layernorm(x, w["ln_f.weight"], w["ln_f.bias"]) @ f.t(w["wte.weight"])
+  for l in range(c.layers): x = gpt2.layer(x, gpt2.block(w, f"h.{l}."), mask, c.heads, mm=mm)
+  return mm(gpt2.layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), f.t(w["wte.weight"]))
+
+def matmul(c):  # forward's mm for c.precision. bf16 casts both operands, so a matmul and its gradients are one bf16 matmul each
+  return (lambda a, b: a.cast("bf16") @ b.cast("bf16")) if c.precision == "bf16" else operator.matmul
 
 def cross_entropy(logits, targets):
   """The mean of -log p(target) over positions. targets is an int32 column of token ids, one a row of logits, and the
-  chip compares it with every column's id to pick out the targets, so no one-hot matrix crosses PCIe."""
+  chip compares it with every column's id to pick out the targets, so no one-hot matrix crosses PCIe. bf16 logits are
+  read as fp32, as PyTorch's autocast does."""
   hot = gpt2.columns(logits.rt, logits.cols).eq(targets).cast("fp32")
-  return (logits.log_softmax() * hot).sum() * (-1 / logits.rows)
+  return (logits.cast("fp32").log_softmax() * hot).sum() * (-1 / logits.rows)
 
 def norm(grads):  # the total norm of grads, a 1 x 1 tensor
   return sum(((g * g).sum() for g in grads[1:]), (grads[0] * grads[0]).sum()).sqrt()
@@ -89,11 +95,11 @@ class Trainer:
     self.w = {k: on(a).requires_grad_() for k, a in init(c, c.seed).items()}
     self.grads, self.state = {k: zeros(t) for k, t in self.w.items()}, {k: [zeros(t), zeros(t)] for k, t in self.w.items()}
     self.loss = Tensor.zeros(rt, 1, 1, dtype="fp32")
-    mask = on(gpt2.mask(range(c.ctx), c.ctx))
+    mask, mm = on(gpt2.mask(range(c.ctx), c.ctx)), matmul(c)
     @jit
     def accumulate(ids, targets):  # adds this sequence's share of the gradients onto self.grads and of the loss onto self.loss
       for t in self.w.values(): t.grad = None
-      share = cross_entropy(forward(ids, self.w, mask, c), targets) * (1 / c.accum)
+      share = cross_entropy(forward(ids, self.w, mask, c, mm), targets) * (1 / c.accum)
       share.backward()
       for k, t in self.w.items(): self.grads[k].assign(self.grads[k] + t.grad)
       self.loss.assign(self.loss + share)
@@ -105,7 +111,7 @@ class Trainer:
       for g in [*self.grads.values(), self.loss]: g.assign(zeros(g))
       return total
     self._accumulate, self._update = accumulate, update
-    self._evaluate = jit(lambda ids, targets: cross_entropy(forward(ids, self.w, mask, c), targets))
+    self._evaluate = jit(lambda ids, targets: cross_entropy(forward(ids, self.w, mask, c, mm), targets))
 
   def tokens(self, run):  # a run of ctx + 1 tokens as the ids to read, a row, and the targets to predict, a column
     rt, ids = self.rt, np.asarray(run, np.int32)
@@ -146,6 +152,7 @@ def main():
       setattr(c, k, type(GPT2[k])(v))
   if c.dim % c.heads: sys.exit(f"dim={c.dim} must divide into heads={c.heads} heads")
   if c.val_every < 1: sys.exit(f"val_every={c.val_every} must be at least 1")
+  if c.precision not in ("fp32", "bf16"): sys.exit(f"precision={c.precision} must be fp32 or bf16")
   train, val = sequences(shard(paths[0]), c.ctx), shard(paths[1]) if len(paths) > 1 else None
   if val is not None: next(sequences(val, c.ctx))  # a validation shard too short for a sequence fails now, not at the first validation
   trainer, log = Trainer(Runtime(Chip(pci.open_device())), c), open(c.log, "a") if c.log else None

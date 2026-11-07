@@ -4,7 +4,7 @@
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.models.gpt2 path/to/model.safetensors "prompt" [tokens] [bfp8]
 # Use model.safetensors from openai-community/gpt2 and tiktoken's gpt2 tokenizer. With bfp8,
 # NumPy reads back the converted weights so both versions use the same values.
-import functools, json, math, struct, sys, time
+import functools, json, math, operator, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
 from baretile.tensor import Tensor, jit
@@ -70,23 +70,23 @@ def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 
 def block(w, pre): return {k[len(pre):]: w[k] for k in w if k.startswith(pre)}  # select weights with prefix pre and remove that prefix
 
-def layer(x, p, mask, heads=HEADS, cache=None, places=None):
+def layer(x, p, mask, heads=HEADS, cache=None, places=None, mm=operator.matmul):
   """Run attention and the MLP, each after layer normalization and with a residual addition. p contains weights
   with the h.<layer>. prefix removed. mask is 0 for visible tokens and -1e9 for hidden ones. cache stores
   key heads followed by value heads, with one row per position. Write this call's keys and values at places,
-  then read the cache for attention."""
+  then read the cache for attention. mm multiplies matrices, as @ does unless training casts their operands."""
   f, d = fns(x), x.shape[-1]
   hd = d // heads
-  qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
+  qkv = mm(layernorm(x, p["ln_1.weight"], p["ln_1.bias"]), p["attn.c_attn.weight"]) + p["attn.c_attn.bias"]
   q, k, v = (f.split(qkv[:, i * d:(i + 1) * d], heads) for i in range(3))  # the heads as a batch
   if cache is not None:
     f.put(cache, places, f.split(qkv[:, d:], 2 * heads))
     k, v = cache[:heads, :, :], cache[heads:, :, :]
-  s = q @ f.t(k) * (1 / math.sqrt(hd)) + mask
-  y = f.merge(f.softmax(s) @ v) @ p["attn.c_proj.weight"]  # the heads side by side, then c_proj
+  s = mm(q, f.t(k)) * (1 / math.sqrt(hd)) + mask
+  y = mm(f.merge(mm(f.softmax(s), v)), p["attn.c_proj.weight"])  # the heads side by side, then c_proj
   x = x + (y + p["attn.c_proj.bias"])  # add x last. It's the large one, so it's rounded only once
-  h = layernorm(x, p["ln_2.weight"], p["ln_2.bias"]) @ p["mlp.c_fc.weight"] + p["mlp.c_fc.bias"]
-  return x + (f.gelu(h) @ p["mlp.c_proj.weight"] + p["mlp.c_proj.bias"])
+  h = mm(layernorm(x, p["ln_2.weight"], p["ln_2.bias"]), p["mlp.c_fc.weight"]) + p["mlp.c_fc.bias"]
+  return x + (mm(f.gelu(h), p["mlp.c_proj.weight"]) + p["mlp.c_proj.bias"])
 
 def forward(ids, w, mask, places=None, caches=None):
   """Return logits after ids, using the transposed token embedding as the output layer (w["wte.T"]). places

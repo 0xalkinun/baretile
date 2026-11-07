@@ -403,6 +403,10 @@ Its defaults are GPT-2 124M's shape and nanoGPT's recipe:
 - Weights, gradients and AdamW's state in fp32. AdamW uses betas 0.9 and 0.95,
   and decays the matrices and embeddings by 0.1, but not the biases or the
   layer norms. Gradients are clipped to a norm of 1.
+- Matmuls in fp32, each three bf16 matmuls (see
+  [matmul precision](compiler.md#matmul-precision)). `precision=bf16`
+  multiplies bf16 operands instead, as PyTorch's autocast does, and keeps the
+  weights, gradients, AdamW's state and everything else in fp32.
 - 524,288 tokens a step, as the gradients of 512 sequences added up. The
   learning rate warms up to 6e-4 over 700 steps, then follows a cosine down to
   a tenth of that at the last of 19,073 steps, which read 10B tokens once.
@@ -430,14 +434,15 @@ with a short warmup so the rate rises within its steps. A step of that model
 takes about half a minute on ttsim v1.11.5, most of it the output layer over the
 50,304-token vocabulary.
 
-`test_train_gpt2` trains a small GPT-2 this way on a counting sequence. At each
-step, the loss and gradients must match PyTorch's on the same weights and
-sequences, and the update must be AdamW's, computed in float64 from the
-gradients the chip added up. Nothing has trained on a card yet. llm.c and the
-modded-nanogpt speedrun train GPT-2 124M on FineWeb to a validation loss of
-3.28, and [#9](https://github.com/0xalkinun/baretile/issues/9) tracks doing that
-on a P150a. fp32 matmuls take three bf16 products each, so training speed is
-work for the card.
+`test_train_gpt2` trains a small GPT-2 this way on a counting sequence, in each
+precision. At each step, the loss and gradients must match PyTorch's on the
+same weights and sequences, under autocast for bf16, and the update must be
+AdamW's, computed in float64 from the gradients the chip added up. Nothing has
+trained on a card yet. llm.c and the modded-nanogpt speedrun train GPT-2 124M
+on FineWeb to a validation loss of 3.28, and
+[#9](https://github.com/0xalkinun/baretile/issues/9) tracks doing that on a
+P150a. [Estimating cost](#estimating-cost) says how long a run would take in
+each precision, by the simulator's counts.
 
 [test/train.py](../test/train.py) trains a small character-level GPT-2 on the
 README and these docs, written in tinygrad: llm.c's GPT from tinygrad's
@@ -508,3 +513,26 @@ It estimates how long those reads and the matrix operations take, uses the
 longer time, then adds the cost of launches and RISC-V control code. The number
 of different experts selected and the fraction of drafts accepted will change
 with your workload.
+
+`python3 -m baretile.models.cost train` estimates a step and a run of
+`baretile.models.train` instead, at its defaults or with its settings, such as
+`precision=bf16` or `steps=1907`, and the card's, such as `probe=probe.json`:
+
+```text
+GPT-2, 12 blocks 768 wide, 124.5M parameters: 524,288 tokens a step, 19,073 steps, 10.0B tokens
+  precision   TFLOP a step   matmuls, s   GB read   reads, s   step, s   tokens/s   all steps, hours
+  fp32               488.6         8.66    24,647      68.77     68.77      7,624              364.3
+  bf16               488.6         3.22    10,902      30.42     30.42     17,236              161.2
+```
+
+It counts the matmuls' FLOPs and their fidelity phases: each matmul's backward
+is two more, the embedding's gradient is a matmul by the tokens' one-hot rows,
+and an fp32 matmul is three bf16 ones. The bytes a sequence reads come from
+ttsim-chaos's read counter at GPT-2's width, fitted as `TRAIN_READS` in
+[cost.py](../baretile/models/cost.py) describes. That counter counts every NoC
+read, copies within a tile's L1 included, and no writes, so these are counts on
+the simulator, not DRAM traffic measured on a card, and the times use the
+assumed 70% of 512 GB/s. By these counts a step is limited by its reads in
+either precision, most of them attention's scores and the logits, so making
+those fewer would shorten a step more than the matmuls' precision does. Launches,
+the SFPU's work and RISC-V control are left out.

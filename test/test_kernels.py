@@ -1915,8 +1915,8 @@ def test_autograd(chip):
   # This checks the ops' backward passes against numpy, on fp32 tensors with odd shapes and broadcasting. The loss is
   # sum(f(inputs) * w), with w random so that the elements of the gradient differ, and the reference gradient comes
   # from central differences in float64. Matmuls are within the FPU's 2^-11, the rest within fp32 rounding. Then come a
-  # bf16 leaf, whose gradient comes back through the cast, a tensor read twice, whose gradients add, and .grad adding
-  # up over two backward passes.
+  # bf16 leaf, whose gradient comes back through the cast, a bf16 result's gradient, in bf16, a tensor read twice, whose
+  # gradients add, and .grad adding up over two backward passes.
   rt, rng = Runtime(chip), np.random.default_rng(11)
   softmax = lambda a, ax: np.exp(a - a.max(ax, keepdims=True)) / np.exp(a - a.max(ax, keepdims=True)).sum(ax, keepdims=True)
   norm = lambda a: (a - a.mean(2, keepdims=True)) / np.sqrt(a.var(2, keepdims=True) + 1e-5)
@@ -1969,6 +1969,9 @@ def test_autograd(chip):
   ta, tb, tw = Tensor.of(rt, a.tolist(), "fp32").requires_grad_(), Tensor.of(rt, b.tolist()).requires_grad_(), Tensor.of(rt, w.tolist(), "fp32")
   ((ta * tb + ta * ta) * tw).sum().backward()
   assert tb.grad.dtype == "bf16" and np.allclose(value(tb.grad)[0], a * w, rtol=2**-8, atol=2**-8), "a bf16 leaf, through the cast"
+  y = ta.cast("bf16") * tb  # read by fp32 ops, a bf16 result still gets a bf16 gradient, as in PyTorch
+  gy = (y * tw).sum().gradient(y)[0]
+  assert gy.dtype == "bf16" and np.allclose(value(gy)[0], w, rtol=2**-8, atol=0), "a bf16 result's gradient, in bf16"
   assert np.allclose(value(ta.grad)[0], (b + 2 * a) * w, rtol=1e-6, atol=1e-6), "ta read twice: the gradients add"
   (ta * tw).sum().backward()
   assert np.allclose(value(ta.grad)[0], (b + 2 * a) * w + w, rtol=1e-6, atol=1e-6), ".grad adds up"

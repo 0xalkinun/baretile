@@ -121,7 +121,9 @@ overlaps a matmul input or an input laid out differently.
 
 Autograd walks the expression backwards and builds tensor operations for the
 gradients. `backward()` queues the forward value and every leaf gradient before
-returning, so sequential parameter updates use the same forward values.
+returning, so sequential parameter updates use the same forward values. As in
+PyTorch, a bf16 result's gradient is bf16, even where fp32 operations read the
+result, so a bf16 matmul's backward is bf16 matmuls rather than split fp32 ones.
 `gradient()` returns lazy expressions; realize all of them before changing any
 forward operand. `test_autograd` checks gradients against numerical differences.
 [test/train.py](../test/train.py) compares a small GPT training run with
