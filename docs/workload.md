@@ -271,8 +271,52 @@ fails or the runs pick different tokens. On ttsim its times are ttsim's clock:
 python3 test/workload.py time "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" timing.json
 ```
 
+The report also keeps the host's peak memory and the card DRAM baretile
+allocated. `precision=bf16` runs the `bf16` diagnostic instead, and `runs=` and
+`steps=` change the protocol's counts.
+
 CI runs both commands on a small random Llama with a reference file of its own
 (`test_workload_commands`), not on these checkpoints.
+
+### The vendor stacks
+
+`stack=` runs the same protocol on another stack on the same card, with the
+same checkpoint and prompt, so that
+[#10](https://github.com/0xalkinun/baretile/issues/10) can compare them. The
+report has the same fields and the vendor's commit:
+
+```sh
+# TT-NN, from tt-metal's Python environment, at the reference's commit 9f98dee
+TT_METAL_HOME=/path/to/tt-metal \
+  python3 test/workload.py time "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" ttnn.json stack=ttnn
+# blackhole-py, at commit dd4f882, in bf16 from this checkpoint and in FP8 from RedHat's
+BLACKHOLE_PY=/path/to/blackhole-py \
+  python3 test/workload.py time "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" blackhole-py.json stack=blackhole-py
+BLACKHOLE_PY=/path/to/blackhole-py \
+  python3 test/workload.py time "$WORKLOAD_DIR/Llama-3.1-8B-Instruct-FP8" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" blackhole-py-fp8.json stack=blackhole-py precision=fp8
+```
+
+The FP8 run needs [RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8](https://huggingface.co/RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8/tree/870a1177ed082c0ba5dbefd62573ab8f91803f6a)
+at `870a1177ed082c0ba5dbefd62573ab8f91803f6a`. It's a different checkpoint, the
+same model quantized with one scale per tensor, so its run is blackhole-py's
+fastest mode beside the others, not the same input. Each stack keeps its own
+boundaries where it has no other:
+
+- **TT-NN** runs Tenstorrent's demo, `simple_text_demo.py`'s batch-1 run at its
+  performance precision, which `tt` follows. The prompt goes to it as text, and
+  its tokenizer gives back the same 512 ids. Each step's time is 1 over the rate
+  the demo logs for that step, to 0.1 tokens/s, so the rate counts the same 198
+  steps. The demo also reports its own rate over 199, which the report keeps.
+  Its first token is its second prefill, after one that compiles. Its load
+  includes the upload, and its picks are the text it made.
+- **blackhole-py** runs its `Llama3Decode`, with this checkpoint's RoPE scaling
+  and EOS ids in place of the Llama 3 ones it has. It has no prefill, so its
+  first token's time is the prompt's 512 positions decoded one at a time. Its
+  picks stay on the card, so a step runs from its replay to its pick read back.
+
+Neither runs on ttsim. CI checks how the script reads the demo's log
+(`test_workload_demo_log`) and drives blackhole-py's decode
+(`test_workload_blackhole_py`, with a stand-in for its package).
 
 The broader benchmark command is:
 
@@ -283,9 +327,9 @@ BOOK="$REF_DIR/tale-of-two-cities.txt.bz2" \
 
 It also runs B1, batch-32 B2, long-context B3 and multi-user B4. Those results
 are outside this specification, so the first workload's own numbers come from
-`test/workload.py time`.
-[Benchmark task #10](https://github.com/0xalkinun/baretile/issues/10) must
-provide a comparable vendor measurement before a performance claim. `--quick`
+`test/workload.py time`, and the vendors' from its `stack=` runs. A
+performance claim needs those vendor measurements beside it
+([#10](https://github.com/0xalkinun/baretile/issues/10)). `--quick`
 cuts layers and sizes, so it cannot qualify a model. There is no tokens/s
 release floor yet: establish the hardware baseline before choosing an
 optimization target. Simulator times do not estimate card
