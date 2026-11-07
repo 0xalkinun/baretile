@@ -204,6 +204,13 @@ python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.re
 On the host, the NumPy path meets the B2 gate at `tt` with no top-5 margin:
 458/500 top-1 and 490/500 top-5, against 499 and 500 in `bf16`. Its products are
 exact, so `tt` comes to the card with no top-5 room for the chip's own rounding.
+If the card misses the gate, the fallback is ready
+([#47](https://github.com/0xalkinun/baretile/issues/47)): the MLP's gate and up
+in bfp8 at two phases in blocks 16 to 23, as `tt` already has them in block 31.
+On the host, with the bits the FPU's phases drop taken out, that's 467/500 top-1
+and 497/500 top-5, for about 6% of the decode rate by the cost model. It becomes
+`tt` only through a reviewed change to the precision table, with #47's numbers
+as its evidence.
 
 For the HTTP case, start one slot, 1,024 positions, `tt` precision and bfp8 KV:
 

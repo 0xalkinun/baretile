@@ -438,11 +438,15 @@ takes about half a minute on ttsim v1.11.5, most of it the output layer over the
 precision. At each step, the loss and gradients must match PyTorch's on the
 same weights and sequences, under autocast for bf16, and the update must be
 AdamW's, computed in float64 from the gradients the chip added up. Nothing has
-trained on a card yet. llm.c and the modded-nanogpt speedrun train GPT-2 124M
-on FineWeb to a validation loss of 3.28, and
-[#9](https://github.com/0xalkinun/baretile/issues/9) tracks doing that on a
-P150a. [Estimating cost](#estimating-cost) says how long a run would take in
-each precision, by the simulator's counts.
+trained on a card yet. The first launch's run
+([#9](https://github.com/0xalkinun/baretile/issues/9)) trains GPT-2 124M on
+FineWeb for 1B tokens in bf16, `precision=bf16 steps=1907`, and publishes its
+validation loss curve beside llm.c's, trained on the same shards with the same
+settings. By the simulator's counts in [Estimating cost](#estimating-cost),
+that's about 16 hours. llm.c and the modded-nanogpt speedrun train GPT-2 124M to
+a validation loss of 3.28. llm.c takes 10B tokens to get there with this recipe,
+about a week in bf16 by the same estimate, so 3.28 waits for a step that reads
+less ([#54](https://github.com/0xalkinun/baretile/issues/54)).
 
 [test/train.py](../test/train.py) trains a small character-level GPT-2 on the
 README and these docs, written in tinygrad: llm.c's GPT from tinygrad's
