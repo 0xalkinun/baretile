@@ -2216,10 +2216,82 @@ def test_workload_commands(tmp_path, monkeypatch):
   first, second = report["runs"]
   assert first["compiled"] > 0 == second["compiled"] and first["kv"] == "bfp8" and len(first["picks"]) == 5, report["runs"]
   assert set(report["model"]) == {"config.json", "model.safetensors", "reference.refpt", "tokenizer.json"} and report["precision"] == "tt"
+  assert report["stack"] == "baretile" and first["dram_gb"] > 0 and report["median"]["host_peak_gb"] > 0, report
+  with pytest.raises(ValueError, match="ttnn runs at tt, not bf16"): workload.timing(str(tmp_path), "", stack="ttnn", precision="bf16")
   report = workload.gate(str(tmp_path), tokens=4)
   assert report["passed"] and report["recovered"] and len(report["prompts"]) == 3, report["failures"]
   missing = workload.timing(str(tmp_path), str(tmp_path / "missing.refpt"), runs=2, steps=4)
   assert not missing["passed"] and len(missing["failures"]) == 2 and "missing.refpt" in missing["failures"][0]["output"], missing["failures"]
+
+def test_workload_demo_log():
+  # stack=ttnn reads each step's rate, the load, the first token, the prompt's length and the text from Tenstorrent's
+  # demo log, in the lines simple_text_demo.py writes at tt-metal 9f98dee. A log without every step's rate fails.
+  import workload
+  line = lambda level, text: f"2026-11-07 12:00:00.000 | {level: <8} | simple_text_demo:test_demo_text:1 - {text}"
+  rates = [2.0, 40.0, 50.0, 25.0]
+  log = "\n".join([line("INFO", "Encoded prompt lengths:512"), line("INFO", "Model build (load_weights) took 61.25s"),
+                   *(line("DEBUG", f"Iteration {i}: {1000 / r:.0f}ms @ {r:.1f} tok/s/user ({r:.1f} tok/s throughput)") for i, r in enumerate(rates)),
+                   line("INFO", "\n==REPEAT BATCH 0\n==USER 0 - PROMPT\nIt was the best \n==USER 0 - OUTPUT\nof times,\n\nit was\n"),
+                   line("INFO", "Average Time to First Token (TTFT): 85.5ms"),
+                   line("INFO", "Average speed: 26.67ms @ 37.5 tok/s/user (37.5 tok/s throughput)")])
+  run = workload.demo(log, 4)
+  assert run["step_s"] == [1 / r for r in rates] and run["load_s"] == 61.25 and run["first_token_s"] == pytest.approx(0.0855), run
+  assert run["prompt_tokens"] == 512 and run["tt_tokens_per_s"] == 37.5 and run["picks"] == "of times,\n\nit was", run
+  with pytest.raises(RuntimeError, match="rate of 3 steps, not 4"): workload.demo("\n".join(l for l in log.split("\n") if "Iteration 3" not in l), 4)
+
+# A stand-in for blackhole-py's examples.llama3, with its config's fields and its decode's calls. Each pick is the token
+# at the position before plus the RoPE factor, and the device appends it to the history as blackhole-py's does.
+BLACKHOLE_PY = """
+import dataclasses
+@dataclasses.dataclass(frozen=True)
+class Llama3Config:
+  model: str
+  dtype: str
+  checkpoint: str
+  rope_factor: float
+  eos_token_ids: frozenset
+  rope_theta = 500000.0
+  rope_low_freq_factor = 1.0
+  rope_high_freq_factor = 4.0
+  rope_original_max_position_embeddings = 8192
+  @classmethod
+  def create(cls, model, dtype): return cls(model, dtype, f"weights/llama3-{model}-{dtype}", 1.0, frozenset((128001, 128009)))
+class Llama3Decode:
+  def __init__(self, cfg, device_index):
+    assert cfg.checkpoint.endswith("model") and cfg.eos_token_ids == {128001, 128008, 128009} and device_index == 0, cfg
+    self.cfg, self.profile, self.history, self.next = cfg, {"weight_upload_total_s": 0.0}, None, 0
+  def load_tokens(self, tokens): self.history = [int(t) for t in tokens]
+  def decode(self, position, logits=True, append=True):
+    assert position == self.next and logits == append == (position >= len(self.history) - 1), (position, logits, append)
+    self.next += 1
+    token = self.history[position] + int(self.cfg.rope_factor)
+    if append: self.history.append(token)
+    return (token if logits else None), 1.0
+  def close(self): pass
+"""
+
+def test_workload_blackhole_py(tmp_path, monkeypatch):
+  # stack=blackhole-py drives Llama3Decode as blackhole-py's own decode benchmark does: the prompt's positions without
+  # picks, then a pick from the prompt's last position and from each one after it, which the device feeds back. The
+  # model folder's RoPE factor and EOS ids replace its Llama 3 ones. A model whose other RoPE settings it doesn't have fails.
+  torch = pytest.importorskip("torch")
+  import workload
+  package, model = tmp_path / "blackhole-py" / "examples" / "llama3", tmp_path / "model"
+  package.mkdir(parents=True)
+  model.mkdir()
+  (package.parent / "__init__.py").write_text("")
+  (package / "__init__.py").write_text(BLACKHOLE_PY)
+  rope = {"factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192, "rope_type": "llama3"}
+  (model / "config.json").write_text(json.dumps({"rope_theta": 500000.0, "rope_scaling": rope, "eos_token_id": [128001, 128008, 128009]}))
+  tokens = np.random.default_rng(3).integers(0, 1000, 1024)
+  torch.save({"reference_tokens": torch.tensor(tokens[None]), "top5_tokens": torch.zeros((1024, 5), dtype=torch.int64)}, model / "reference.refpt")
+  monkeypatch.setenv("BLACKHOLE_PY", str(package.parent.parent))
+  report = workload.timing(str(model), str(model / "reference.refpt"), runs=2, steps=4, stack="blackhole-py")
+  assert report["passed"] and report["precision"] == "bf16" and report["median"]["tokens_per_s"] > 0, report["failures"]
+  assert [r["picks"] for r in report["runs"]] == 2 * [[int(tokens[511]) + 8 * i for i in range(1, 6)]], report["runs"]
+  (model / "config.json").write_text(json.dumps({"rope_theta": 1e4, "rope_scaling": rope, "eos_token_id": [128001]}))
+  failed = workload.timing(str(model), str(model / "reference.refpt"), runs=1, steps=4, stack="blackhole-py")
+  assert not failed["passed"] and "RoPE settings" in failed["failures"][0]["output"], failed["failures"]
 
 def test_serve_timeout(tmp_path, start):
   # A request that receives no text within wait seconds must release its slot. A complete response gets HTTP 504, and a
