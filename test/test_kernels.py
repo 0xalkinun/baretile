@@ -966,6 +966,18 @@ def test_accumulate_parts(chip):
   bound = 2**-10 * (np.abs(a[:, :first]) @ np.abs(b[:first])) + 2**-20 * (np.abs(a) @ np.abs(b))
   assert np.all(np.abs(got - want) <= bound), np.abs(got - want).max()
 
+def test_zeroing_after_other_kernels(chip):
+  # A kernel's math thread starts with the Dst and the Dst counter that earlier kernels left, and where ZEROACC zeroes
+  # depends on the counter (math_begin). Here a kernel adds SrcA's tile of 1s to SrcB's into Dst's first 256 rows, 8
+  # an ELWADD, which leaves them 2s and the counter at 256. The matmul after it must still start from zeros (#55).
+  rt, rng = Runtime(chip, end=chip.tensix[1]), np.random.default_rng(43)
+  chip.write(*rt.cores[0], tensix.slot_base("bf16") + 2048, np.full(1024, 0x3F80, np.uint16).tobytes())  # slot 1: 1s
+  fill = tensix.aim(0) + [tensix.ins("SETRWC", bit_mask=0b1111)] + [tensix.ins("ELWADD", dst=0)] * 31
+  rt.launch(compile_kernel(None, tensix.unpack_program(tensix.tt(tensix.unpack(1, 1)), tensix.kernel_config()),
+                           tensix.math_program({}, tensix.tt(fill + [tensix.release(tensix.ins("ELWADD", dst=0))]))), (), 1)
+  a, b = bf16(rng.normal(0, 1, (32, 96))), bf16(rng.normal(0, 1, (96, 64)))
+  close(Tensor.of(rt, a.tolist()) @ Tensor.of(rt, b.tolist()), a @ b, 0.02)
+
 def test_matmul_indexed(chip):
   # x.matmul(w, index=ids) is the matmul of a mixture of experts. Entry b of the result is row b // k of x times the
   # matrix of w that ids[b // k, b % k] picks. BRISC reads ids on the chip, so a replay uses the experts that its tokens

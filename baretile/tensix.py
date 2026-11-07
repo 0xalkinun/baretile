@@ -210,9 +210,13 @@ def aim(row):
 # In the C programs, h is the first Dst row of the half that the next op gets, 0 or DST_HALF. h ^= DST_HALF moves on.
 DST_FREE = ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)  # waits until a Dst half is free
 # Waits for a free Dst half and aims the FPU at it. If the math accumulates, it also zeroes the half, 16 rows at a time.
+# Where ZEROACC zeroes isn't only `where`: with the offset plus the Dst counter at 256 or more, it zeroes rows 256
+# further on (ttsim's ZEROACC). The counter moves 8 rows an instruction and lasts from one kernel to the next, so it
+# starts from 0 here.
 def math_begin(zero):
-  return [DST_FREE, *aim("h")] + [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b),
-                                        "h / 16") for b in range(4) if zero]
+  return [DST_FREE, *aim("h")] + ([ins("SETRWC", bit_mask=0b0100)] +
+                                  [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16")
+                                   for b in range(4)] if zero else [])
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
             ins("SEMPOST", sem_sel=SEM_DST)]
 # packs 64 Dst rows from `row` into an L1 slot, then frees them and posts the semaphores in done
