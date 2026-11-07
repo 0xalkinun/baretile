@@ -249,6 +249,7 @@ jobs:
           TTSIM_CHAOS_RISCV: 0.2
           TTSIM_CHAOS_TENSIX: 0.2
           TTSIM_CHAOS_MATH: 1,40
+          TTSIM_CHAOS_OUTSTANDING: 1,2  # tile (1, 2)'s NoC counter as a card's reset leaves it (#4)
           TTSIM_CHAOS_SEED: ${{ github.run_number }}
   # The check that main's branch protection requires: it passes when every job above passed, so they can be split or
   # renamed without changing the repository's settings. It runs even when one fails, since a skipped check would pass.

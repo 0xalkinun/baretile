@@ -205,7 +205,11 @@ Multicast needs broadcast, path reservation and static VC class 2. Count write
 acknowledgements from the recipients. The outstanding-request counter goes up
 once for the send, then down once per recipient, so it won't tell you when the
 multicast is done. `mcast_done` waits for acknowledgements and clears the
-affected counters after transfers have finished.
+affected counters after transfers have finished. A card's reset doesn't clear
+them: after one, its firmware's clear of L1 by multicast from (1, 2) leaves that
+tile about 14,000 requests counted for transaction ID 0. So a new runtime
+clears every counter of its tiles while it holds them in reset, before their
+firmware starts ([#4](https://github.com/0xalkinun/baretile/issues/4)).
 
 ## Ethernet links
 

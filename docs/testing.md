@@ -166,15 +166,17 @@ Set `TTSIM_CHAOS_SEED` to repeat a run. `TTSIM_CHAOS_UNHARVESTED=1` enables all
 `TTSIM_CHAOS_OUTSTANDING=x,y` starts Tensix tile (x, y) with 200 requests
 counted as outstanding on NoC 0 for transaction ID 0, and `x,y,n` with n, up to
 255. A P150a's firmware leaves that tile's counter nonzero after a reset, which
-hangs a runtime that waits for it to reach 0
-([#4](https://github.com/0xalkinun/baretile/issues/4)). With
-`TTSIM_CHAOS_OUTSTANDING=1,2`, `python3 -m baretile.hello` hangs at launch 1 on
-(1, 2), and the report lists `NoC requests in flight by id: {0: 200}`. CI
-doesn't set it until the runtime clears the counters itself.
+would hang a runtime that waits for it to reach 0
+([#4](https://github.com/0xalkinun/baretile/issues/4)). A new runtime zeroes the
+counters before its firmware starts, so with `TTSIM_CHAOS_OUTSTANDING=1,2`,
+`python3 -m baretile.hello` passes. Without that, it hangs at launch 1 on (1, 2),
+and the report lists `NoC requests in flight by id: {0: 200}`.
 
 CI builds ttsim-chaos this way for every push to main and every pull request
-that changes more than Markdown. With the four delay settings above and the run
-number as the seed, so each run tries other timings, it runs
+that changes more than Markdown. With the four delay settings above, the run
+number as the seed, so each run tries other timings, and
+`TTSIM_CHAOS_OUTSTANDING=1,2`, so each process boots (1, 2) as a card leaves it,
+it runs
 `test/test_device.py` and `test/test_kernels.py`, the model-specific DeltaNet
 and MoE kernel checks (`test_delta_step`, `test_delta_pieces` and `test_moe`),
 and the kernel ramp (`test_ramp[4_kernel.py]`). The device tests cover the
