@@ -6,7 +6,7 @@ from baretile import pci, tensor
 from baretile.tensor import Tensor
 from baretile.runtime import Bound, Runtime
 from conftest import bf16, value
-import benchmark, train
+import benchmark, train, train_reference
 from baretile.models import cost, gpt2, llama, qwen, serve
 from baretile.models import train as gpt2_train  # test/train.py is train
 
@@ -122,6 +122,35 @@ def test_train_resume(chip, tmp_path, monkeypatch):
     assert sorted(a.files) == sorted(b.files) and all(np.array_equal(a[k], b[k]) for k in a.files)
   with pytest.raises(SystemExit, match="other lr"): run("resumed", "lr=1e-3")
   with pytest.raises(SystemExit, match="other shards"): run("resumed", files=files[1:])
+
+def test_train_reference(chip, tmp_path, monkeypatch, capsys):
+  # test/train_reference.py runs baretile.models.train's recipe in PyTorch, from the same weights and sequences. A small
+  # GPT-2 in fp32 for 4 steps on ttsim, reading two shards, logs the same steps as PyTorch's run: each step's loss and
+  # validation loss within 1e-4, its gradient norm within 1e-4 of it, and the same learning rate. stop=2 runs the first
+  # 2 steps of the same schedule, and compare reports the largest difference in loss. eps=1e-4 keeps Adam's first steps
+  # from following the sign of each gradient, which a matmul's rounding can flip near zero, so the two runs stay close
+  # enough to tell a difference in the recipe, such as decaying every weight, from rounding.
+  pytest.importorskip("torch")
+  from baretile import chip as chips
+  monkeypatch.setattr(pci, "open_device", lambda: None)
+  monkeypatch.setattr(chips, "Chip", lambda device: chip)
+  files = [str(shard(tmp_path / f"{name}.bin", np.arange(150) * k % 90)) for name, k in (("train0", 2), ("train1", 3), ("val", 1))]
+  small = ["layers=2", "dim=64", "heads=2", "ctx=32", "vocab=96", "accum=2", "steps=4", "warmup=2", "lr=1e-2", "eps=1e-4",
+           "val_every=2", "val_batches=1"]
+  monkeypatch.setattr(sys, "argv", ["train", *files, *small, f"log={tmp_path / 'chip.jsonl'}"])
+  gpt2_train.main()
+  for name, extra in (("torch", []), ("first", ["stop=2"])):
+    monkeypatch.setattr(sys, "argv", ["train_reference", *files, str(tmp_path / f"{name}.jsonl"), *small, *extra])
+    train_reference.main()
+  ours, theirs, first = (train_reference.records(tmp_path / f"{n}.jsonl") for n in ("chip", "torch", "first"))
+  assert list(ours) == list(theirs) == [1, 2, 3, 4] and list(first) == [1, 2], (ours, theirs, first)
+  for s, a in ours.items():
+    b = theirs[s]
+    assert abs(a["loss"] - b["loss"]) < 1e-4 and abs(a["norm"] - b["norm"]) < 1e-4 * b["norm"] and a["lr"] == b["lr"], (s, a, b)
+    assert a.keys() == b.keys() and ("val" not in a or abs(a["val"] - b["val"]) < 1e-4), (s, a, b)
+  assert all(first[s]["loss"] == theirs[s]["loss"] for s in first)
+  monkeypatch.setattr(sys, "argv", ["train_reference", "compare", str(tmp_path / "chip.jsonl"), str(tmp_path / "torch.jsonl")])
+  assert abs(train_reference.main()) < 1e-4 and "4 steps in both" in capsys.readouterr().out
 
 def test_training_cost():
   # cost.training counts GPT-2 124M's step at baretile.models.train's defaults: 6 FLOPs a parameter a token for the

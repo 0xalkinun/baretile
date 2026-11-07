@@ -461,6 +461,20 @@ a validation loss of 3.28. llm.c takes 10B tokens to get there with this recipe,
 about a week in bf16 by the same estimate, so 3.28 waits for a step that reads
 less ([#54](https://github.com/0xalkinun/baretile/issues/54)).
 
+[test/train_reference.py](../test/train_reference.py) runs the same recipe in
+PyTorch, from the same initial weights and on the same sequences, and writes its
+log in the same form, for #9's check that the card's first 100 steps follow
+PyTorch's loss curve. It runs on CUDA if PyTorch has it, and `stop` ends it after
+that many steps of the full schedule:
+
+```sh
+python3 test/train_reference.py fineweb/fineweb_train_*.bin fineweb/fineweb_val_000000.bin pytorch.json precision=bf16 steps=1907 stop=100
+python3 test/train_reference.py compare train.json pytorch.json
+```
+
+`test_train_reference` checks it against baretile on ttsim, for a small GPT-2 in
+fp32: over 4 steps on two shards, the two runs' losses stay within 1e-4.
+
 [test/train.py](../test/train.py) trains a small character-level GPT-2 on the
 README and these docs, written in tinygrad: llm.c's GPT from tinygrad's
 examples, with tinygrad's Adam, on baretile through the
