@@ -2,9 +2,10 @@
 # sequences of c.ctx tokens, clips their norm and updates the weights, and each of those runs as a replayed recording
 # (tensor.jit), so the host only sends each sequence's tokens. The tokens come from llm.c's .bin shards, such as
 # FineWeb's (docs/models.md#training).
-#   python3 -m baretile.models.train train.bin [val.bin] [key=value ...]
+#   python3 -m baretile.models.train train.bin [train.bin ...] [val.bin] [key=value ...]
+# It reads the training shards in the order given. With two or more files, the last is the validation shard.
 # GPT2 has the settings and their defaults: GPT-2 124M's shape, and nanoGPT's schedule and AdamW.
-import json, math, operator, sys, time
+import json, math, operator, os, sys, time
 from types import SimpleNamespace
 import numpy as np
 from baretile.tensor import Tensor, jit
@@ -13,11 +14,13 @@ from baretile.models import gpt2
 # 12 blocks 768 wide with 12 heads, on 1,024 tokens, and the vocabulary padded from 50,257 to a multiple of 64. A step
 # is 512 sequences, 524,288 tokens, and 19,073 steps read FineWeb's 10B tokens once. The learning rate warms up
 # linearly over warmup steps, then follows a cosine down to a tenth at the last step. AdamW decays the matrices and
-# embeddings, but not the biases or the layer norms. log names a file for each step's numbers, as JSON lines.
+# embeddings, but not the biases or the layer norms. log names a file for each step's numbers, as JSON lines. save names
+# a file that keeps the run every save_every steps and at the end, and that the same run resumes from.
 # precision is fp32, or bf16 as PyTorch's autocast has it: the matmuls multiply bf16 operands, while the weights, their
 # gradients, AdamW's state and everything else stay fp32. An fp32 matmul is three bf16 ones (docs/compiler.md).
 GPT2 = dict(layers=12, dim=768, heads=12, ctx=1024, vocab=50304, accum=512, steps=19073, lr=6e-4, warmup=700, decay=0.1, b1=0.9, b2=0.95,
-            eps=1e-8, clip=1.0, val_every=250, val_batches=20, seed=0, log="", precision="fp32")
+            eps=1e-8, clip=1.0, val_every=250, val_batches=20, seed=0, log="", precision="fp32", save="", save_every=100)
+UNSAVED = ("log", "save", "save_every", "val_every", "val_batches")  # settings a resumed run may change
 
 def shard(path):
   """The GPT-2 tokens in an llm.c .bin shard, memory-mapped. A shard has a 1 KiB header of 256 int32s, starting with
@@ -26,10 +29,17 @@ def shard(path):
   if len(header) < 3 or header[0] != 20240520 or header[1] != 1: raise ValueError(f"{path} isn't an llm.c token shard (magic 20240520, version 1)")
   return np.memmap(path, np.uint16, "r", offset=1024, shape=(int(header[2]),))
 
-def sequences(tokens, n):  # runs of n + 1 tokens, each starting where the last one's targets end, from the start again after the last
-  if len(tokens) < n + 1: raise ValueError(f"{len(tokens)} tokens can't make a sequence of {n} and its next token")
+def sequences(shards, n, skip=0):
+  """Runs of n + 1 tokens from the shards in order, each starting where the last one's targets end, and from the first
+  shard again after the last. skip passes over that many runs first, without reading them."""
+  counts = [(len(tokens) - 1) // n for tokens in shards]
+  for tokens in shards:
+    if len(tokens) < n + 1: raise ValueError(f"{len(tokens)} tokens can't make a sequence of {n} and its next token")
+  skip %= sum(counts)
   while True:
-    for at in range(0, len(tokens) - n, n): yield tokens[at:at + n + 1].astype(np.int32)
+    for tokens, count in zip(shards, counts):
+      for at in range(n * min(skip, count), n * count, n): yield tokens[at:at + n + 1].astype(np.int32)
+      skip = max(0, skip - count)
 
 def init(c, seed=0):
   """GPT-2's initial weights by name, as float32 numpy. Weights are N(0, 0.02), the position embedding N(0, 0.01), and
@@ -134,15 +144,33 @@ class Trainer:
     return total.tolist()[0][0], lr
 
   def validate(self, tokens, n):  # the mean loss over the first n runs of tokens, the same ones each time, without training on them
-    runs = sequences(tokens, self.c.ctx)
+    runs = sequences([tokens], self.c.ctx)
     return sum(self._evaluate(*self.tokens(next(runs))).tolist()[0][0] for _ in range(n)) / n
+
+  def save(self, path, meta):
+    """Write the weights, AdamW's state, the step and meta, a dict for JSON, to path. The file is replaced only once
+    the new one is on disk, so a crash while saving leaves the last one."""
+    arrays = {f"{kind}.{k}": np.frombuffer(t.tobytes(), np.float32).reshape(t.rows, t.cols)
+              for k in self.w for kind, t in zip("wmv", (self.w[k], *self.state[k]))}
+    with open(f"{path}.tmp", "wb") as f:
+      np.savez(f, **arrays, meta=np.array(json.dumps(meta | dict(step=self.step))))
+      f.flush(), os.fsync(f.fileno())
+    os.replace(f"{path}.tmp", path)
+
+  def load(self, path):  # put the weights, AdamW's state and the step that save wrote back in place
+    with np.load(path) as saved:
+      for k in self.w:
+        for kind, t in zip("wmv", (self.w[k], *self.state[k])):
+          t.assign(Tensor.frombytes(self.rt, t.rows, t.cols, saved[f"{kind}.{k}"].tobytes(), 1, "fp32"))
+      self.step = json.loads(str(saved["meta"]))["step"]
 
 def main():
   from baretile import pci
   from baretile.chip import Chip
   from baretile.runtime import Runtime
   paths = [a for a in sys.argv[1:] if "=" not in a]
-  if not paths: sys.exit("usage: python3 -m baretile.models.train train.bin [val.bin] [key=value ...]\n  settings: "
+  if not paths: sys.exit("usage: python3 -m baretile.models.train train.bin [train.bin ...] [val.bin] [key=value ...]\n"
+                         "  with two or more files, the last is the validation shard\n  settings: "
                          + ", ".join(f"{k}={v}" for k, v in GPT2.items()))
   c = SimpleNamespace(**GPT2)
   for a in sys.argv[1:]:
@@ -152,12 +180,24 @@ def main():
       setattr(c, k, type(GPT2[k])(v))
   if c.dim % c.heads: sys.exit(f"dim={c.dim} must divide into heads={c.heads} heads")
   if c.val_every < 1: sys.exit(f"val_every={c.val_every} must be at least 1")
+  if c.save_every < 1: sys.exit(f"save_every={c.save_every} must be at least 1")
   if c.precision not in ("fp32", "bf16"): sys.exit(f"precision={c.precision} must be fp32 or bf16")
-  train, val = sequences(shard(paths[0]), c.ctx), shard(paths[1]) if len(paths) > 1 else None
-  if val is not None: next(sequences(val, c.ctx))  # a validation shard too short for a sequence fails now, not at the first validation
+  names = paths[:-1] if len(paths) > 1 else paths
+  shards, val = [shard(p) for p in names], shard(paths[-1]) if len(paths) > 1 else None
+  if val is not None: next(sequences([val], c.ctx))  # a validation shard too short for a sequence fails now, not at the first validation
+  # what a run saves, and what a run that resumes it must have the same
+  meta = dict(settings={k: getattr(c, k) for k in GPT2 if k not in UNSAVED}, shards=[[os.path.basename(p), len(t)] for p, t in zip(names, shards)])
+  resume = c.save and os.path.exists(c.save)
+  if resume:
+    with np.load(c.save) as saved: was = json.loads(str(saved["meta"]))
+    other = [k for k, v in meta["settings"].items() if was["settings"].get(k) != v] + ["shards"] * (was["shards"] != meta["shards"])
+    if other: sys.exit(f"{c.save} saved a run with other {', '.join(other)}. Resume it as it was, or save to another file")
   trainer, log = Trainer(Runtime(Chip(pci.open_device())), c), open(c.log, "a") if c.log else None
-  print(f"GPT-2, {c.layers} blocks {c.dim} wide, on {c.ctx}-token sequences: {c.accum * c.ctx:,} tokens a step for {c.steps:,} steps")
-  for step in range(1, c.steps + 1):
+  if resume: trainer.load(c.save)
+  train = sequences(shards, c.ctx, trainer.step * c.accum)  # a resumed run reads on from where its saved step stopped
+  print(f"GPT-2, {c.layers} blocks {c.dim} wide, on {c.ctx}-token sequences: {c.accum * c.ctx:,} tokens a step for {c.steps:,} steps"
+        + (f", resuming after step {trainer.step} from {c.save}" if resume else ""))
+  for step in range(trainer.step + 1, c.steps + 1):
     start = time.time()
     loss, total, lr = trainer.train(train)
     took, record = time.time() - start, dict(step=step, loss=loss, norm=total, lr=lr)
@@ -167,5 +207,6 @@ def main():
       line += f", validation loss {record['val']:.4f}"
     print(f"{line} ({took:.1f}s, {c.accum * c.ctx / took:,.0f} tokens/s)")
     if log: log.write(json.dumps(record | dict(seconds=took)) + "\n"), log.flush()
+    if c.save and (step % c.save_every == 0 or step == c.steps): trainer.save(c.save, meta)
 
 if __name__ == "__main__": main()

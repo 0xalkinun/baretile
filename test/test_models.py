@@ -40,7 +40,7 @@ def test_train_gpt2(chip, tmp_path, precision):
   (tmp_path / "bad.bin").write_bytes(bytes(1024))
   with pytest.raises(ValueError, match="llm.c token shard"): gpt2_train.shard(tmp_path / "bad.bin")
   t, pmask = gpt2_train.Trainer(Runtime(chip), c), torch.tensor(gpt2.mask(range(c.ctx), c.ctx))
-  runs, same = gpt2_train.sequences(gpt2_train.shard(path), c.ctx), gpt2_train.sequences(gpt2_train.shard(path), c.ctx)
+  runs, same = gpt2_train.sequences([gpt2_train.shard(path)], c.ctx), gpt2_train.sequences([gpt2_train.shard(path)], c.ctx)
   losses = []
   for step in range(1, c.steps + 1):
     w, state = {k: gpt2.values(v).astype(np.float64) for k, v in t.w.items()}, {k: [gpt2.values(s) for s in ms] for k, ms in t.state.items()}
@@ -77,6 +77,51 @@ def test_train_settings(tmp_path, monkeypatch):
   with pytest.raises(ValueError, match="8 tokens can't make a sequence of 16"): gpt2_train.main()
   monkeypatch.setattr(sys, "argv", ["train", str(train_bin), "val_every=0"])
   with pytest.raises(SystemExit, match="val_every"): gpt2_train.main()
+  monkeypatch.setattr(sys, "argv", ["train", str(train_bin), "save_every=0"])
+  with pytest.raises(SystemExit, match="save_every"): gpt2_train.main()
+
+def test_train_shards():
+  # sequences reads the shards in order, each run of ctx + 1 tokens starting where the last one's targets end, and
+  # leaves out the tokens at a shard's end that don't fill a run. After the last shard it starts the first again. skip
+  # passes over runs, as a resumed run does.
+  a, b = np.arange(100), np.arange(1000, 1070)  # 3 runs of 32 tokens and their next, then 2
+  starts = lambda runs, n: [int(next(runs)[0]) for _ in range(n)]
+  assert starts(gpt2_train.sequences([a, b], 32), 7) == [0, 32, 64, 1000, 1032, 0, 32]
+  assert starts(gpt2_train.sequences([a, b], 32, skip=4), 3) == [1032, 0, 32]
+  assert starts(gpt2_train.sequences([a, b], 32, skip=12), 2) == [64, 1000]
+  run = next(gpt2_train.sequences([a, b], 32, skip=3))
+  assert run.dtype == np.int32 and run.tolist() == list(range(1000, 1033))
+
+def test_train_resume(chip, tmp_path, monkeypatch):
+  # With save=file, a run keeps itself in the file every save_every steps. One stopped during its third step and run
+  # again resumes after its second, and ends with the same log, weights and AdamW state as a run straight through, bit
+  # for bit. Its two training shards are read in order, and the resumed run starts on the second. A run with other
+  # settings or shards won't resume from the file.
+  from baretile import chip as chips
+  monkeypatch.setattr(pci, "open_device", lambda: None)
+  monkeypatch.setattr(chips, "Chip", lambda device: chip)
+  files = [str(shard(tmp_path / f"{name}.bin", np.arange(150) * k % 90)) for name, k in (("train0", 2), ("train1", 3), ("val", 1))]
+  small = ["layers=1", "dim=64", "heads=2", "ctx=32", "vocab=96", "accum=2", "steps=4", "warmup=2", "val_every=2", "val_batches=1", "save_every=2"]
+  def run(name, *settings, files=files):
+    monkeypatch.setattr(sys, "argv", ["train", *files, *small, f"save={tmp_path / name}.npz", f"log={tmp_path / name}.jsonl", *settings])
+    gpt2_train.main()
+  class Stop(Exception): pass
+  update = gpt2_train.Trainer.update
+  def stopping(self):  # stands for a crash in the third step's update
+    if self.step == 2: raise Stop
+    return update(self)
+  run("straight")
+  monkeypatch.setattr(gpt2_train.Trainer, "update", stopping)
+  with pytest.raises(Stop): run("resumed")
+  monkeypatch.setattr(gpt2_train.Trainer, "update", update)
+  run("resumed")
+  logs = [[{k: v for k, v in json.loads(line).items() if k != "seconds"} for line in (tmp_path / f"{n}.jsonl").read_text().splitlines()]
+          for n in ("straight", "resumed")]
+  assert logs[0] == logs[1] and [r["step"] for r in logs[0]] == [1, 2, 3, 4] and "val" in logs[0][1], logs
+  with np.load(tmp_path / "straight.npz") as a, np.load(tmp_path / "resumed.npz") as b:
+    assert sorted(a.files) == sorted(b.files) and all(np.array_equal(a[k], b[k]) for k in a.files)
+  with pytest.raises(SystemExit, match="other lr"): run("resumed", "lr=1e-3")
+  with pytest.raises(SystemExit, match="other shards"): run("resumed", files=files[1:])
 
 def test_training_cost():
   # cost.training counts GPT-2 124M's step at baretile.models.train's defaults: 6 FLOPs a parameter a token for the
