@@ -1656,6 +1656,32 @@ def test_delta_pieces(chip):
   got = gpt2.values(llama.forward(on(ids), on(list(range(150))), t, c, llama.kv_cache(c, 256, llama.zeros(rt)), every=True))
   assert max(np.abs(a - b).max() / np.abs(b).max() for a, b in zip(got, want)) < 0.05 and near(got, want)
 
+def test_delta_solve(chip):
+  # qwen.chunk solves each piece's corrections, (I + L) u = beta v, by joining blocks. A product (I + P)(I + P^2)... over
+  # the whole piece forms powers of L that reach 1e10 in Qwen3.5-9B's later blocks, where a piece's keys point nearly
+  # the same way, and float32 loses the answer in their cancellation: the block outputs were off by up to 50%. Here
+  # the keys are a few degrees apart, beta is near 1 and the decay near 0, so L is close to a triangle of ones. chunk
+  # must match the rule run a token at a time (qwen.step) to 1e-5 in NumPy. On the chip, where an fp32 matmul is good to
+  # about 2^-11 of its largest terms, it's within 1% (0.4% here); the product over the whole piece was off by 1e13.
+  rng = np.random.default_rng(53)
+  h, m, kd, vd = 4, 64, 32, 48
+  k = rng.normal(0, 1, (h, 1, kd)) + rng.normal(0, 0.05, (h, m, kd))
+  k /= np.linalg.norm(k, axis=-1, keepdims=True)
+  q, v = rng.normal(0, 0.3, (h, m, kd)), rng.normal(0, 1, (h, m, vd))
+  beta, g, S = rng.uniform(0.9, 1, (h, m, 1)), -rng.uniform(0, 0.01, (h, m, 1)), rng.normal(0, 0.1, (h, kd, vd))
+  want, state = [], S
+  for t in range(m):  # step takes q and k as columns, the rest as rows
+    o, state = qwen.step(q[:, t, :, None], k[:, t, :, None], v[:, t, None, :], beta[:, t, None, :], g[:, t, None, :], state)
+    want.append(o[:, 0])
+  want = np.stack(want, 1)
+  rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
+  o, after = qwen.chunk(q, k, v, beta, g, S)
+  assert rel(o, want) < 1e-5 and rel(after, state) < 1e-5, (rel(o, want), rel(after, state))
+  rt = Runtime(chip)
+  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
+  o, after = qwen.chunk(*(up(a) for a in (q, k, v, beta, g, S)))
+  assert rel(value(o), want) < 1e-2 and rel(value(after), state) < 1e-2, (rel(value(o), want), rel(value(after), state))
+
 def test_speculative(chip):
   # Two slots verify their token and draft in one replayed call, with a third slot free. A right draft is accepted. A
   # wrong one is rejected (accept 0), and the next step goes on from the Gated DeltaNet states as they were after the

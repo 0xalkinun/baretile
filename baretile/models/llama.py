@@ -27,7 +27,7 @@ def fns(x):
                            sink_softmax=sink_softmax, exp=np.exp, log=np.log, bf16=lambda a: a, float=lambda a: a, now=lambda a: a,
                            swap=lambda a: a.transpose(1, 0, 2), cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None],
                            assign=lambda a, b: a.__setitem__(..., b),
-                           tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)),
+                           tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)), pairs=pairs,
                            parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to,
                            pad=lambda a, rows: np.pad(a, ((0, 0), (0, rows), (0, 0))), empty=lambda shape: np.empty(shape, np.float32),
                            delta=qwen.numpy_delta, where=np.where)
@@ -37,13 +37,23 @@ def fns(x):
                          experts=qwen.chip_experts, where=lambda cond, a, b: cond.where(a, b), minimum=Tensor.minimum, maximum=Tensor.maximum,
                          sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, bf16=Tensor.bfloat16, float=Tensor.float, now=Tensor.realize,
                          cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0), swap=lambda a: a.permute(1, 0, 2),
-                         assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 1),
+                         assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower),
+                         pairs=lambda n, span: paired(x.rt, n, span), parts=lambda a, n: a.split(n, 1),
                          pad=lambda a, rows: a.pad(((0, 0), (0, rows), (0, 0))), expand=lambda a, shape: a.expand(*shape), delta=qwen.delta,
                          empty=lambda shape: Tensor(x.rt, shape[1], shape[2], batch=shape[0], dtype="fp32"))
 
 @functools.cache
 def triangle(rt, n, lower=False):  # n x n fp32 ones on and above the diagonal (below with lower), made once on the chip
   return Tensor.of(rt, (np.tril if lower else np.triu)(np.ones((n, n))).tolist(), "fp32")
+
+def pairs(n, span):
+  """n x n fp32 ones where row i is in the second and column j in the first span of the same 2 span rows: the blocks
+  below the diagonal that joining blocks of span into blocks of 2 span adds (qwen.chunk)."""
+  i, j = np.arange(n)[:, None], np.arange(n)
+  return np.float32((i // (2 * span) == j // (2 * span)) & (i // span % 2 == 1) & (j // span % 2 == 0))
+
+@functools.cache
+def paired(rt, n, span): return Tensor.of(rt, pairs(n, span).tolist(), "fp32")  # pairs, made once on the chip
 
 def precision(c, mode="bf16", kv=None):
   """The format and fidelity phases of each matmul's weights, as {(op, block): (format, phases)}.

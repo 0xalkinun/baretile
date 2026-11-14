@@ -119,9 +119,12 @@ def chunk(q, k, v, beta, g, S, size=64):
   per chunk to update state and write outputs.
 
   Within a chunk, corrections solve (I + L) u = beta v. L is strictly lower triangular and describes
-  how each token's correction affects later tokens. Since L^64 = 0, setting P = -L gives
-  (I + L)^-1 = (I + P)(I + P^2)(I + P^4)... . Each factor takes one or two matmuls, avoiding a loop
-  over individual tokens."""
+  how each token's correction affects later tokens. Its inverse is built by joining blocks, from one
+  token up: two inverted blocks A^-1 and B^-1, with C below the diagonal between them, join as
+  [A^-1 0; -B^-1 C A^-1, B^-1], two matmuls for every pair of blocks at once. Each step reads only
+  inverses, which stay near 1. A product (I - L)(I + L^2)(I + L^4)... over the whole chunk is the
+  same inverse, but its powers of L reach 1e10 where a chunk's keys point nearly the same way, as in
+  Qwen3.5-9B's later blocks, and float32 loses the result in their cancellation."""
   f, (h, m, dv) = llama.fns(q), v.shape
   n, s = -(-m // size), min(m, size)  # the number of pieces, and the tokens in each
   if n > 1:  # copy each, since it may be a repeat or a view, and pad to a multiple of 64. piece i of head j is batch entry j n + i
@@ -130,10 +133,11 @@ def chunk(q, k, v, beta, g, S, size=64):
   cum = f.t(f.t(g) @ upper)  # the log decay from the start of the piece through each token
   decay = f.exp(f.minimum(cum - f.t(cum), 0)) * f.tri(s, True)  # the decay from token j to token i where j <= i, else 0
   kbeta = k * beta
-  P, u, w, span = -((kbeta @ f.t(k)) * decay * (1 - upper)), v * beta, kbeta * f.exp(cum), 1
+  L = (kbeta @ f.t(k)) * decay * (1 - upper)
+  inv, span = upper * f.tri(s, True) - L * f.pairs(s, 1), 2  # pairs of single tokens: [1 0; l 1]^-1 is [1 0; -l 1]
   while span < s:
-    u, w, span = u + P @ u, w + P @ w, 2 * span
-    if span < s: P = P @ P
+    inv, span = inv - (inv @ (L * f.pairs(s, span))) @ inv, 2 * span
+  u, w = inv @ (v * beta), inv @ (kbeta * f.exp(cum))
   last = cum[:, s - 1:s, :]
   now, piece = (f.now, lambda t, i: t[i::n, :, :]) if n > 1 else (lambda t: t, lambda t, i: t)  # a prompt of one piece stays lazy
   qs, a, kl, u, w = now(q * f.exp(cum)), now((q @ f.t(k)) * decay), now(f.t(k * f.exp(last - cum))), now(u), now(w)  # what the loop reads
