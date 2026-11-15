@@ -1178,7 +1178,7 @@ void kmain(volatile unsigned *a) {{
 # how many tiles of a part fit in topk's L1
 def topk_room(dtype, k): return (OUTS - DATA - tile_bytes(dtype) - 4096 - 64 * k) // tile_bytes(dtype)
 
-def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
+def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False, scan=None):
   """Find the k largest values in each row, and their columns. Of equal values, the first column wins.
 
   args: [first unit, units, the values' address, the indices' address, then x's address, tile strides for batch and
@@ -1196,12 +1196,17 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   not within the part. With labels, an index is read from an int32 tensor of x's shape at the picked column, as the 64
   bytes around it. Labels are for a topk over the best indices of the parts, so they need parts=1.
 
+  scan is C of a caller's own that finds a row's k best in place of reading and scanning x, for a kernel that reads
+  only some of a row: it calls keep(key(v), c) for each value v at column c better than the worst kept (kept < k, or
+  WORSE(top[0], col[0], key(v), c)). Its own args start at a[9], and its L1 at SCRATCH. The values come back from the
+  keys, so a -0 as 0.
+
   Units write their row of each result tile, in both faces, with zeros past the k columns and past x's rows. Values are
   bf16 or fp32 and indices int32. The tile's 32 units write all of it between them, and no two write the same bytes. A
   dimension of 1 fills its tile with copies, as in any tensor. A k of 1 fills the row with its column. When x has one
   row, the tile row's first unit scans it and writes complete tiles, with the row copied down."""
   # ct, kt: x's tiles and the results' in a part
-  ct, kt, item, bits = -(-cols // 32), -(-k // 32), ITEMSIZE[dtype], 8 * ITEMSIZE[dtype]
+  ct, kt, item, bits = 0 if scan else -(-cols // 32), -(-k // 32), ITEMSIZE[dtype], 8 * ITEMSIZE[dtype]
   tb = tile_bytes(dtype)
   pick = "0" if k * parts == 1 else "j"  # the pick that result column j holds. A k of 1 in one part is copied across
   label = (f"((volatile unsigned *)(LABELS + {pick} * 64))[at(s, col[{pick}] % 32) % 16]" if labels else
@@ -1209,11 +1214,37 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   if not (parts == 1 or (k % 32 == 0 and cols % 32 == 0)):
     raise ValueError("with parts, k and cols must be multiples of 32")
   if ct > topk_room(dtype, k): raise ValueError("a part's tile row doesn't fit in L1")
+  value = "unkey(top[{0}])" if scan else "x[col[{0}] / 32 * 1024 + at(s, col[{0}] % 32)]"
+  scan = scan or f"""if (t != held || rows <= 8) {{  // up to 8 rows read their runs, more the tile row once a worker
+        for (unsigned j = 0; j < {ct}; j++)
+          if (rows <= 8) for (unsigned f = 0; f < 2; f++) {{
+            unsigned o = at(s, 16 * f) * {item};
+            noc_get(BANK(first + j), AT(a[4], first + j, {tb}) + o, X + j * {tb} + o, {16 * item});
+          }}
+          else noc_get(BANK(first + j), AT(a[4], first + j, {tb}), X + j * {tb}, {tb});
+        noc_wait();
+        held = t;
+      }}
+      const signed_datum *row = (const signed_datum *)x + at(s, 0);  // its run of 16 in face 0 of tile 0
+      for (unsigned c0 = 0; c0 < {cols}; c0 += 16) {{  // the row's run of 16 in each face of each tile, in order
+        const signed_datum *run = row + c0 / 32 * 1024 + c0 % 32 / 16 * 256;
+        if (raw >= 0 && c0 + 16 <= {cols}) {{  // skip a full run that's no better than the worst kept, with one branch
+          int better = 0;
+          for (unsigned c = 0; c < 16; c++) better |= run[c] > raw;
+          if (!better) continue;
+        }}
+        for (unsigned c = c0, end = c0 + 16 < {cols} ? c0 + 16 : {cols}; c < end; c++) {{
+          signed_datum d = run[c - c0];
+          if (kept == {k} && (raw >= 0 ? d <= raw : key((datum)d) <= last)) continue;  // no better than the worst kept
+          keep(key((datum)d), c);
+        }}
+      }}"""
   return compile_kernel(f"""
 #define X {DATA:#x}
 #define VALUES {DATA + ct * tb:#x}
 #define IDS {DATA + ct * tb + tb:#x}
 #define LABELS {DATA + ct * tb + tb + 4096:#x}
+#define SCRATCH {DATA + ct * tb + tb + 4096 + 64 * k:#x}
 {ROWS}
 typedef {"unsigned short" if item == 2 else "unsigned"} datum;
 typedef {"short" if item == 2 else "int"} signed_datum;
@@ -1237,11 +1268,24 @@ static unsigned key(unsigned v) {{  // a float's bits as an unsigned integer tha
   const unsigned sign = 1u << {bits - 1}, all = {(1 << bits) - 1:#x};
   return v == sign ? sign : v & sign ? all & ~v : v | sign;
 }}
+static unsigned unkey(unsigned v) {{ return v >> {bits - 1} ? v & ~(1u << {bits - 1}) : ~v & {(1 << bits) - 1:#x}; }}
+// v, a key at column c, joins the k best: it's better than the worst
+#define keep(v, c) do {{ unsigned kv = (v), kc = (c), i; \\
+  if (kept < {k})  /* it moves up while it's worse than its parent */ \\
+    for (top[i = kept++] = kv, col[i] = kc; i && WORSE(top[i], col[i], top[(i - 1) / 2], col[(i - 1) / 2]); \\
+         i = (i - 1) / 2) \\
+      swap(top, col, i, (i - 1) / 2); \\
+  else top[0] = kv, col[0] = kc, down(top, col, 0, {k});  /* it replaces the worst */ \\
+  if (kept == {k}) last = top[0], raw = last >= {1 << bits - 1:#x}u ? (int)(last & {(1 << bits - 1) - 1:#x}) : -1; \\
+}} while (0)
 void kmain(volatile unsigned *a) {{
   datum *x = (datum *)X;
   volatile datum *values = (volatile datum *)VALUES;  // a result tile of each. This unit writes its row in it
   volatile unsigned *ids = (volatile unsigned *)IDS;
-  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, top[{k}], col[{k}], kept = 0;
+  // the k best so far. last is the key of the worst kept. While that value has no sign bit, raw holds its bits, and a
+  // later value beats it if it's bigger as a signed integer. This costs one compare where the key costs four.
+  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, top[{k}], col[{k}], kept, last;
+  int raw;
   for (unsigned u = 0; u < a[1]; u++) {{
     // row r of tile row i of x, in part p of matrix b. first is the part's first tile
     unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, i = t % tr, p = t / tr % {parts}, b = t / tr / {parts};
@@ -1251,42 +1295,8 @@ void kmain(volatile unsigned *a) {{
     unsigned face = at(r, 0);  // the row's run in the left face
     if (rows == 1 && r) continue;  // with one row of x, the tile row's first unit writes all its copies
     if (s < n) {{
-      kept = 0;
-      if (t != held || rows <= 8) {{  // up to 8 rows read their runs. More read the part's tile row, once a worker
-        for (unsigned j = 0; j < {ct}; j++)
-          if (rows <= 8) for (unsigned f = 0; f < 2; f++) {{
-            unsigned o = at(s, 16 * f) * {item};
-            noc_get(BANK(first + j), AT(a[4], first + j, {tb}) + o, X + j * {tb} + o, {16 * item});
-          }}
-          else noc_get(BANK(first + j), AT(a[4], first + j, {tb}), X + j * {tb}, {tb});
-        noc_wait();
-        held = t;
-      }}
-      const signed_datum *row = (const signed_datum *)x + at(s, 0);  // its run of 16 in face 0 of tile 0
-      // last is the key of the worst value kept. While that value has no sign bit, raw holds its bits, and a later
-      // value beats it if it's bigger as a signed integer. This costs one compare where the key costs four.
-      unsigned last = 0;
-      int raw = -1;
-      for (unsigned c0 = 0; c0 < {cols}; c0 += 16) {{  // the row's run of 16 in each face of each tile, in order
-        const signed_datum *run = row + c0 / 32 * 1024 + c0 % 32 / 16 * 256;
-        if (raw >= 0 && c0 + 16 <= {cols}) {{  // skip a full run that's no better than the worst kept, with one branch
-          int better = 0;
-          for (unsigned c = 0; c < 16; c++) better |= run[c] > raw;
-          if (!better) continue;
-        }}
-        for (unsigned c = c0, end = c0 + 16 < {cols} ? c0 + 16 : {cols}; c < end; c++) {{
-          signed_datum d = run[c - c0];
-          if (kept == {k} && (raw >= 0 ? d <= raw : key((datum)d) <= last)) continue;  // no better than the worst kept
-          unsigned v = key((datum)d), i;
-          if (kept < {k}) {{  // it moves up while it's worse than its parent
-            for (top[i = kept++] = v, col[i] = c; i && WORSE(top[i], col[i], top[(i - 1) / 2], col[(i - 1) / 2]);
-                 i = (i - 1) / 2)
-              swap(top, col, i, (i - 1) / 2);
-          }} else top[0] = v, col[0] = c, down(top, col, 0, {k});  // it replaces the worst
-          if (kept == {k})
-            last = top[0], raw = last >= {1 << (bits - 1):#x}u ? (int)(last & {(1 << (bits - 1)) - 1:#x}) : -1;
-        }}
-      }}
+      kept = 0, last = 0, raw = -1;
+      {scan}
       // the worst goes to the end in turn: best first
       for (unsigned n = kept; n > 1; n--) swap(top, col, 0, n - 1), down(top, col, 0, n - 1);
       {f"""for (unsigned j = 0; j < {k}; j++) {{  // each pick's label: the 64 bytes around it
@@ -1298,7 +1308,7 @@ void kmain(volatile unsigned *a) {{
     for (unsigned q = 0; q < {kt}; q++) {{  // the unit's row of each result tile: its picks there, then 0 past them
       for (unsigned c = 0; c < 32; c++) {{
         unsigned j = q * 32 + c, v = 0, id = 0;
-        if (s < n && {pick} < {k}) v = x[col[{pick}] / 32 * 1024 + at(s, col[{pick}] % 32)], id = {label};
+        if (s < n && {pick} < {k}) v = {value.format(pick)}, id = {label};
         values[at(r, c)] = v, ids[at(r, c)] = id;
       }}
       unsigned o = (b * tr + i) * {parts * kt} + p * {kt} + q;  // the result tile

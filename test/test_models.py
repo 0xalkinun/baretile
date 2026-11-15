@@ -2421,15 +2421,16 @@ def bytes_tokenizer(folder):  # writes a byte-level vocabulary of the 256 bytes 
 def test_heads(chip):
   # serve.heads finds each row's 64 largest logits on the chip, in numpy's stable argsort order, and the log of the sum
   # of exp((x - max(x)) t) over the row. Qwen3.6's vocabulary splits into 97 parts of 2,560. Llama 3's doesn't split into parts of
-  # 96 tiles or fewer, so it takes 24 parts of 5,344, as big as topk's L1 holds. serve.Head.of must agree on the host.
+  # 96 tiles or fewer, so it takes 24 parts of 5,344, as big as topk's L1 holds. With k=1 on 4 rows, the wider two go
+  # to grouped_topk. serve.Head.of must agree on the host.
   rt, rng = Runtime(chip), np.random.default_rng(3)
   x = np.float32(rng.integers(-3, 4, (40, 300))) * np.float32(rng.choice([1, 0.5], (40, 300)))  # many ties, -0 among them
   x[x == 0] = np.where(rng.random((x == 0).sum()) < 0.5, -0.0, 0.0)
   assert all(np.array_equal(serve.Head.of(row, 1.0, k).ids, np.argsort(-row, kind="stable")[:k]) for row, k in zip(x, range(1, 81, 2)))
   for vocab in (512, 128256, 248320):
-    x, ts = rng.normal(0, 3, (3, vocab)).astype(np.float32), [1.0, 1 / 0.7, 2.0]
+    x, ts = rng.normal(0, 3, (4, vocab)).astype(np.float32), [1.0, 1 / 0.7, 2.0, 1.0]
     x[1, 5] = x[1, vocab - 7] = x[1].max() + 1
-    logits = Tensor.frombytes(rt, 3, vocab, x.tobytes(), dtype="fp32")
+    logits = Tensor.frombytes(rt, 4, vocab, x.tobytes(), dtype="fp32")
     values, ids, lse = serve.heads(logits, Tensor.of(rt, [[t] for t in ts], "fp32"))
     want, scaled = np.argsort(-x, -1, kind="stable")[:, :64], np.float64(x) * np.array(ts)[:, None]
     assert np.array_equal(gpt2.values(ids), want) and np.array_equal(gpt2.values(values), np.take_along_axis(x, want, -1)), vocab
@@ -2438,6 +2439,32 @@ def test_heads(chip):
     # Relative lse can approach zero. An absolute error of 1e-6 means about one ppm in the normalization mass.
     assert np.allclose(gpt2.values(lse)[:, 0], exact, rtol=1e-6, atol=1e-6), (gpt2.values(lse)[:, 0], exact)
     assert np.array_equal(gpt2.values(serve.heads(logits, k=1)[1])[:, 0], want[:, 0])
+
+def test_grouped_topk(chip):
+  # serve.grouped_topk takes a row too wide for topk's L1 in one call, with k up to 32: the maximum of each of its strided
+  # groups on the Tensix engines, their 64 best, then BRISC reads only the groups that can hold the k largest. The
+  # cases: random rows with the best value tied across groups; -0 and 0, equal and the largest; 70 groups tied at the
+  # k-th maximum, so the row is read whole; 300 tiles, in 15 groups rather than 16; rows past one tile, one row of
+  # copies, bf16 and a k of 1. Then rows of equal values, where every group ties and the first columns win, and a k past
+  # 32, which needs topk's parts.
+  rt, rng = Runtime(chip), np.random.default_rng(41)
+  for dtype, rows, cols, k in (("fp32", 3, 8192, 32), ("fp32", 3, 9600, 32), ("fp32", 33, 8192, 20), ("bf16", 1, 16384, 32),
+                               ("bf16", 5, 16384, 1)):
+    x = rng.normal(-2, 3, (rows, cols))
+    x[0, [5, 300, 7000]] = x[0].max() + 1
+    if rows > 2:
+      x[1] = -np.abs(x[1]) - 1
+      x[1, [7, 600]] = [-0.0, 0.0]
+      x[2] = -5.0
+      x[2, rng.choice(cols // 32, 70, replace=False)] = 3.0  # one column in each of 70 groups
+    x = bf16(x) if dtype == "bf16" else x.astype(np.float32)
+    values, ids = serve.grouped_topk(Tensor.frombytes(rt, rows, cols, x.astype(np.float32).tobytes(), dtype="fp32").cast(dtype), k)
+    want = np.argsort(-x, -1, kind="stable")[:, :k]
+    got = value(ids).reshape(rows, k), value(values).reshape(rows, k)
+    assert np.array_equal(got[0], want) and np.array_equal(got[1], np.take_along_axis(x, want, -1)), (dtype, rows, k)
+  x = Tensor.of(rt, np.ones((2, 8192)).tolist(), "fp32")
+  assert np.array_equal(value(serve.grouped_topk(x, 32)[1]).reshape(2, 32), np.tile(np.arange(32), (2, 1)))
+  with pytest.raises(ValueError, match="k up to 32"): serve.grouped_topk(x, 33)
 
 def test_sampling():
   # Request.pick samples from the head of a row (serve.Head), checked against a full sort of the vocabulary. top_p on a
