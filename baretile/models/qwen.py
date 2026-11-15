@@ -12,7 +12,7 @@ from baretile.tensix import (ACROSS, BANKS, DST_FREE, DST_HALF, FILLED, FOLDS, M
 from baretile.tensor import Tensor
 from baretile.models import gpt2, llama
 
-def deltanet(h, p, c, state, phases, live=None, accept=None):
+def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   """Apply Qwen3.5/3.6's Gated DeltaNet to this call's tokens and update recurrent state in place.
   Tokens belong to one sequence, or form equal-length groups for several sequences. live marks active
   tokens; inactive tokens leave state unchanged. After the projections, computation uses fp32.
@@ -29,6 +29,12 @@ def deltanet(h, p, c, state, phases, live=None, accept=None):
   token. On the next call, accept=1 resumes from the state after both tokens; accept=0 resumes from
   the copies before the rejected draft.
 
+  rule, a recurrence of the caller's, takes the place of the conv and the gated delta rule, for tokens in
+  an order of its own, and the states stay as they were. rule(rows, taps, gates, S) gets each sequence's
+  conv inputs (its last c.conv - 1, then this call's), the conv taps, gates, which takes the conv's sums
+  to q, k, v, b (before its sigmoid) and g with a batch entry for each head of each sequence, and S. It
+  returns the outputs as chunk does, a batch entry for each value head of each sequence.
+
   p contains qkv_proj (q, k, v, z, b and a concatenated), conv taps, decay (-exp(A_log)), dt_bias,
   norm and o_proj."""
   f, (past, S) = llama.fns(h), state[:2]
@@ -39,7 +45,20 @@ def deltanet(h, p, c, state, phases, live=None, accept=None):
   alive = lambda: live.reshape(1, seqs, m)[:, :, :1]  # the first token of each sequence, with sequences as rows
   keep = lambda old, new: new if live is None else old + alive() * (new - old)
   big = lambda old, new: new if live is None else old + f.repeat(alive().reshape(seqs, 1, 1), c.vh) * (new - old)
-  if (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
+  def each(t, d):  # a batch entry for each head of each sequence
+    heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
+    return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, m * d)).reshape(seqs * heads.shape[0], m, d)
+  def gates(y):  # from the conv's sums: q and k of each key head, to length 1, v of each value head, b and g
+    y = f.silu(y).reshape(n, width)
+    unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # q and k of each head to length 1, along a row
+    q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))
+    b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
+    g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus: the log decay of each head
+    return q, k, each(y[:, 2 * qk:], c.vd), each(b, 1), g
+  if rule is not None:  # the caller's recurrence, from the conv inputs: the last ones, then this call's
+    o = rule(f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width))), taps, gates, S)
+    o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
+  elif (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
     # A decode step's token, or a verify step's token and then its draft, in one kernel with a unit for each key head
     # of each sequence (f.delta).
     # The kernel reads the rows of x as they are and runs the conv, the gates and the recurrence. It writes the conv
@@ -52,15 +71,8 @@ def deltanet(h, p, c, state, phases, live=None, accept=None):
     rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))
     y = sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))
     f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
-    def each(t, d):  # a batch entry for each head of each sequence
-      heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
-      return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, m * d)).reshape(seqs * heads.shape[0], m, d)
-    y = f.silu(y).reshape(n, width)
-    unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # q and k of each head to length 1, along a row
-    q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))
-    b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
-    g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus: the log decay of each head
-    o, S2 = chunk(f.repeat(q, r), f.repeat(k, r), each(y[:, 2 * qk:], c.vd), f.sigmoid(each(b, 1)), g, S)
+    q, k, v, b, g = gates(y)
+    o, S2 = chunk(f.repeat(q, r), f.repeat(k, r), v, f.sigmoid(b), g, S)
     o = f.now(o)  # o reads the state, so realize it before the state is written over
     f.assign(state[1], big(state[1], S2))
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
@@ -109,6 +121,28 @@ def step(q, k, v, beta, g, S):
   S = e * S + k * v
   return (q * S).sum(-2, keepdims=True), S
 
+def corrected(k, v, beta, g, seen=None):
+  """The part of a piece's gated delta rule that doesn't read the state (chunk, or a deltanet rule). seen[i, j] is 1
+  where token i follows token j or is it: the causal triangle when None, or another order, such as a tree's ancestors,
+  with each token after the ones it follows. Return cum, the log decay through each token, the decay from token j to
+  token i where i follows j (else 0), and u and w, which solve (I + L) u = beta v and (I + L) w = beta k e^cum. L is
+  strictly lower triangular, since a token comes after the ones it follows, and describes how each token's correction
+  affects the ones after it. Its inverse is built by joining blocks, from one token up: two inverted blocks A^-1 and
+  B^-1, with C below the diagonal between them, join as [A^-1 0; -B^-1 C A^-1, B^-1], two matmuls for every pair of
+  blocks at once. Each step reads only inverses, which stay near 1. A product (I - L)(I + L^2)(I + L^4)... over the
+  whole piece is the same inverse, but its powers of L reach 1e10 where a piece's keys point nearly the same way, as
+  in Qwen3.5-9B's later blocks, and float32 loses the result in their cancellation."""
+  f, s = llama.fns(k), k.shape[-2]
+  upper = f.tri(s)
+  cum = f.t(f.t(g) @ (upper if seen is None else f.t(seen)))  # the log decay from the start of the piece, along its path
+  decay = f.exp(f.minimum(cum - f.t(cum), 0)) * (f.tri(s, True) if seen is None else seen)
+  kbeta = k * beta
+  L = (kbeta @ f.t(k)) * decay * (1 - upper)
+  inv, span = upper * f.tri(s, True) - L * f.pairs(s, 1), 2  # pairs of single tokens: [1 0; l 1]^-1 is [1 0; -l 1]
+  while span < s:
+    inv, span = inv - (inv @ (L * f.pairs(s, span))) @ inv, 2 * span
+  return cum, decay, inv @ (v * beta), inv @ (kbeta * f.exp(cum))
+
 def chunk(q, k, v, beta, g, S, size=64):
   """Apply the gated delta rule to a prompt in 64-token chunks, following transformers'
   torch_chunk_gated_delta_rule. Take initial state S, queries q, keys k, values v, and columns beta
@@ -118,22 +152,12 @@ def chunk(q, k, v, beta, g, S, size=64):
   and decay are zero, so they don't change state. Then process chunks in order, using four matmuls
   per chunk to update state and write outputs.
 
-  Within a chunk, corrections solve (I + L) u = beta v. L is strictly lower triangular and describes
-  how each token's correction affects later tokens. Since L^64 = 0, setting P = -L gives
-  (I + L)^-1 = (I + P)(I + P^2)(I + P^4)... . Each factor takes one or two matmuls, avoiding a loop
-  over individual tokens."""
+  Within a chunk, corrections solve (I + L) u = beta v, as corrected says."""
   f, (h, m, dv) = llama.fns(q), v.shape
   n, s = -(-m // size), min(m, size)  # the number of pieces, and the tokens in each
   if n > 1:  # copy each, since it may be a repeat or a view, and pad to a multiple of 64. piece i of head j is batch entry j n + i
     q, k, v, beta, g = (f.parts(f.pad(t, n * s - m) if n * s > m else t + 0, n) for t in (q, k, v, beta, g))
-  upper = f.tri(s)
-  cum = f.t(f.t(g) @ upper)  # the log decay from the start of the piece through each token
-  decay = f.exp(f.minimum(cum - f.t(cum), 0)) * f.tri(s, True)  # the decay from token j to token i where j <= i, else 0
-  kbeta = k * beta
-  P, u, w, span = -((kbeta @ f.t(k)) * decay * (1 - upper)), v * beta, kbeta * f.exp(cum), 1
-  while span < s:
-    u, w, span = u + P @ u, w + P @ w, 2 * span
-    if span < s: P = P @ P
+  cum, decay, u, w = corrected(k, v, beta, g)
   last = cum[:, s - 1:s, :]
   now, piece = (f.now, lambda t, i: t[i::n, :, :]) if n > 1 else (lambda t: t, lambda t, i: t)  # a prompt of one piece stays lazy
   qs, a, kl, u, w = now(q * f.exp(cum)), now((q @ f.t(k)) * decay), now(f.t(k * f.exp(last - cum))), now(u), now(w)  # what the loop reads
@@ -710,13 +734,19 @@ def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
   RMS-normalize the embedding and h, concatenate them for fc, then run the block, norm and output layer.
   Update caches[c.layers] at places. slots and length follow llama.forward. With every=False, return only
   the last position, as needed after a prompt chunk."""
+  f = llama.fns(h)
+  rows, rotary, mask, _, live = llama.around(w, c, places, caches[c.layers].shape[-2], slots, length)
+  g = predict(ids, h, w, c, caches[c.layers], rows, rotary, mask, slots is None and h.shape[-2] > 1, live, slots)
+  own = "embed.T draft" in w  # a copy of the output layer for the draft, when the precision has a "draft head"
+  last = g if every else f.rows(g, [g.shape[-2] - 1])
+  return f.mm(last, w["embed.T draft" if own else "embed.T"], llama.precision_of(c, "draft head" if own else "head")[1], "fp32")
+
+def predict(ids, h, w, c, cache, rows, rotary, mask, prefill, live=None, slots=None):
+  """The multi-token prediction block's normalized output for tokens ids after hidden states h (draft's pass): fc
+  reads the normalized embedding and h side by side, and the block writes its keys and values into cache at rows."""
   f, d, l = llama.fns(h), c.dim, c.layers
   e, h = llama.rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), llama.rms(h, w["mtp.pre_fc_norm_hidden"], c)
   fc = w["mtp.fc"]
   x = f.mm(e, fc[:d, :], None, "fp32") + f.mm(h, fc[d:, :], None, "fp32")
-  rows, rotary, mask, _, live = llama.around(w, c, places, caches[l].shape[-2], slots, length)
-  x = llama.layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, live, slots=slots)
-  own = "embed.T draft" in w  # a copy of the output layer for the draft, when the precision has a "draft head"
-  last = x if every else f.rows(x, [x.shape[-2] - 1])
-  return f.mm(llama.rms(last, w["mtp.norm"], c), w["embed.T draft" if own else "embed.T"],
-              llama.precision_of(c, "draft head" if own else "head")[1], "fp32")
+  x = llama.layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, cache, rows, l, prefill, live, slots=slots)
+  return llama.rms(x, w["mtp.norm"], c)
