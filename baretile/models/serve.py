@@ -11,8 +11,8 @@ import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 from baretile import bh, pci
-from baretile.kernels import topk_room
-from baretile.tensix import tile_bytes
+from baretile.kernels import topk_kernel, topk_room
+from baretile.tensix import ITEMSIZE, tile_bytes, tile_of
 from baretile.tensor import Tensor, jit
 from baretile.models import gpt2, llama, qwen
 
@@ -40,6 +40,68 @@ def unsure(text, marks):  # how many characters at the end of text may begin one
 
 def scale(r): return 1 / r.temperature if r and r.temperature > 0 else 1.0  # the 1/temperature of a request. Any value works for greedy
 
+# A row too wide for topk's L1 goes in groups (grouped_topk): as many as the factor of its tiles nearest 16, from 8 to
+# 32, or none. BRISC reads TOPK_RUNS runs of 16 at a time
+def topk_groups(tiles): return min((g for g in range(8, 33) if tiles % g == 0), key=lambda g: abs(g - 16), default=0)
+TOPK_RUNS = 1024
+
+def grouped_topk(x, k):
+  """topk's (values, int32 indices) of each row's k largest, k up to 32, in one call for a row too wide for topk's L1,
+  such as a vocabulary's logits: batch 1, bf16 or fp32 with no NaN, and a tile count with a factor G from 8 to 32
+  (topk_groups). Column g of each of G equal parts makes group g. The Tensix engines take each group's maximum, an
+  elementwise maximum of the parts, and topk finds the 64 best groups. With tau the k-th of those maxima, at least k
+  values reach tau, so each of the row's k best lies in a group whose maximum reaches tau, and BRISC reads just those
+  groups' columns, a run of 16 for each (grouped_scan). If the 64th maximum reaches tau too, groups past the 64 may
+  tie with it, and BRISC reads the whole row instead. Exact, and ties keep column order, as in topk."""
+  groups = topk_groups(x.cols // 32) if x.cols % 32 == 0 else 0
+  if not (0 < k <= 32 and x.batch == 1 and x.dtype in ("bf16", "fp32") and groups):
+    raise ValueError(f"grouped_topk needs k up to 32, batch 1, bf16 or fp32 and a tile count with a factor from 8 to 32: "
+                     f"k={k}, batch {x.batch}, {x.dtype}, {x.cols} columns")
+  m = x.split(groups).max(0)  # each group's maximum
+  tiles = m.cols // 32
+  p = next(p for p in range(1, tiles + 1) if tiles % p == 0 and tiles // p <= topk_room(x.dtype, 64))
+  best, at = m.topk(64, p)  # the 64 best groups
+  best, at = best.topk(64, labels=at) if p > 1 else (best, at)
+  values, ids = (Tensor(x.rt, x.rows, k, dtype=d) for d in (x.dtype, "int32"))
+  key = ("grouped topk", k, x.cols, x.dtype, groups)
+  return values.run(key, lambda: topk_kernel(k, x.cols, x.dtype, scan=grouped_scan(*key[1:])), values.addr, ids.addr,
+                    x, x.rows, best, at, units=-(-x.rows // 32) * 32, name="topk"), ids
+
+def grouped_scan(k, cols, dtype, groups):
+  """grouped_topk's scan for topk_kernel. Its args, from a[9]: the row's 64 best group maxima and their groups, each an
+  address, tile strides for batch and row, and a tile offset. In L1 from SCRATCH: TOPK_RUNS runs read at a time, in 64
+  bytes each, then the tiles of the maxima and of the groups. A read keeps its offset in 64 bytes, SKEW."""
+  item, tb, w = ITEMSIZE[dtype], tile_bytes(dtype), cols // groups  # w, a part's width: group g is column g of each
+  x = tile_of(4, "b", "i", "(c) / 32")
+  return f"""#define SKEW (at(s, 0) * {item} % 64)
+#define RUN(c, to) noc_get(BANK({x}), AT(a[4], {x}, {tb}) + at(s, (c) % 32 / 16 * 16) * {item}, (to) + SKEW, {16 * item})
+#define GV (SCRATCH + {TOPK_RUNS * 64})
+#define GID (GV + {2 * tb})
+#define MAXIMUM(j) key(((const datum *)GV)[(j) / 32 * 1024 + at(s, (j) % 32)])  // the j-th best group's maximum, as a key
+#define GROUP(j) ((const unsigned *)GID)[(j) / 32 * 1024 + at(s, (j) % 32)]
+      for (unsigned q = 0; q < 2; q++) {{  // the tiles of the row's 64 best group maxima and their groups
+        unsigned g = {tile_of(9, "b", "i", "q")}, h = {tile_of(13, "b", "i", "q")};
+        noc_get(BANK(g), AT(a[9], g, {tb}), GV + q * {tb}, {tb});
+        noc_get(BANK(h), AT(a[13], h, 4096), GID + q * 4096, 4096);
+      }}
+      noc_wait();
+      // tau, the k-th best group maximum, and the groups that reach it, best first. If the 64th reaches it too, groups
+      // past the 64 may tie with it: then read the whole row, a run at a time
+      unsigned tau = MAXIMUM({k - 1}), whole = MAXIMUM(63) >= tau, reach = 0, visits;
+      while (reach < 64 && MAXIMUM(reach) >= tau) reach++;
+      visits = whole ? {cols // 16} : reach * {groups};
+      for (unsigned v0 = 0; v0 < visits; v0 += {TOPK_RUNS}) {{
+        unsigned end = v0 + {TOPK_RUNS} < visits ? v0 + {TOPK_RUNS} : visits;
+        for (unsigned v = v0; v < end; v++) RUN(whole ? 16 * v : GROUP(v / {groups}) + v % {groups} * {w}, SCRATCH + (v - v0) * 64);
+        noc_wait();
+        for (unsigned v = v0; v < end; v++)
+          for (unsigned j = 0; j < (whole ? 16 : 1); j++) {{  // out of column order, so ties compare by column in full
+            unsigned c = whole ? 16 * v + j : GROUP(v / {groups}) + v % {groups} * {w};
+            unsigned d = key(((const datum *)(SCRATCH + (v - v0) * 64 + SKEW))[c % 16]);
+            if (kept < {k} || WORSE(top[0], col[0], d, c)) keep(d, c);
+          }}
+      }}"""
+
 def heads(logits, t=None, k=64):
   """The head of each row of logits, on the chip: (values, ids[, lse]), realized, which is what Head holds.
 
@@ -48,14 +110,18 @@ def heads(logits, t=None, k=64):
   in fp32, with a kernel for the parts and another to combine them.
   A part is at most 96 tiles where the vocabulary splits that way, so more workers share the work. Otherwise it's as
   many as topk fits in L1: Llama 3's 128,256 goes as 24 parts of 5,344. There are at most 125 parts, since the second
-  topk holds 64 of the best of each part in the L1 of one worker. Returns None for a vocabulary that doesn't split
-  into such parts, and then the host reads the logits back and finds the heads in numpy."""
+  topk holds 64 of the best of each part in the L1 of one worker. With k up to 32 and 4 rows or more, rows too wide
+  for L1 go to grouped_topk, which reads far less of them: on ttsim it's the faster from 4 rows at 248,320 logits,
+  while fewer rows go faster in parts, spread over more workers. Returns None for a vocabulary that doesn't split into
+  such parts, and then the host reads the logits back and finds the heads in numpy."""
   tiles = logits.cols // 32
   cut = lambda most: next((p for p in range(1, 126) if tiles % p == 0 and tiles // p <= most), None)
   parts = cut(96) or cut(topk_room("fp32", -(-k // 32) * 32)) if logits.cols % 32 == 0 else None
   if parts is None: return None
-  best, ids = logits.topk(-(-k // 32) * 32 if parts > 1 else k, parts)
-  values, ids = best.topk(k, labels=ids) if parts > 1 else (best, ids)
+  if k <= 32 and logits.rows >= 4 and tiles > topk_room("fp32", k) and topk_groups(tiles): values, ids = grouped_topk(logits, k)
+  else:
+    best, ids = logits.topk(-(-k // 32) * 32 if parts > 1 else k, parts)
+    values, ids = best.topk(k, labels=ids) if parts > 1 else (best, ids)
   if t is None: return values.realize(), ids.realize()
   x, m = logits.split(parts), values.max(2).realize()  # one maximum for the row, including every part
   mass = ((x - m) * t).exp().sum(2)

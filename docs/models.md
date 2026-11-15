@@ -237,6 +237,8 @@ prompt tokens that were reused.
 
 For supported vocabulary shapes, the device returns the largest 64 logits and
 the normalization sum. Greedy selection and top_k up to 64 can use that result.
+A greedy pick of 4 rows or more takes `serve.grouped_topk`, which reads only the
+groups of a row's columns that can hold its largest.
 Penalties, logprobs and constrained output need the full row. Some other
 sampling requests do too, so they can read much more data back to the host.
 
