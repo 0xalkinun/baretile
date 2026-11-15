@@ -1682,6 +1682,36 @@ def test_delta_solve(chip):
   o, after = qwen.chunk(*(up(a) for a in (q, k, v, beta, g, S)))
   assert rel(value(o), want) < 1e-2 and rel(value(after), state) < 1e-2, (rel(value(o), want), rel(value(after), state))
 
+def test_delta_rule(chip):
+  # deltanet's rule takes the place of the conv and the gated delta rule, for tokens in an order of the caller's, and
+  # leaves the states as they were. A rule that runs a prompt's own recurrence, from the conv inputs and gates it's
+  # given and qwen.corrected, must give the outputs deltanet gives that prompt: to 1e-5 in NumPy, within 2% on the
+  # chip. The states come from a prompt before it, so they aren't zero.
+  rng = np.random.default_rng(67)
+  c, weights = qwen35(rng)
+  first, then = (bf16(rng.normal(0, 1, (n, c.dim))) for n in (10, 6))
+  phases = lambda op: None
+  def causal(rows, taps, gates, S):  # the prompt's recurrence as a rule: the conv in order, then the rule from S
+    f, m = llama.fns(rows), rows.shape[-2] - (c.conv - 1)
+    q, k, v, b, g = gates(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv)))
+    q, k = f.repeat(q, c.vh // c.kh), f.repeat(k, c.vh // c.kh)
+    cum, decay, u, w = qwen.corrected(k, v, f.sigmoid(b), g)
+    return (q * f.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ (u - w @ S)
+  def run(p, up, zeros, rule):  # the outputs for then after first, and the states before and after
+    state = llama.kv_cache(c, 64, zeros)[0]
+    qwen.deltanet(up(first), p, c, state, phases)
+    before = [value(s) for s in state[:2]]
+    return value(qwen.deltanet(up(then), p, c, state, phases, rule=rule)), before, state[:2]
+  rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
+  p = gpt2.block(llama.arrays(weights), "layers.0.")
+  want = run(p, lambda a: a, np.zeros, None)[0]
+  got, before, after = run(p, lambda a: a, np.zeros, causal)
+  assert rel(got, want) < 1e-5 and all(np.array_equal(value(a), b) for a, b in zip(after, before)), rel(got, want)
+  rt = Runtime(chip)
+  p = gpt2.block(llama.upload(rt, weights), "layers.0.")
+  got, before, after = run(p, lambda a: Tensor.of(rt, a.tolist()), llama.zeros(rt), causal)
+  assert rel(got, want) < 0.02 and all(np.array_equal(value(a), b) for a, b in zip(after, before)), rel(got, want)
+
 def test_speculative(chip):
   # Two slots verify their token and draft in one replayed call, with a third slot free. A right draft is accepted. A
   # wrong one is rejected (accept 0), and the next step goes on from the Gated DeltaNet states as they were after the

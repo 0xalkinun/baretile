@@ -114,7 +114,7 @@ def attends(c, w):  # whether Tensor.attend can run attention. It needs heads 64
 def rope(x, cos, sin, turn):
   return x * cos + (x @ turn) * sin
 
-def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None):
+def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None, rule=None):
   """Block l: attention, then a SwiGLU MLP, each after an RMSNorm and added back. A block whose weights have a conv
   runs Gated DeltaNet in place of attention (qwen.deltanet). With a router, it runs a mixture of experts (qwen.moe).
 
@@ -127,14 +127,14 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, acc
     mask     -1e9 where a token must not look (gpt2.mask). On the chip, around's comes with its positions and window
     prefill  a prompt's tokens, not a decode step
     live     from around. A free slot's token picks no expert and leaves its Gated DeltaNet states as they were
-  accept goes to qwen.deltanet, and slots comes from forward."""
+  accept and rule go to qwen.deltanet, and slots comes from forward."""
   f, phases = fns(x), lambda op, block=l: precision_of(c, op, block)[1]  # None means tensor.FIDELITY
   h = rms(x, p["input_layernorm"], c)
   # The residual stream is fp32, and each half's output is the fp32 sum of its last matmul (the output's, the down's
   # or the experts'). In bf16, a large value that a later block cancels would lose the low bits of what's left. Each
   # half adds onto the stream in its own kernel, and f.now realizes the stream there, so later norms don't add up the
   # blocks' outputs again.
-  mixed = (qwen.deltanet(h, p, c, cache, phases, live, accept) if "conv" in p
+  mixed = (qwen.deltanet(h, p, c, cache, phases, live, accept, rule) if "conv" in p
            else attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots))
   x = f.now(x + mixed)
   h = rms(x, p["post_attention_layernorm"], c)
@@ -445,8 +445,10 @@ def config(folder, places=4096):
                kd=j.get("linear_key_head_dim"), vd=j.get("linear_value_head_dim"),
                mtp=j.get("mtp_num_hidden_layers", 0), tied=j.get("tie_word_embeddings", False))
 
-def load(folder, places=4096):
+def load(folder, places=4096, mtp=None):
   """Return (config, {name: Weight}) from model.safetensors or the shards listed in model.safetensors.index.json.
+  mtp names a safetensors file whose mtp.* weights replace the checkpoint's, such as a multi-token prediction layer
+  trained or quantized apart from the model.
 
   Names drop "model.". Linear weights are transposed for x @ w, and vectors become one-row matrices. The output layer
   is the embedding unless the model has its own lm_head. fuse joins the matrices and stacks a mixture's experts. RoPE's
@@ -460,6 +462,10 @@ def load(folder, places=4096):
   for file in files:
     header, data = gpt2.safetensors(os.path.join(folder, file))
     tensors |= {name: (data, t) for name, t in header.items() if name != "__metadata__"}
+  if mtp is not None:
+    header, data = gpt2.safetensors(mtp)
+    tensors = {k: v for k, v in tensors.items() if not k.startswith("mtp.")}
+    tensors |= {name: (data, t) for name, t in header.items() if name.startswith("mtp.")}
   for full, (data, t) in tensors.items():
     if full.endswith("_scales"): continue  # an MXFP4 tensor's scales, read with its blocks
     name = full.removeprefix("model.").removeprefix("language_model.").removesuffix(".weight")

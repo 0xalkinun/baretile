@@ -100,8 +100,14 @@ tokens by expert, has fewer tile rows.
 Qwen3.5 and Qwen3.6 combine attention with Gated DeltaNet. A DeltaNet block
 keeps convolution history and a fixed-size recurrent state. Its decode kernel
 performs the convolution, gates and state update in fp32. Prompt processing
-works in pieces of 64 tokens. State updates are written in place so later
-replays see the new state.
+works in pieces of 64 tokens. Within a piece, each token's correction solves a
+triangular system, whose inverse `qwen.corrected` builds by joining blocks, from
+single tokens up. A product of powers over the whole piece is the same inverse,
+but in Qwen3.5-9B's later blocks, where a piece's keys point nearly the same
+way, its powers reach 1e10 and float32 loses the result. State updates are
+written in place so later replays see the new state. A `rule` of the caller's
+takes the place of the convolution and the recurrence in `qwen.deltanet`, for
+tokens in an order of its own, and leaves the states as they were.
 
 Models with a multi-token prediction layer can draft a token and verify it with
 the next token. Verification keeps state after the first token and after both
@@ -111,7 +117,10 @@ value head dimensions that are multiples of 32, and a convolution of 4 taps,
 which `llama.config` checks. A hybrid cut down to its recurrent blocks also
 runs. With no attention cache to give the positions per sequence,
 `llama.forward` takes them from its `capacity` argument, which the server
-passes, or else from the RoPE tables.
+passes, or else from the RoPE tables. `qwen.predict` is the prediction layer's
+pass on its own, with the caller's rows, positions and mask, and
+`llama.load(mtp=...)` takes that layer's weights from a separate file, such as
+a drafter trained or quantized apart from the model.
 
 Expert routing holds a prompt chunk's choices in one worker's L1, so it raises
 `ValueError` for a chunk too large for that, several thousand tokens. The
