@@ -795,8 +795,8 @@ def test_matmul_parts(chip):
   # reads A again for each group. B is read once; A is read once per group.
   # The cases split K into these parts, in tiles: 22, 22, 20. Then 32 four times with a bfp8 B in regions past the slots,
   # 22 with B transposed, and 32 four times again, so A's buffers go round. Then 22 with the last workers of the grid taking 2
-  # of their 3 columns. Last is a grid of one row, with blocks of 32 tile rows in two groups of 4 columns, where the
-  # last worker has none in the second group.
+  # of their 3 columns. Last is a grid of one row, with blocks of 32 tile rows in four groups of 2 columns, since 4 columns'
+  # fp32 sums would be past the packer's reach (bh.PACK_REACH), and the last worker has none in the last two groups.
   base = tensix.FRAMES + 2 * 3 + 1  # a lone matmul: two frames of 3 slots, plus one slot for its op
   rng = np.random.default_rng(41)
   for end, m, k, n, how in ((None, 320, 2048, 416, "bf16"), (None, 288, 4096, 224, "bfp8"), (None, 352, 2048, 200, "T"),
@@ -818,7 +818,7 @@ def test_matmul_parts(chip):
     assert kernels(rt, launches) == 1 and reads() - before == tiles, (m, k, n, how, reads() - before, tiles)
     v = value(tb)[0]
     assert np.all(np.abs(value(y)[0] - a @ v) <= 2**-8 * (np.abs(a) @ np.abs(v))), (m, k, n, how)
-    if end: assert (kp, q, groups) == (2, 4, 2), (kp, q, groups)
+    if end: assert (kp, q, groups) == (2, 2, 4), (kp, q, groups)
   rt = Runtime(chip)
   x, w, d, bias = (Tensor.of(rt, bf16(rng.uniform(-1, 1, shape)).tolist()) for shape in ((96, 4096), (4096, 200), (96, 200), (1, 200)))
   assert (x @ w * d + bias).tolist() == unfused(x @ w * d + bias).tolist()

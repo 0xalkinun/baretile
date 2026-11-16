@@ -25,7 +25,8 @@ def grid_parts(rt, w, kt, grid, base, more=0):
   Return None if A's rows and B's three buffers fit below slot 256. Otherwise return (kp, q, acc): split K
   into kp-tile parts, process q columns per worker at a time, and accumulate the partial results in fp32
   from L1 address acc. Read A again for each group of q columns. Prefer parts of at least 4 tiles, reducing
-  q if necessary, and reserve more slots for single inputs. Return False if the accumulators won't fit.
+  q if necessary, and reserve more slots for single inputs. Return False if the accumulators won't fit, in
+  L1 or within the packer's reach (bh.PACK_REACH).
 
   Choose the layout independently of B's format, so a block-float B and a bf16 B containing the same values
   produce bitwise-identical results."""
@@ -34,6 +35,7 @@ def grid_parts(rt, w, kt, grid, base, more=0):
   for least in (max(min(4, kt - 1), 1), 1):  # a part is a tile or more, so a K of one tile has none
     for q in range(bq, 0, -1):
       q = -(-bq // -(-bq // q))  # make the groups as even as possible
+      if bp * q * tile_bytes("fp32") > bh.PACK_REACH: continue  # the packer reaches every accumulator from acc
       acc = OUTS - bp * q * tile_bytes("fp32")
       for kp in range(min(kt - 1, B8_SLOTS), least - 1, -1):
         top = base + more + 3 * (bp + 1) * kp
