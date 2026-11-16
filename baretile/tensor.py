@@ -5,7 +5,7 @@ from baretile import bh
 from baretile.runtime import Bound
 from baretile.tensix import (ACCS, BFP, BINARY, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, SFPU, ext, round_bf16,
                              tile_bytes)
-from baretile.kernels import attention_plan, link_flags
+from baretile.kernels import GATHER_SHORT, attention_plan, link_flags
 from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel,
                               link_kernel, move_kernel, put_kernel, readback_kernel, storage_kernel, topk_kernel,
                               transpose_kernel, upload_kernel, zeros_kernel)
@@ -217,7 +217,8 @@ class Tensor:
       raise ValueError("gather needs batch 1, and ids as an int32 row")
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     addr, _, stride, offset = _plain(self.realize())._where()
-    return out.run(("gather", d), lambda: gather_kernel(d), out.addr, addr, stride, offset,
+    key = ("gather", d, tr if (tr := -(-self.rows // 32)) <= GATHER_SHORT else 0)
+    return out.run(key, lambda: gather_kernel(*key[1:]), out.addr, addr, stride, offset,
                    -(-self.cols // 32), ids.cols, ids.addr, ids.offset, name="gather")._track("gather", (self,), ids)
 
   @_matrices
