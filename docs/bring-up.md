@@ -125,7 +125,9 @@ hung card.
 ## Measuring a card
 
 `baretile.probe` measures launch overhead, transfers, memory latency and Tensix
-operations. `baretile.bench` runs a matmul. Use a card for performance numbers.
+operations. `baretile.bench` runs a matmul, and `baretile.models.bench` times what a
+decode or verify step of a Qwen3.5-9B-shaped model runs, each against what the
+card could do. Use a card for performance numbers.
 
 `test/benchmark.py` compares matmul, Llama decode and prefill with TT-NN. Its
 fourth workload sends concurrent HTTP requests to baretile. The TT-NN runs need
