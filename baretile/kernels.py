@@ -1015,7 +1015,9 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
                         unpack_program(f"posted += {len(made)}; drain();" + unpacker, cfg), math_program(replays, math),
                         pack_program("static unsigned needed;" + packer))
 
-def gather_kernel(dtype):
+GATHER_SHORT = 4  # the most tile rows of a table that gather_kernel reads whole
+
+def gather_kernel(dtype, short=0):
   """Copy selected tensor rows into a new tensor using BRISC.
 
   args: [first unit, units, out, input address, input tile stride, input tile offset,
@@ -1024,12 +1026,27 @@ def gather_kernel(dtype):
   Each unit writes one result tile. A worker keeps its current index tile, then reads two runs of 16 values per selected
   row, one from each face. DRAM reads must preserve the low six address bits, so each run is fetched
   as the containing 64-byte block. Read all blocks for a tile together, then copy the values into place.
-  A single-row result repeats that row throughout its tile using NoC copies within L1."""
+  A table of a few tile rows reads its whole column of tiles instead, a few large reads in place of 64 small ones,
+  which bound the time, and a 4-byte run, a whole aligned 64-byte block there, goes into place by a NoC copy within
+  L1. A single-row result repeats that row throughout its tile using NoC copies within L1."""
   tb, item = tile_bytes(dtype), ITEMSIZE[dtype]
+  if short:  # the table's column of tiles into SRC, then each row's runs from there
+    fetch = (f"for (unsigned q = 0; q < {short}; q++) {{ unsigned from = q * a[4] + j + a[5]; "
+             f"noc_get(BANK(from), AT(a[3], from, {tb}), SRC + q * {tb}, {tb}); }}")
+    run = f"SRC + id(r) / 32 * {tb} + run_of(id(r), f)"
+  else:  # row r's run in face f, through block 2 r + f of BLOCKS
+    fetch = (f"for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{ unsigned n = id(r), "
+             f"from = n / 32 * a[4] + j + a[5]; "
+             f"noc_get(BANK(from), AT(a[3], from, {tb}) + run_of(n, f) / 64 * 64, BLOCKS + (2 * r + f) * 64, 64); }}")
+    run = "BLOCKS + (2 * r + f) * 64 + run_of(id(r), f) % 64"
+  place = (f"copy({run}, SLOT + run_of(r, f), 64);" if short and item == 4 else
+           f"volatile unsigned *to = (volatile unsigned *)(SLOT + run_of(r, f)), *by = (volatile unsigned *)({run}); "
+           f"for (unsigned k = 0; k < {4 * item}; k++) to[k] = by[k];")
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
 #define IDS {DATA + tb:#x}
 #define BLOCKS {DATA + tb + 4096:#x}
+#define SRC {DATA + tb + 2 * 4096:#x}
 {ROWS}
 // index r of this tile's 32, in row 0
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}
@@ -1042,17 +1059,12 @@ void kmain(volatile unsigned *a) {{
     if (it != held) noc_get(BANK(it), AT(a[8], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")}), held = it;
     if (rows < 32) copy({ZEROS:#x}, SLOT, {tb});  // full tiles overwrite every row; partial tiles keep zero padding
     noc_wait();
-    // row r's run in face f, through block 2 r + f of BLOCKS
-    for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{
-      unsigned n = id(r), from = n / 32 * a[4] + j + a[5];
-      noc_get(BANK(from), AT(a[3], from, {tb}) + run_of(n, f) / 64 * 64, BLOCKS + (2 * r + f) * 64, 64);
-    }}
+    {fetch}
     noc_wait();
     for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{
-      volatile unsigned *to = (volatile unsigned *)(SLOT + run_of(r, f));
-      volatile unsigned *by = (volatile unsigned *)(BLOCKS + (2 * r + f) * 64 + run_of(id(r), f) % 64);
-      for (unsigned k = 0; k < {4 * item}; k++) to[k] = by[k];  // a run's 16 values, in words
+      {place}
     }}
+    noc_wait();
     if (a[7] == 1) row_down(SLOT, {ITEMSIZE[dtype]});
     noc_write(SLOT, BANK(t), AT(a[2], t, {tb}), {tb});
     noc_wait();
