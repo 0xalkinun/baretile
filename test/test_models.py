@@ -3090,9 +3090,12 @@ def test_serve(chip, tmp_path):
   class Watched(serve.Request):  # records engine.prefilled at each of its tokens, from the engine's thread
     def take(self, logits, room): self.seen = getattr(self, "seen", []) + [engine.prefilled]; return super().take(logits, room)
   r, deadline = Watched(tok, [3, 1, 4], 12, 0), time.time() + 600
+  go, advance = threading.Event(), engine.advance  # r's decoding waits for the long prompt, which a card could outrun
+  engine.advance = lambda: (go.wait(), advance())
   engine.waiting.put(r)
   while not getattr(r, "seen", None): assert time.time() < deadline; time.sleep(0.01)
   engine.waiting.put(long := serve.Request(tok, list(range(100, 150)), 2, 0))  # 50 tokens: four chunks
+  go.set()
   done(r), done(long)
   steps = np.diff(r.seen)
   assert 16 in steps and steps.max() <= 16, ("at most one chunk of the long prompt between two of its tokens", r.seen)

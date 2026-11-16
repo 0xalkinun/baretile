@@ -795,10 +795,13 @@ static void flipped(unsigned base, unsigned t, unsigned slot) {{
             {tb // 4});
 }}
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
-static void send(void) {{  // write completed results to DRAM in pack order
+// Write completed results to DRAM in pack order. The packer may reuse a slot once the NIU has read it out, before
+// DRAM acknowledges the write: the firmware's noc_wait waits for that before the launch reports done.
+static void send(void) {{
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1);
-    noc_put(OUT_SLOT(slot), BANK(t), AT(out, t, {to}), {to}); noc_wait();
+    noc_put(OUT_SLOT(slot), BANK(t), AT(out, t, {to}), {to});
+    while (NIU2(CMD) & 1) {{}} while (NIU(OUTGOING)) {{}}
   }}
 }}
 // A slot gets fetched into again once thread 0 has unpacked what was there. For a frame that's the frame two back,

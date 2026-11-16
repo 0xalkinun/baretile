@@ -3,7 +3,8 @@
 import array, collections, functools, itertools, math, operator, struct
 from baretile import bh
 from baretile.runtime import Bound
-from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
+from baretile.tensix import (ACCS, BFP, BINARY, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, SFPU, ext, round_bf16,
+                             tile_bytes)
 from baretile.kernels import attention_plan, link_flags
 from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel,
                               link_kernel, move_kernel, put_kernel, readback_kernel, storage_kernel, topk_kernel,
@@ -444,6 +445,21 @@ class Tensor:
     return self._view(self.rows // n, self.cols, self.batch * n, 0,
                       self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
+  def _split_cols(self, n, cols, made=None):
+    """This elementwise expression with each tensor of cols columns in it split into n parts by columns, or None.
+    A column or a number broadcasts as it is. made keeps each split once, so a value read twice is computed once."""
+    made = {} if made is None else made
+    if id(self) in made: return made[id(self)]
+    if self.cols != cols: t = self if self.cols == 1 else None
+    elif self.op is None: t = self.split(n) if self.batch == 1 and self.cols % (32 * n) == 0 else None
+    elif self.op not in ELEMENTWISE or self.batch != 1: t = None
+    else:
+      srcs = [s._split_cols(n, cols, made) for s in self.srcs]
+      t = None if any(s is None for s in srcs) else _lead(Tensor(self.rt, self.rows, cols // n, self.op, tuple(srcs), n,
+                                                                 self.dtype), (n,))
+    made[id(self)] = t
+    return t
+
   @_matrices
   def merge(self):
     """Place batch matrices side by side, reversing split: x.split(n).merge() has x's values, bit for bit. An unrealized
@@ -680,6 +696,10 @@ class Tensor:
     k = 0 if leading else axis - (n - 3)  # the axis of (batch, rows, cols) that the kernel folds
     shape = [math.prod(lead) if ax == k and leading else 1 if ax == k else s for ax, s in enumerate(self._dims)]
     if shape == list(self._dims): return self
+    # A kernel sweeps each line on one worker, so a few long rows take a part each on several, and a second reduction
+    # takes the parts' results: the serial tiles go from a row's to about twice its square root
+    if k == 2 and not self.requires_grad and self.batch == 1 and (p := _parts_of(self)):
+      return self._split_cols(p, self.cols)._reduce(f, -1)._reduce(f, 0)._relabel(self.lead)
     t = _lead(Tensor(self.rt, shape[1], shape[2], f"{f}{k}", (self,), shape[0], self.dtype), lead)
     # with other leading sizes, each result matrix folds lead[axis] of these, the ones after it apart
     t.axis, t.sweep = axis, (self.lead[axis], math.prod(self.lead[axis + 1:])) if leading and shape[0] > 1 else None
@@ -1057,6 +1077,11 @@ def _fit(t):
         s = gone.pop()
         readers[id(s)] -= 1
         if not readers[id(s)] and s.op and id(s) in first: gone += {id(x): x for x in s.srcs}.values()
+ELEMENTWISE = {"add", "sub", "mul", "cast", *BINARY, *SFPU}
+def _parts_of(t):  # the parts a row reduction of t splits its rows into, or None: few lines, each 16 tiles or more
+  lines, tc, workers = -(-t.rows // 32), -(-t.cols // 32), len(t.rt.cores)
+  if t.cols % 32 or tc < 16 or 4 * lines > workers or t._split_cols(2, t.cols) is None: return None
+  return min((p for p in range(2, tc) if tc % p == 0 and lines * p <= workers), key=lambda p: (tc // p + p, -p))
 def _terms(t):  # the terms of t, if it's an unrealized sum of realized tensors of its shape, else None
   if t.op != "add" or any(s.shape != t.shape or s.dtype != t.dtype for s in t.srcs): return None
   terms = [[s] if s.op is None else _terms(s) for s in t.srcs]
