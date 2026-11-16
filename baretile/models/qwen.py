@@ -8,7 +8,7 @@ import functools
 import numpy as np
 from baretile import bh
 from baretile.runtime import DATA, ZEROS, compile_kernel
-from baretile.tensix import (ACROSS, BANKS, DST_FREE, DST_HALF, FILLED, FOLDS, MATH_END, MINUS_ONE, ONE, OUTS, RAW, REPORT, ROWS, SEM_L1,
+from baretile.tensix import (ACROSS, BANKS, COPIES, DST_FREE, DST_HALF, FILLED, FOLDS, MATH_END, MINUS_ONE, ONE, OUTS, RAW, REPORT, ROWS, SEM_L1,
                             SEM_PACKED, SFPU, SFPU_START, SYNC_WORDS, UNPACKABLE, ZERO, Loop, aim, allocate, brisc_program, fill, haloize, ins,
                             kernel_config, mad, mask_columns, mask_rows, math_begin, math_program, matmul, mul, pack, pack_program, reconfigure,
                             sfp_const, sfp_load, sfp_store, sfpu, slot_base, tile_of, tt, unpack, unpack_program, walk)
@@ -35,8 +35,9 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   rule, a recurrence of the caller's, takes the place of the conv and the gated delta rule, for tokens in
   an order of its own, and the states stay as they were. rule(rows, taps, gates, S) gets each sequence's
   conv inputs (this call's, then its last c.conv - 1, so that this call's start a tile), the conv taps, gates,
-  which takes the conv's sums to q, k, v, b (before its sigmoid) and g with a batch entry for each head of each
-  sequence, and S. It returns the outputs as chunk does, a batch entry for each value head of each sequence.
+  which takes the conv's output (with its SiLU, as conv gives it) to q, k, v, b (before its sigmoid) and g with a
+  batch entry for each head of each sequence, and S. It returns the outputs as chunk does, a batch entry for each
+  value head of each sequence.
 
   p contains qkv_proj (q, k, v, z, b and a concatenated), conv taps, decay (-exp(A_log)), dt_bias,
   norm and o_proj."""
@@ -51,8 +52,8 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   def each(t, d):  # a batch entry for each head of each sequence
     heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
     return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, m * d)).reshape(seqs * heads.shape[0], m, d)
-  def gates(y):  # from the conv's sums: q and k of each key head, to length 1, v of each value head, b and g
-    y = f.silu(y).reshape(n, width)
+  def gates(y):  # from the conv's output: q and k of each key head, to length 1, v of each value head, b and g
+    y = y.reshape(n, width)
     unit = lambda t: t * f.rsqrt(f.mean(t * t) * c.kd + 1e-6)  # q and k of each head to length 1, along a row
     q, k = unit(each(y[:, :qk], c.kd)) * c.kd ** -0.5, unit(each(y[:, qk:2 * qk], c.kd))
     b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
@@ -72,7 +73,7 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     # The conv inputs of each sequence are its last ones, then this call's. Realize them before the last ones are
     # written over.
     rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))
-    y = sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))
+    y = conv(rows.reshape(seqs * (m + c.conv - 1), width), shifted(h, seqs, m, c.conv), taps)  # each token after its last inputs
     f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
     q, k, v, b, g = gates(y)
     o, S2 = chunk(q, k, v, f.sigmoid(b), g, S)
@@ -484,6 +485,96 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
   return o.run(key, lambda: delta_kernel(*key[1:]), S, o, live, *((first, accept) if m > 1 else ()), x, conv, *((conv2,) if m > 1 else ()),
                taps, dt, decay, units=n * kh, name="delta")
 
+def helpers(programs, setups={}):
+  """SFPU programs as C functions p_name(h), each over the tile at Dst half h, its words once in the program. A program
+  takes the row of its result, and its setup, if any, runs before its loop."""
+  body = lambda n, p, r: tt(SFPU_START + setups.get(n, []) + [Loop(32, p(r))])
+  return "".join(f"__attribute__((noinline)) static void p_{n}(unsigned h) {{ if (h) {{ {body(n, p, DST_HALF)} }} "
+                 f"else {{ {body(n, p, 0)} }} }}\n" for n, p in programs.items())
+
+def shifted(x, seqs, m, n):
+  """conv's picks for a prompt of m tokens in each of seqs sequences, whose conv inputs are each sequence's last n - 1
+  and then its m: token i's n inputs, oldest first. An int32 tensor on x's chip, made once for each shape."""
+  picks = np.int32([[b * (m + n - 1) + i + j for b in range(seqs) for i in range(m)] for j in range(n)])
+  return picks if isinstance(x, np.ndarray) else _shifted(x.rt, picks.tobytes(), n, seqs * m)
+
+@functools.cache
+def _shifted(rt, picks, n, cols): return Tensor.frombytes(rt, 1, cols, picks, n, "int32")
+
+def conv_kernel(n):
+  """The kernel for conv: the SiLU of the sum over n taps of the table's picked rows times the tap, one result tile a
+  unit, in fp32.
+
+  Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile
+  stride, row tile stride, tile offset): the result, the table, the picks (an int32 row for each tap) and the taps (a
+  row for each), then the result's tile columns and rows.
+
+  For each unit, BRISC reads its picks once a tile row, then the taps' tiles (a 1-row tensor repeats its row down its
+  tiles), and each tap's picked rows: from the table's tiles that they reach, through a cache of 4, by NoC copies within
+  L1, since a row's run of 16 values in a face is a whole 64-byte block. The math thread sums the products on the SFPU. Frames take
+  turns, so BRISC reads one unit while math works on the last. The result's padding rows stay 0, as SiLU(0) is."""
+  OUT, F0, R2, R3 = 1, 3, 2 * DST_HALF, 3 * DST_HALF  # output slots for each Dst half, then a frame of 2n tiles each
+  IDS, CACHE = F0 + 4 * n, F0 + 5 * n  # the picks' tiles, then the table's
+  if CACHE + 4 > UNPACKABLE: raise ValueError("conv_kernel: too many taps for L1")
+  frame = f"{F0} + (u & 1) * {2 * n}"
+  units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned t = a[0] + u, i = t / a[18], j = t % a[18]; {body} }}"
+  held = "unsigned held = ~0u, tag[4], next = 0;  // the picks' tile row, and the cache's, for this launch\n"
+  brisc = held + units(f"""unsigned F = {frame}, rows = a[19] - i * 32 < 32 ? a[19] - i * 32 : 32;
+    reached(frame_done[u & 1]);
+    if (i != held) {{ for (unsigned k = 0; k < {n}; k++) get(a[10], {tile_of(10, 'k', 0, 'i')}, {IDS} + k); held = i; }}
+    for (unsigned k = 0; k < {n}; k++) {{
+      get(a[14], {tile_of(14, 'k', 0, 'j')}, F + {n} + k);
+      if (rows < 32) copy({ZEROS:#x}, SLOT(F + k), 4096);  // full tiles overwrite every row; partial ones keep zeros
+    }}
+    noc_wait();
+    for (unsigned c = 0; c < 4; c++) tag[c] = ~0u;  // the cache holds tiles of this unit's column
+    for (unsigned k = 0; k < {n}; k++) for (unsigned r = 0; r < rows; r++) {{
+      unsigned p = ((volatile unsigned *)SLOT({IDS} + k))[at(0, r)], q = p / 32, c = 0;
+      while (c < 4 && tag[c] != q) c++;
+      if (c == 4) {{  // a miss takes the next place, once the copies from it are done
+        c = next++ % 4, tag[c] = q;
+        noc_wait();
+        get(a[6], {tile_of(6, 0, 'q', 'j')}, {CACHE} + c);
+        noc_wait();
+      }}
+      for (unsigned f = 0; f < 2; f++) copy(SLOT({CACHE} + c) + at(p % 32, 16 * f) * 4, SLOT(F + k) + at(r, 16 * f) * 4, 64);
+    }}
+    noc_wait(); ready(); frame_done[u & 1] = ++events;""")
+  free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
+  fills = lambda *pairs: tt(free + [w for slot, row in pairs for w in fill(slot, row)] + FILLED)
+  lib = lambda name: f"{tt(aim(R2))} p_{name}(); {tt(aim(0))}"  # an SFPU library program, on the tile at R2
+  silu = f"p_neg(h); {lib('fexp')} p_inc(h); {lib('frecip')} p_mul(h);"  # x / (1 + e^-x), with e^-x at R2
+  math = units(f"unsigned F = {frame}; fetched(); {tt([DST_FREE])} {fills(('F', 'h'), (f'F + {n}', R2))} p_mul(h); " +
+               "".join(f"{fills((f'F + {k}', R2), (f'F + {n + k}', R3))} p_fma(h); " for k in range(1, n)) +
+               f"{silu} {tt(MATH_END)} h ^= {DST_HALF}; {tt(REPORT)}")
+  packer = units(f"output(h / {DST_HALF}, {OUT} + h / {DST_HALF}, {tile_of(2, 0, 'i', 'j')}); "
+                 f"{tt(pack('h', f'{OUT} + h / {DST_HALF}', SEM_PACKED))} h ^= {DST_HALF};")
+  programs = {"mul": lambda r: [sfp_load(0, r), sfp_load(1, R2), mul(2, 0, 1), sfp_store(2, r)],
+              "fma": lambda r: [sfp_load(0, r), sfp_load(1, R2), sfp_load(2, R3), mad(3, 1, 2, 0), sfp_store(3, r)],
+              "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, R2)],  # -r into R2
+              "inc": lambda r: [sfp_load(0, R2), mad(1, 0, ONE, ONE), sfp_store(1, R2)]}  # 1 + R2
+  library = "".join(f"__attribute__((noinline)) static void p_{n}(void) {{ {tt(sfpu([n], {}))} }}\n" for n in ("fexp", "frecip"))
+  cfg = kernel_config("fp32", "fp32")
+  return compile_kernel(brisc_program("a[1]", brisc, "fp32", "fp32", COPIES),
+                        unpack_program(units("fetched();"), cfg), math_program({}, math, True, helpers(programs) + library),
+                        pack_program(packer))
+
+def conv(table, picks, taps):
+  """SiLU of the sum over taps t of table[picks[t]] times taps[t]: Gated DeltaNet's conv, for tokens whose inputs are
+  rows of table in any order, such as a prompt's in turn or a tree's along each path (conv_kernel, one launch). table
+  is a matrix of fp32 rows, picks an int32 row of indices for each tap, and taps a row of fp32 weights for each.
+  Unchecked indices, as Tensor.gather's."""
+  if isinstance(table, np.ndarray):
+    y = sum(table.reshape(-1, table.shape[-1])[np.ravel(p)] * w for p, w in zip(picks, taps))[None]
+    return y / (1 + np.exp(-y))
+  m, width = picks.cols, table.cols
+  if not (table.batch == 1 and table.dtype == taps.dtype == "fp32" and picks.dtype == "int32" and picks.rows == 1 and
+          taps.shape == (picks.batch, 1, width)):
+    raise ValueError("conv needs an fp32 table, an int32 row of picks and an fp32 row of taps for each tap")
+  out = Tensor(table.rt, m, width, dtype="fp32")
+  return out.run(("conv", picks.batch), lambda: conv_kernel(picks.batch), out, table, picks, taps, -(-width // 32),
+                 m, units=out.tiles, name="conv")
+
 def rule_kernel(st, kt, vt, rep, state):
   """The kernel for rule: a piece's gated delta rule after the decays, one value head a unit, all of it in fp32. Every
   product runs on the FPU, which reads fp32 tiles as TF32 (10 bits of mantissa, as the GPU engine's tree kernel), and
@@ -603,14 +694,10 @@ def rule_kernel(st, kt, vt, rep, state):
   units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned e = a[0] + u; {body} }}"
   total = f"a[1] * {2 * st * vt + kt * vt * state}"
   brisc = units(f"reached(frame_done[0]); {fetch} ready(); frame_done[0] = ++events;")
-  setup = lambda n: SFPU["ftoh"][0] if n == "round" else []
-  helper = lambda n, p: (f"__attribute__((noinline)) static void p_{n}(unsigned h) {{ "
-                         f"if (h) {{ {tt(SFPU_START + setup(n) + [Loop(32, p(DST_HALF))])} }} "
-                         f"else {{ {tt(SFPU_START + setup(n) + [Loop(32, p(0))])} }} }}\n")
   cfg = kernel_config("fp32", "fp32")
   return compile_kernel(brisc_program(total, brisc, "fp32", "fp32"), unpack_program(units("fetched();"), cfg),
                         math_program(replays, units("fetched(); " + " ".join(m for m, _ in ops) + " " + tt(REPORT)), True,
-                                     "".join(helper(n, p) for n, p in programs.items()), wide=True),
+                                     helpers(programs, {"round": SFPU["ftoh"][0]}), wide=True),
                         pack_program(units(" ".join(c for _, c in ops)), 2 + st * vt))
 
 def rule(q, k, v, beta, g, S, seen=None, state=False):

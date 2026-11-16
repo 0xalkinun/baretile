@@ -683,8 +683,9 @@ static inline unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16
 NEAR = f"""static unsigned near[{len(bh.DRAM)}];
 #undef BANK
 #define BANK(t) near[(t) % {len(bh.DRAM)}] & 63, near[(t) % {len(bh.DRAM)}] >> 6"""
-# C shared by the kernels that run on BRISC alone: the banks, copies within this L1, and copying a row down its tile
-ROWS = BANKS + """
+# C shared by the kernels that run on BRISC alone: the banks (ROWS), copies within this L1, and copying a row down its
+# tile (COPIES, which a kernel with TRISC programs takes beside its BRISC program's banks)
+ROWS = BANKS + (COPIES := """
 // A copy within this L1. This tile's coordinates take an NIU register read, so it reads them once a launch.
 static void copy(unsigned from, unsigned to, unsigned n) {
   static unsigned me;
@@ -702,7 +703,7 @@ static void row_down(unsigned tile, unsigned item) {
   }
   copy(tile, tile + 2 * face, 2 * face);
   noc_wait();
-}"""
+}""")
 # tile (b, r, c) of the tensor at a[i]
 def tile_of(i, b, r, c, a="a"): return f"({b}) * {a}[{i} + 1] + ({r}) * {a}[{i} + 2] + ({c}) + {a}[{i} + 3]"
 
