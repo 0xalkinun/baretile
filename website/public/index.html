@@ -22,7 +22,7 @@ The driver runs in userspace and loads our firmware onto the workers.
 We use Tenstorrent's board firmware for ARC and Ethernet, with no dependency on tt-metal, tt-umd or LLK.</p>
 
 <p>We develop on Tenstorrent's ttsim simulator.
-A P150a has run the first bring-up stages, preflight, chip and transfers; nothing else is tested on a card yet.
+A P150a has run bring-up through its probe stage, and SmolLM-135M matches NumPy on it. A few kernel and model tests still fail there.
 Simulator timings don't predict card performance.
 The <a href="https://github.com/users/0xalkinun/projects/1">roadmap</a> says what we're building first.</p>
 
