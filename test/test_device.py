@@ -855,11 +855,12 @@ def test_readers(chip):
   assert sum(links(p, w) for w, (_, p) in zip(rt.cores, rt.readers)) < sum(links(p, w) for w in rt.cores[:n] for p in every) / len(every) / 2
 
 def test_relaunch_without_reset(chip):
-  # Different kernels run back to back from the same address, each loaded after the one before was evicted. A stale
-  # copy of the previous kernel would give the wrong answer.
-  rt = Runtime(chip, end=chip.tensix[2])
+  # Different kernels run back to back from the same address on every worker, each loaded after the one before was
+  # evicted and just before its doorbell, which goes through another TLB (#26). A stale copy of the previous kernel, or
+  # a doorbell that overtook the load, would give the wrong answer.
+  rt = Runtime(chip)
   cores = rt.cores
-  for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 2):
+  for i, (op, f) in enumerate([("*", int.__mul__), ("+", int.__add__)] * 16):
     rt.evict()
     rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ a[3] = (noc_me() + a[2]) {op} 3; }}"), (i, 0))
     rt.wait()
@@ -867,7 +868,7 @@ def test_relaunch_without_reset(chip):
   # Kernels stay loaded until their area of L1 is full. Then the next load evicts them all, once the queue is done.
   big = [compile_kernel(f"void kmain(volatile unsigned *a) {{ a[1] = a[0] + {k}; }}").ljust(300_000, b"\0") for k in (1, 2)]
   rt.evict()
-  for k, image in enumerate(big + big):
+  for k, image in enumerate((big + big) * 4):
     rt.launch(image)
     rt.wait()
     assert rt.loaded == {image: KERNELS} and all(chip.read32(x, y, rt.args() + 4) == i + k % 2 + 1 for i, (x, y) in enumerate(cores))
