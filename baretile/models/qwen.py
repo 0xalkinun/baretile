@@ -34,9 +34,9 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
 
   rule, a recurrence of the caller's, takes the place of the conv and the gated delta rule, for tokens in
   an order of its own, and the states stay as they were. rule(rows, taps, gates, S) gets each sequence's
-  conv inputs (its last c.conv - 1, then this call's), the conv taps, gates, which takes the conv's sums
-  to q, k, v, b (before its sigmoid) and g with a batch entry for each head of each sequence, and S. It
-  returns the outputs as chunk does, a batch entry for each value head of each sequence.
+  conv inputs (this call's, then its last c.conv - 1, so that this call's start a tile), the conv taps, gates,
+  which takes the conv's sums to q, k, v, b (before its sigmoid) and g with a batch entry for each head of each
+  sequence, and S. It returns the outputs as chunk does, a batch entry for each value head of each sequence.
 
   p contains qkv_proj (q, k, v, z, b and a concatenated), conv taps, decay (-exp(A_log)), dt_bias,
   norm and o_proj."""
@@ -58,8 +58,8 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
     g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus: the log decay of each head
     return q, k, each(y[:, 2 * qk:], c.vd), each(b, 1), g
-  if rule is not None:  # the caller's recurrence, from the conv inputs: the last ones, then this call's
-    o = rule(f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width))), taps, gates, S)
+  if rule is not None:  # the caller's recurrence, from the conv inputs: this call's, then the last ones
+    o = rule(f.now(f.cat(x[:, :width].reshape(seqs, m, width), f.swap(past))), taps, gates, S)
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   elif (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
     # A decode step's token, or a verify step's token and then its draft, in one kernel with a unit for each key head
@@ -635,7 +635,8 @@ def rule(q, k, v, beta, g, S, seen=None, state=False):
   qr, kr, seen = f.repeat(q, rep), f.repeat(k, rep), f.tri(s, True) if seen is None else seen
   cum = f.now(f.bf16(seen) @ g)  # seen is 0 or 1, which bf16 holds exactly
   decay = f.exp(f.minimum(cum - f.t(cum), 0)) * seen
-  e, kb = f.exp(cum), kr * beta
+  e, beta = f.now(f.exp(cum)), f.now(beta)  # columns, made once: the scaled rows would each work them out again
+  kb = kr * beta
   extra = (f.exp(G := cum[:, s - 1:s, :]) * ones(q.rt), near(f.t(kr * f.exp(G - cum)))) if state else ()
   out = Tensor(q.rt, 64 * st + 32 * kt * state, vd, batch=h, dtype="fp32")  # its padding stays 0, as the inputs' does
   key = ("rule", st, kt, vt, rep, state)
