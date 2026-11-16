@@ -1046,9 +1046,9 @@ def test_hung_kernel_times_out(chip):
   rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ ((volatile unsigned *){MAILBOX:#x})[5] = noc_me(); }}"))  # reports to itself
   with pytest.raises(TimeoutError, match=r"launch 1, whose workers all finished, so it missed a report$"): rt.wait(timeout=0.2)
   rt = Runtime(chip, end=chip.tensix[1])
-  # a hang's report ends with each core's last three lines
+  # a hang's report ends with each core's last three lines, and on a card with its pcs
   rt.launch(compile_kernel('void kmain(volatile unsigned *a) { for (unsigned i = 0; i < 5; i++) print("waiting on %u", i); for (;;); }'))
   with pytest.raises(TimeoutError, match=r"not finished by BRISC\n.*\n.*\n    printed \(1, 2\) BRISC: 2 earlier lines not shown\n"
-                     r"    printed \(1, 2\) BRISC, launch 1: waiting on 2\n.*\n.*waiting on 4(\n    pc .*)?$"): rt.wait(timeout=0.2)  # a card adds the pcs
+                     r"    printed \(1, 2\) BRISC, launch 1: waiting on 2\n.*\n.*waiting on 4(\n    pc .*)?$"): rt.wait(timeout=0.2)
   rt.close()  # a hung ordinary kernel holds cancellation up for at most the launch's two seconds
   assert rt.resources.closed
