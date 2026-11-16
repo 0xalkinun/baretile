@@ -178,7 +178,8 @@ A P150a has settled these, which ttsim doesn't model:
   their doorbells, and one loaded over zeros, which no core can run, ran right
   every time.
 - A request initiator can hold a request before the NIU counts it, so
-  `noc_wait` waits for the initiators to be free first.
+  `noc_wait` waits for the initiators to be free first. The NIU counts requests
+  in flight modulo 256, so no core has more than 255 out at once.
 - A write that the PCIe tile forwards to host memory is posted, so
   `Chip.write` reads it back.
 - A packer's offset past its L1 address wraps at 256 KiB (`bh.PACK_REACH`), so
