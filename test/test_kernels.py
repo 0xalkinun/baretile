@@ -162,6 +162,7 @@ def test_viz_script(tmp_path):
   assert [k["name"] for k in run["kernels"]] == ["mul", "readback"] and run["kernels"][0]["graph"][-1][0] == "mul"
 
 
+@pytest.mark.skipif(pci.simulator() is None, reason="the script opens the device again, and a card can't be open in two processes")
 def test_viz_dropped_runtimes(tmp_path):
   # Under viz, a script that makes and drops runtimes one after another leaves as many open as without viz, so it
   # needs no more host memory, and the page still shows the launches of each one, kept as Python reaps it (#22).
