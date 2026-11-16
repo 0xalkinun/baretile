@@ -1,8 +1,8 @@
 # Bring-up on a card
 
 These steps take baretile onto a Blackhole P150a for the first time. A P150a has
-run the first bring-up stages, preflight, chip and transfers; nothing else is
-tested on a card yet. Start at the bottom of the stack and stop at the first
+run them through the probe stage, and SmolLM-135M matches NumPy on it; a few
+kernel and model tests still fail there. Start at the bottom of the stack and stop at the first
 failure, since the later tests need the earlier ones to work.
 
 ## Before you start

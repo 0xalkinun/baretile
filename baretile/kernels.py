@@ -698,17 +698,17 @@ j0 = {col0};
     (gx_n, gy_n), (xs, ys), kt, x = bcast, grid, mm["kt"], arg(mm["x"])
     # each matrix's grid rows
     rects = [bh.noc_rect((xs[0], ys[g]), (xs[gx_n - 1], ys[g + gy_n - 1])) for g in range(0, nb * gy_n, gy_n)]
-    decls, tail = decls + table("rect", rects) + "\n" + ours, f"unflag({gx_n}, 0);"
+    decls, tail = decls + table("rect", rects) + "\n" + ours, "unflag(1, 0);"
     in_batch = matrix(mm["x"], x)
     near = (f"  for (unsigned i = 0; i < {len(bh.DRAM)}; i++) near[i] = bank[i];\n"
             "  near[reader[a[0]] >> 12 & 7] = reader[a[0]] & 0xFFF; "
             " // its own bank through its reader's port\n") if local else ""
-    first = (near + f"  {{ unsigned b = a[0] / {bcols}, gx = a[0] % {gx_n}, e = gx * {kt} / {gx_n}, "
-                    f"end = (gx + 1) * {kt} / {gx_n};\n"
-             f"    if (a[0] % {bcols} < {gx_n}) {{ for (unsigned m = e; m < end; "
-             f"m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
-             f"      share(SLOT({rows_at[0]} + e), "
-             f"(end - e) * {tile_bytes(dtype)}, rect[b], {bcols - 1}, gx, 1); }}\n    await(0, {gx_n}, 1);\n  }}\n")
+    # One worker of each matrix reads A's row and multicasts it: on a card, multicasts into one rectangle from several
+    # workers queue up behind each other, and sharing A's row this way took 2-3x as long
+    first = (near + f"  {{ unsigned b = a[0] / {bcols};\n    if (a[0] % {bcols} == 0) {{ "
+                    f"for (unsigned m = 0; m < {kt}; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
+             f"      share(SLOT({rows_at[0]}), {kt * tile_bytes(dtype)}, rect[b], {bcols - 1}, 0, 1); }}\n"
+             "    await(0, 1, 1);\n  }\n")
   # With shared, grid workers wait for A's row before their first tile. The grid's first row reads and sends it.
   if shared:
     (xs, ys), kt, x = grid, mm["kt"], arg(mm["x"])

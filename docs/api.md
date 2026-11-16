@@ -2,9 +2,9 @@
 
 This page lists what you can build on, and what it promises. Names it doesn't
 list, and names that start with an underscore, are internal and change freely.
-baretile is pre-alpha. A P150a has run the first bring-up stages, preflight,
-chip and transfers; nothing else is tested on a card yet, so everything below is
-promised on ttsim only.
+baretile is pre-alpha. A P150a has run bring-up through its probe stage, but a
+few kernel and model tests still fail there, so everything below is promised on
+ttsim only.
 
 baretile has its own small frontend, `tensor.Tensor`, which its models are
 written in. tinygrad programs also run on baretile, through the adapter, which

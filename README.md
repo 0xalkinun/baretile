@@ -6,8 +6,9 @@ baretile is a compiler and runtime for Tenstorrent Blackhole, written in Python.
 You write tensor operations, and it compiles them into Tensix instructions. It
 also handles the PCIe access needed to load and run those programs on the chip.
 
-It runs on Tenstorrent's ttsim simulator. A P150a has run the first bring-up
-stages, preflight, chip and transfers; nothing else is tested on a card yet.
+It runs on Tenstorrent's ttsim simulator. A P150a has run bring-up
+through its probe stage, and SmolLM-135M matches NumPy on it. A few kernel and
+model tests still fail there.
 
 The code in `baretile/` uses only the Python standard library. The driver runs
 in userspace, and baretile loads its own firmware onto the workers. It needs

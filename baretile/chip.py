@@ -83,6 +83,9 @@ class Chip:
     for off, size in self.chunks(x, y, addr, len(data), start):
       self.pci.write(off, data[done:done + size])
       done += size
+    # A write the PCIe tile forwards to host memory is posted, and can land after the host looks (a slow link shows it).
+    # A read behind it can't pass it, so the write is in memory once the read returns.
+    if (x, y) == bh.PCIE and data: self.read(x, y, addr + len(data) - 1, 1)
   def read32(self, x, y, addr): return int.from_bytes(self.read(x, y, addr, 4), "little")
   def write32(self, x, y, addr, val, start=None): self.write(x, y, addr, val.to_bytes(4, "little"), start)
 

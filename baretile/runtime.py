@@ -107,8 +107,8 @@ static inline void mcast_done(unsigned acks) {{
   l1_settle({MCAST_STATE + 4:#x});
 }}
 static inline void noc_wait(void) {{  // wait until reads have landed and writes are acknowledged
-  // reading the initiators back keeps the counter read behind their last requests
-  (void)NIU(CMD); (void)NIU1(CMD); (void)NIU2(CMD);
+  // An initiator still holding a request hasn't counted it yet, which a busy NoC shows (ttsim never holds one)
+  while ((NIU(CMD) | NIU1(CMD) | NIU2(CMD)) & 1) {{}}
   while (NIU(OUTSTANDING)) {{}}
   asm volatile("fence" ::: "memory");  // drop L0 data cache lines that the NoC may have overwritten
 }}
