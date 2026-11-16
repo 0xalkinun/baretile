@@ -1112,7 +1112,8 @@ def put_kernel(dtype):
 
   A unit is a row of x in a matrix and tile column of the tensor, so the work grows with the rows put, not with the
   size of the tensor. Workers read all the places, 32 to a tile, and chain the rows that land in each tile row, first
-  to last. The unit of the first row to land in a tile row does the work. It reads the tensor's tile once, then the
+  to last. The unit of the first row to land in a tile row does the work. The rows come innermost among the units,
+  so the few that work, like a verify's rows over two tile rows, spread over the workers instead of a few taking all. It reads the tensor's tile once, then the
   tile of x for each row. It copies each row's two runs, the left and right face, in order, so a later row to the
   same place wins. Then it writes the tile back. No two workers write the same tile. 32 rows that fill a tile in
   order, like a prompt's starting at a tile boundary, use their tile of x as it is. Places past the tensor's last tile
@@ -1172,7 +1173,7 @@ void kmain(volatile unsigned *a) {{
   for (unsigned i = 0; i < tr; i++) first[i] = ~0u;
   for (unsigned i = n; i-- > 0;) if (place[i] / 32 < tr) {{ next[i] = first[place[i] / 32]; first[place[i] / 32] = i; }}
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, b = unit / (n * ct), i0 = unit / ct % n, j = unit % ct, ti = place[i0] / 32;
+    unsigned unit = a[0] + u, b = unit / (n * ct), j = unit / n % ct, i0 = unit % n, ti = place[i0] / 32;
     if (ti >= tr || first[ti] != i0) continue;  // the tile belongs to an earlier row's unit, or there's none
     unsigned to = b * a[3] + ti * a[4] + j + a[5], held = ~0u, whole = i0 % 32 == 0 && i0 + 32 <= n;
     for (unsigned k = 0; whole && k < 32; k++) whole = place[i0 + k] == 32 * ti + k;
