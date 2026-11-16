@@ -275,12 +275,12 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install numpy pytest
+      # the runner's own Python, 3.12 or later, in a venv kept beside the checkout: setup-python's builds are Ubuntu's
+      - run: python3 -m venv ../venv && ../venv/bin/python -m pip install numpy pytest
+      # one process opens the card at a time, so wait while another, such as someone's work at the machine, holds it
+      - run: timeout 3600 sh -c 'until ../venv/bin/python -c "from baretile import pci; pci.open_device()"; do sleep 30; done'
       - name: Bring up the card and run the suite on it
-        run: python test/bringup.py record --only preflight,chip,transfers,launches,math,kernels,models${{ vars.SMOLLM && format(',smollm --smollm {0}', vars.SMOLLM) || '' }}
+        run: ../venv/bin/python test/bringup.py record --only preflight,chip,transfers,launches,math,kernels,models${{ vars.SMOLLM && format(',smollm --smollm {0}', vars.SMOLLM) || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -137,25 +137,32 @@ top.
 
 Once bring-up passes, CI can run it on the card for every change, so the card
 path doesn't break between manual checks. The `card` job in
-[the workflow](../.github/workflows/test.yml) has no runner yet. Once one
-exists, it runs `test/bringup.py` from preflight through the model tests, keeps
-the record as an artifact, and fails at the first failing stage. It names the
-SmolLM stage in `--only`, and so runs it, only when the repository variable
-`SMOLLM` gives a SmolLM-135M folder on the card's machine. It leaves out the
-probe, which measures, and the Llama stages, which take hours.
+[the workflow](../.github/workflows/test.yml) runs `test/bringup.py` from
+preflight through the model tests, keeps the record as an artifact, and fails
+at the first failing stage. It names the SmolLM stage in `--only`, and so runs
+it, only when the repository variable `SMOLLM` gives a SmolLM-135M folder on the
+card's machine. It leaves out the probe, which measures, and the Llama stages,
+which take hours. It runs in a venv of the machine's own Python, and waits for
+the card while another process has it open, such as someone's work at the
+machine.
 
-To set it up on the card's machine:
+A self-hosted runner runs whatever a pull request's code does, with its
+user's access. The job never runs for a pull request from a fork, and the
+runner runs as a user of its own, `baretile-ci`, which can reach the card, the
+checkout and its own files, and nothing in other users' homes. To set it up on
+the card's machine, with tt-kmd, clang and lld installed:
 
-1. Install tt-kmd, so the runner needs no root, and clang and lld.
-2. Add a self-hosted runner for the repository, with the label `p150a`, running
-   as an ordinary user. The repository's runner settings give the commands.
-3. In the repository's variables, set `CARD` to `true`, and `SMOLLM` if you
-   like.
+```sh
+sudo useradd --create-home baretile-ci
+sudo -u baretile-ci sh -c 'mkdir ~/runner && cd ~/runner && curl -fsSLo r.tgz https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-linux-x64-2.338.2.tar.gz && echo "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40  r.tgz" | sha256sum -c && tar xzf r.tgz && rm r.tgz'
+token=$(gh api -X POST repos/0xalkinun/baretile/actions/runners/registration-token --jq .token)
+sudo -u baretile-ci sh -c "cd ~/runner && ./config.sh --unattended --url https://github.com/0xalkinun/baretile --token $token --name p150a --labels p150a"
+cd /home/baretile-ci/runner && sudo ./svc.sh install baretile-ci && sudo ./svc.sh start
+```
 
-The job never runs for a pull request from a fork. A self-hosted runner runs
-whatever a pull request's code does, with the machine's access, so keep the
-machine for the card, and its runner for this repository. It becomes a required
-check once it has passed reliably for a week
+The token lasts an hour. Then, in the repository's variables, set `CARD` to
+`true`, and `SMOLLM` to a SmolLM-135M folder that `baretile-ci` can read. The
+job becomes a required check once it has passed reliably for a week
 ([#11](https://github.com/0xalkinun/baretile/issues/11)).
 
 ## What a card has shown
@@ -167,8 +174,9 @@ A P150a has settled these, which ttsim doesn't model:
 - Loading a new kernel where another was invalidates the old instructions: 40
   kernels loaded in turn at one address each ran on every core. A kernel
   arrives before the doorbell that launches it, though they go through
-  different TLBs: one loaded over zeros, which no core can run, ran right every
-  time.
+  different TLBs: `test_relaunch_without_reset` loads 40 in turn just before
+  their doorbells, and one loaded over zeros, which no core can run, ran right
+  every time.
 - A request initiator can hold a request before the NIU counts it, so
   `noc_wait` waits for the initiators to be free first.
 - A write that the PCIe tile forwards to host memory is posted, so
