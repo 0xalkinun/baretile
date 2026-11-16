@@ -1110,14 +1110,14 @@ def put_kernel(dtype):
   address and tile offset of the int32 row that holds the places of the n rows, then n, and the tensor's tile columns
   and tile rows, then its logical row count].
 
-  A unit is a row of x in a matrix and tile column of the tensor, so the work grows with the rows put, not with the
-  size of the tensor. Workers read all the places, 32 to a tile, and chain the rows that land in each tile row, first
-  to last. The unit of the first row to land in a tile row does the work. The rows come innermost among the units,
-  so the few that work, like a verify's rows over two tile rows, spread over the workers instead of a few taking all. It reads the tensor's tile once, then the
-  tile of x for each row. It copies each row's two runs, the left and right face, in order, so a later row to the
-  same place wins. Then it writes the tile back. No two workers write the same tile. 32 rows that fill a tile in
-  order, like a prompt's starting at a tile boundary, use their tile of x as it is. Places past the tensor's last tile
-  row are skipped, and a place in the padding of its last tile row is written there.
+  A unit is a row of x in a matrix and tile column of the tensor, so the work grows with the rows put, not with the size
+  of the tensor. Workers read all the places, 32 to a tile, and chain the rows that land in each tile row, first to
+  last. The unit of the first row to land in a tile row does the work. The rows come innermost among the units, so the
+  few that work, like a verify's rows over two tile rows, spread over the workers instead of a few taking all. It reads
+  the tensor's tile once, then the tile of x for each row. It copies each row's two runs, the left and right face, in
+  order, so a later row to the same place wins. Then it writes the tile back. No two workers write the same tile. 32
+  rows that fill a tile in order, like a prompt's starting at a tile boundary, use their tile of x as it is. Places past
+  the tensor's last tile row are skipped, and a place in the padding of its last tile row is written there.
 
   Into a block float, like a KV cache in bfp8 or bfp4, x is bf16 and each run of 16 rounds as a cast would. The run
   shares its largest exponent. bfp8 keeps 7 bits of magnitude rounded half up, as the packer does. bfp4 keeps 3 bits
@@ -1173,7 +1173,8 @@ void kmain(volatile unsigned *a) {{
   for (unsigned i = 0; i < tr; i++) first[i] = ~0u;
   for (unsigned i = n; i-- > 0;) if (place[i] / 32 < tr) {{ next[i] = first[place[i] / 32]; first[place[i] / 32] = i; }}
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, b = unit / (n * ct), j = unit / n % ct, i0 = unit % n, ti = place[i0] / 32;
+    unsigned unit = a[0] + u, b = unit / (n * ct), j = unit / n % ct, i0 = unit % n;  // the rows innermost
+    unsigned ti = place[i0] / 32;
     if (ti >= tr || first[ti] != i0) continue;  // the tile belongs to an earlier row's unit, or there's none
     unsigned to = b * a[3] + ti * a[4] + j + a[5], held = ~0u, whole = i0 % 32 == 0 && i0 + 32 <= n;
     for (unsigned k = 0; whole && k < 32; k++) whole = place[i0 + k] == 32 * ti + k;
