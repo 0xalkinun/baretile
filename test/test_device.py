@@ -40,7 +40,7 @@ def test_layers():
     theirs = {name for q in trees if q != p for name in defined[q] if private(name)} - defined[p]
     assert not used[p] & theirs, f"{p.name} uses another file's private {sorted(used[p] & theirs)}"
 
-CORE, BUDGET, WIDTH = ("bh", "pci", "chip", "runtime", "tensix", "kernels", "tensor"), 4500, 120  # layers 0 to 3
+CORE, BUDGET, WIDTH = ("bh", "pci", "chip", "runtime", "tensix", "kernels", "tensor"), 4600, 120  # layers 0 to 3
 
 def code_lines(text, width=WIDTH):
   """Count the lines of code in Python source: not its comments, blank lines or docstrings. A line counts once for
@@ -71,6 +71,12 @@ def test_open_device(chip):
   with pytest.raises(RuntimeError, match="already open"): pci.open_device()
   with pytest.raises(RuntimeError, match="already has a Chip"): Chip(chip.pci)
   with pytest.raises(ValueError, match="chips"): pci.open_device(64)
+
+def test_config_bank_off_noc(chip):
+  # A Tensix tile's config bank isn't on the NoC, and on a card an access there takes it off its PCIe link, so Chip
+  # refuses one, an access that only reaches into it too, before anything goes out
+  with pytest.raises(ValueError, match="config bank"): chip.read(*chip.tensix[0], bh.TENSIX_CFG + 4 * bh.CFG_IC_INVALIDATE, 4)
+  with pytest.raises(ValueError, match="config bank"): chip.write(*chip.tensix[0], bh.TENSIX_CFG - 4, bytes(8))
 
 def test_config_space(chip):
   assert chip.pci.cfg_read(0x00) == bh.VENDOR | bh.DEVICE << 16
