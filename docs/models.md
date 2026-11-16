@@ -104,7 +104,10 @@ works in pieces of 64 tokens. Within a piece, each token's correction solves a
 triangular system, whose inverse `qwen.corrected` builds by joining blocks, from
 single tokens up. A product of powers over the whole piece is the same inverse,
 but in Qwen3.5-9B's later blocks, where a piece's keys point nearly the same
-way, its powers reach 1e10 and float32 loses the result. State updates are
+way, its powers reach 1e10 and float32 loses the result. On the chip a piece
+is one kernel, `qwen.rule`, after tensor operations for the decays: every
+product on the FPU, which reads the fp32 tiles as TF32 (10 bits of mantissa,
+as the GPU engine's kernels compute it), and the rest on the SFPU. State updates are
 written in place so later replays see the new state. A `rule` of the caller's
 takes the place of the convolution and the recurrence in `qwen.deltanet`, for
 tokens in an order of its own, and leaves the states as they were.

@@ -87,4 +87,4 @@ tile running a kernel; a tensor tile is the data it processes.
 | | [baretile/adapters/](../baretile/adapters) | The BARETILE device for tinygrad |
 
 A kernel that only one workload uses stays in layer 4 next to that workload.
-For example, Gated DeltaNet's decode kernel is in `baretile/models/qwen.py`.
+For example, Gated DeltaNet's kernels are in `baretile/models/qwen.py`.

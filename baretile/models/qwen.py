@@ -3,12 +3,15 @@
 # these models live here: delta updates recurrent state, group sorts a long prompt's tokens by expert,
 # and touched lists the experts that a decode step's or a short prompt's tokens selected. gpt-oss
 # weights are converted from MXFP4.
+import functools
+
 import numpy as np
 from baretile import bh
 from baretile.runtime import DATA, ZEROS, compile_kernel
-from baretile.tensix import (ACROSS, BANKS, DST_FREE, DST_HALF, FILLED, FOLDS, MATH_END, MINUS_ONE, ONE, OUTS, REPORT, ROWS, SEM_L1, SEM_PACKED,
-                            SFPU_START, SYNC_WORDS, UNPACKABLE, ZERO, Loop, aim, fill, ins, kernel_config, mad, mask_columns, mask_rows, math_program,
-                            mul, pack, pack_program, sfp_const, sfp_load, sfp_store, sfpu, slot_base, tile_of, tt, unpack_program)
+from baretile.tensix import (ACROSS, BANKS, DST_FREE, DST_HALF, FILLED, FOLDS, MATH_END, MINUS_ONE, ONE, OUTS, RAW, REPORT, ROWS, SEM_L1,
+                            SEM_PACKED, SFPU, SFPU_START, SYNC_WORDS, UNPACKABLE, ZERO, Loop, aim, allocate, brisc_program, fill, haloize, ins,
+                            kernel_config, mad, mask_columns, mask_rows, math_begin, math_program, matmul, mul, pack, pack_program, reconfigure,
+                            sfp_const, sfp_load, sfp_store, sfpu, slot_base, tile_of, tt, unpack, unpack_program, walk)
 from baretile.tensor import Tensor
 from baretile.models import gpt2, llama
 
@@ -39,7 +42,7 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   norm and o_proj."""
   f, (past, S) = llama.fns(h), state[:2]
   past = past.get() if isinstance(past, Row) else past  # the conv state of one sequence out of several
-  n, seqs, qk, vw, r = h.shape[-2], past.shape[1], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
+  n, seqs, qk, vw = h.shape[-2], past.shape[1], c.kh * c.kd, c.vh * c.vd
   m, width, taps = n // seqs, 2 * qk + vw, p["conv"]  # tokens per sequence, channels of the conv, and its taps (a batch entry each)
   x = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32")
   alive = lambda: live.reshape(1, seqs, m)[:, :, :1]  # the first token of each sequence, with sequences as rows
@@ -72,7 +75,7 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     y = sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))
     f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
     q, k, v, b, g = gates(y)
-    o, S2 = chunk(f.repeat(q, r), f.repeat(k, r), v, f.sigmoid(b), g, S)
+    o, S2 = chunk(q, k, v, f.sigmoid(b), g, S)
     o = f.now(o)  # o reads the state, so realize it before the state is written over
     f.assign(state[1], big(state[1], S2))
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
@@ -144,30 +147,20 @@ def corrected(k, v, beta, g, seen=None):
   return cum, decay, inv @ (v * beta), inv @ (kbeta * f.exp(cum))
 
 def chunk(q, k, v, beta, g, S, size=64):
-  """Apply the gated delta rule to a prompt in 64-token chunks, following transformers'
-  torch_chunk_gated_delta_rule. Take initial state S, queries q, keys k, values v, and columns beta
-  and g. Return each token's output and the final state.
-
-  Batch the work independent of S across chunks. Pad the last chunk with tokens whose key, value
-  and decay are zero, so they don't change state. Then process chunks in order, using four matmuls
-  per chunk to update state and write outputs.
-
-  Within a chunk, corrections solve (I + L) u = beta v, as corrected says."""
+  """Apply the gated delta rule to a prompt in 64-token pieces, following transformers'
+  torch_chunk_gated_delta_rule. Take initial state S, queries q and keys k for each key head (as rule), values v,
+  and columns beta and g. Return each token's output and the final state. Pad the last piece with tokens whose key, value
+  and decay are zero, so they don't change state. Each piece runs by rule, the state through them in turn."""
   f, (h, m, dv) = llama.fns(q), v.shape
   n, s = -(-m // size), min(m, size)  # the number of pieces, and the tokens in each
-  if n > 1:  # copy each, since it may be a repeat or a view, and pad to a multiple of 64. piece i of head j is batch entry j n + i
-    q, k, v, beta, g = (f.parts(f.pad(t, n * s - m) if n * s > m else t + 0, n) for t in (q, k, v, beta, g))
-  cum, decay, u, w = corrected(k, v, beta, g)
-  last = cum[:, s - 1:s, :]
-  now, piece = (f.now, lambda t, i: t[i::n, :, :]) if n > 1 else (lambda t: t, lambda t, i: t)  # a prompt of one piece stays lazy
-  qs, a, kl, u, w = now(q * f.exp(cum)), now((q @ f.t(k)) * decay), now(f.t(k * f.exp(last - cum))), now(u), now(w)  # what the loop reads
-  out = f.empty((h, n * s, dv)) if n > 1 else None
+  if n == 1: return (lambda o, vnew, cum, S: (o, S))(*rule(q, k, v, beta, g, S, state=True))
+  # copy each, since it may be a repeat or a view, and pad to a multiple of 64. piece i of head j is batch entry j n + i
+  q, k, v, beta, g = (f.parts(f.pad(t, n * s - m) if n * s > m else t + 0, n) for t in (q, k, v, beta, g))
+  out = f.empty((h, n * s, dv))
   for i in range(n):
-    vnew = piece(u, i) - piece(w, i) @ S  # subtract the predictions from the state before this chunk
-    o = piece(qs, i) @ S + piece(a, i) @ vnew
-    if n > 1: f.assign(piece(f.parts(out, n), i), o)
-    S = now(S * f.exp(piece(last, i)) + piece(kl, i) @ vnew)
-  return o if n == 1 else out if n * s == m else out[:, :m, :], S
+    o, _, _, S = rule(*(t[i::n, :, :] for t in (q, k, v, beta, g)), S, state=True)
+    f.assign(f.parts(out, n)[i::n, :, :], o)
+  return out if n * s == m else out[:, :m, :], S
 
 def delta_kernel(kt, vt, vh, rep, m=1):
   """The kernel for delta: the Gated DeltaNet decode step of each sequence, or a verify step's token and its draft,
@@ -490,6 +483,173 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
   key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m)
   return o.run(key, lambda: delta_kernel(*key[1:]), S, o, live, *((first, accept) if m > 1 else ()), x, conv, *((conv2,) if m > 1 else ()),
                taps, dt, decay, units=n * kh, name="delta")
+
+def rule_kernel(st, kt, vt, rep, state):
+  """The kernel for rule: a piece's gated delta rule after the decays, one value head a unit, all of it in fp32. Every
+  product runs on the FPU, which reads fp32 tiles as TF32 (10 bits of mantissa, as the GPU engine's tree kernel), and
+  everything else on the SFPU. The unpacker truncates to TF32, a bias that sums over K, so every tile the FPU reads is
+  rounded to nearest first: the inputs by rule, except the state, which goes on in fp32, and a copy of the state and
+  each tile this kernel makes by the SFPU, before it's packed. The math
+  thread unpacks everything: into Dst for the SFPU, into SrcA and SrcB for the FPU. Each op makes one tile in a Dst
+  half, which pack writes into L1 for the ops after it, or for BRISC to write out.
+
+  Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile
+  stride, row tile stride, tile offset), in this order:
+  - out: for each value head, its outputs, then v_new, then with state the state after the piece
+  - q and k, for each key head; a unit reads those of its value head's (e / rep)
+  - kb = beta k, kbe = beta k e^cum, qe = q e^cum and vb = beta v, for each value head
+  - decay: the decay from token j to token i where i follows j (or is it), else 0
+  - S, the state before the piece
+  - consts: the identity, then the pairs masks of spans 1, 2, 4, 8 and 16 (llama.pairs)
+  - with state, e^G, where G is cum at the last token, in every place of a tile, and kl = (k e^(G - cum))^T
+
+  The ops follow corrected and chunk: L = (kb k^T) decay, then the inverse of I + L in blocks, w = inv kbe (kept
+  negated), v_new = inv vb - w S, the outputs qe S + ((q k^T) decay) v_new, and the state e^G S + kl v_new. L's diagonal
+  is never read, since every pairs mask lies below it. st, kt and vt are the tiles of a piece, a key and a value."""
+  tiles = lambda base, cols: (lambda i, j: base + i * cols + j)
+  # What the packer writes comes first, after slot 0: within bh.PACK_REACH of it. The inputs follow.
+  used = [1]
+  def take(n): used[0] += n; return used[0] - n  # n slots, from the first unused
+  L, INV, LP, X = (tiles(take(st * st), st) for _ in range(4))
+  NW, VN, QK = tiles(take(st * kt), kt), tiles(take(st * vt), vt), tiles(take(st * st), st)
+  SR = tiles(take(kt * vt), vt)  # the state rounded, for the FPU
+  OUT = take(2)  # an output slot for each Dst half
+  Q, K, KB, KBE, QE = (tiles(take(st * kt), kt) for _ in range(5))
+  VB, DC, SS, CN = tiles(take(st * vt), vt), tiles(take(st * st), st), tiles(take(kt * vt), vt), take(6)
+  EG, KL = (take(1), tiles(take(kt * st), st)) if state else (None, None)
+  end = used[0]
+  if OUT * 4096 >= bh.PACK_REACH or end > UNPACKABLE or slot_base("fp32") + end * 4096 > OUTS:
+    raise ValueError("rule_kernel: a unit's tiles don't fit in L1")
+  replays, R2, R3 = allocate({"mm", "mmT"}), 2 * DST_HALF, 3 * DST_HALF  # tiles filled for the SFPU beside the result
+  programs = {"mul": lambda r: [sfp_load(0, r), sfp_load(1, R2), mul(2, 0, 1), sfp_store(2, r)],
+              "rsub": lambda r: [sfp_load(0, r), sfp_load(1, R2), mad(2, 0, ONE, 1, neg=1), sfp_store(2, r)],  # R2 - r
+              "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, r)],
+              "fma": lambda r: [sfp_load(0, r), sfp_load(1, R2), sfp_load(2, R3), mad(3, 1, 2, 0), sfp_store(3, r)],
+              "round": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_store(0, r, mod0=RAW)]}  # to TF32's 10 bits
+  srca = lambda on: [ins("SETC16", setc16_reg=bh.THREAD_CFG[r], setc16_value=v) for r, v in  # unpacker 0 into SrcA, or Dst
+                     (("UNPACK_MISC", 1 - on), ("SRCA_SET", bh.SRCA_SET_BY_ADDR * on))]
+  formats = lambda f: reconfigure(SEC0_out_format=f, SEC1_out_format=f)
+  free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]  # a fill waits for the SFPU to finish
+  ops, made = [], {}  # (math, pack) for each op, and which op made each slot
+  def op(slot, terms=(), start=None, posts=(), home=None):
+    """One tile into slot: the sum of the products in terms, as (A's tile, B's tile, B transposed), or start's tile,
+    then posts, (program, tiles) in turn, each with its tiles filled beside the result. With home, it goes out to that
+    tile of out, and stays in L1 if slot isn't OUT."""
+    read = [a for a, _, _ in terms] + [b for _, b, _ in terms] + [t for _, ts in posts for t in ts] + ([start] if start else [])
+    # Wait for what pack has put in L1 before reading it, and before SEM_L1 would hold more than 15
+    waiting = sum(1 for j in made.values() if j >= op.drained)
+    words = ["drain();"] if any(made.get(t, -1) >= op.drained for t in read) or waiting >= 15 else []
+    if words: op.drained = len(ops)
+    if terms:
+      mm, was = math_begin(True) + srca(1) + formats(bh.TF32), False
+      for a, b, T in terms:  # a transposed B comes as it lies: unpacker 0 turns its faces, and the walk picks them
+        if T != was: mm += haloize(T) + walk(T)
+        mm, was = mm + unpack(b, a) + matmul(replays, 4, T), T
+      if was: mm += haloize(0) + walk(False)
+      words.append(tt(mm + formats(bh.FP32) + srca(0) + aim(0)))
+    else: words.append(tt([DST_FREE] + free + fill(start, "h") + FILLED))
+    kept = home is None or slot != OUT
+    for p, ts in [*posts, *[("round", ())] * kept]:  # a tile kept in L1 is an FPU operand: TF32 to nearest, unbiased
+      words.append((f"{tt(free + [w for t, r in zip(ts, (R2, R3)) for w in fill(t, r)] + FILLED)} " if ts else "") + f"p_{p}(h);")
+    words.append(f"{tt(MATH_END)} h ^= {DST_HALF};")
+    if kept: words.append("posted++;"); made[slot] = len(ops)
+    if home is None: pack_ = f"{tt(pack('h', slot, SEM_L1))}"
+    else:
+      to, keep = (f"{OUT} + h / {DST_HALF}", f"h / {DST_HALF}") if slot == OUT else (slot, slot - VN(0, 0) + 2)
+      pack_ = f"output({keep}, {to}, {tile_of(2, 'e', home[0], home[1])}); {tt(pack('h', to, SEM_PACKED, *[SEM_L1] * kept))}"
+    ops.append((" ".join(words), f"{pack_} h ^= {DST_HALF};"))
+  op.drained = 0
+  for c in range(kt):
+    for j in range(vt): op(SR(c, j), start=SS(c, j))  # rounded, as rule rounds the other inputs
+  lower = [(i, j) for i in range(st) for j in range(i + 1)]
+  for i, j in lower: op(L(i, j), [(KB(i, c), K(j, c), True) for c in range(kt)], posts=[("mul", (DC(i, j),))])
+  for i in range(st): op(INV(i, i), start=L(i, i), posts=[("mul", (CN + 1,)), ("rsub", (CN,))])  # I - L, a token at a time
+  for n, span in enumerate((2, 4, 8, 16)):  # join blocks within each tile: inv -= (inv (L pairs)) inv
+    for i in range(st):
+      op(LP(i, i), start=L(i, i), posts=[("mul", (CN + 2 + n,))])
+      op(X(i, i), [(INV(i, i), LP(i, i), False)])
+      op(INV(i, i), [(X(i, i), INV(i, i), False)], posts=[("rsub", (INV(i, i),))])
+  span = 1
+  while span < st:  # then blocks of tiles: below the diagonal of each pair of blocks, -B^-1 C A^-1
+    for b0 in range(0, st, 2 * span):
+      second, first = range(b0 + span, b0 + 2 * span), range(b0, b0 + span)
+      for i in second:
+        for m in first: op(X(i, m), [(INV(i, l), L(l, m), False) for l in second if l <= i])
+        for j in first: op(INV(i, j), [(X(i, m), INV(m, j), False) for m in first if m >= j], posts=[("neg", ())])
+    span *= 2
+  for i in range(st):
+    for c in range(kt): op(NW(i, c), [(INV(i, l), KBE(l, c), False) for l in range(i + 1)], posts=[("neg", ())])
+  for i in range(st):
+    for j in range(vt):
+      op(VN(i, j), [(INV(i, l), VB(l, j), False) for l in range(i + 1)] + [(NW(i, c), SR(c, j), False) for c in range(kt)],
+         home=(st + i, j))
+  for i, j in lower: op(QK(i, j), [(Q(i, c), K(j, c), True) for c in range(kt)], posts=[("mul", (DC(i, j),))])
+  for i in range(st):
+    for j in range(vt):
+      op(OUT, [(QE(i, c), SR(c, j), False) for c in range(kt)] + [(QK(i, l), VN(l, j), False) for l in range(i + 1)],
+         home=(i, j))
+  if state:
+    for c in range(kt):
+      for j in range(vt):  # kl v_new + e^G S, with S as it came
+        op(OUT, [(KL(c, l), VN(l, j), False) for l in range(st)], posts=[("fma", (SS(c, j), EG))], home=(2 * st + c, j))
+  # BRISC fetches a unit's inputs once math has reported the last unit done, and writes results out as they're packed.
+  get = lambda i, base, rows, cols, b="e": (f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) "
+                                            f"get(a[{i}], {tile_of(i, b, 'r', 'c')}, {base} + r * {cols} + c);")
+  fetch = (get(6, Q(0, 0), st, kt, f"e / {rep}") + get(10, K(0, 0), st, kt, f"e / {rep}") +
+           "".join(get(i, m(0, 0), st, kt) for i, m in ((14, KB), (18, KBE), (22, QE))) + get(26, VB(0, 0), st, vt) +
+           get(30, DC(0, 0), st, st) + get(34, SS(0, 0), kt, vt) +
+           f"for (unsigned t = 0; t < 6; t++) get(a[38], {tile_of(38, 't', 0, 0)}, {CN} + t);" +
+           (f"get(a[42], {tile_of(42, 'e', 0, 0)}, {EG});" + get(46, KL(0, 0), kt, st) if state else ""))
+  units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned e = a[0] + u; {body} }}"
+  total = f"a[1] * {2 * st * vt + kt * vt * state}"
+  brisc = units(f"reached(frame_done[0]); {fetch} ready(); frame_done[0] = ++events;")
+  setup = lambda n: SFPU["ftoh"][0] if n == "round" else []
+  helper = lambda n, p: (f"__attribute__((noinline)) static void p_{n}(unsigned h) {{ "
+                         f"if (h) {{ {tt(SFPU_START + setup(n) + [Loop(32, p(DST_HALF))])} }} "
+                         f"else {{ {tt(SFPU_START + setup(n) + [Loop(32, p(0))])} }} }}\n")
+  cfg = kernel_config("fp32", "fp32")
+  return compile_kernel(brisc_program(total, brisc, "fp32", "fp32"), unpack_program(units("fetched();"), cfg),
+                        math_program(replays, units("fetched(); " + " ".join(m for m, _ in ops) + " " + tt(REPORT)), True,
+                                     "".join(helper(n, p) for n, p in programs.items()), wide=True),
+                        pack_program(units(" ".join(c for _, c in ops)), 2 + st * vt))
+
+def rule(q, k, v, beta, g, S, seen=None, state=False):
+  """A piece's gated delta rule, from state S: each token's output and its v_new, cum (corrected's), and with state,
+  the state after the piece. q and k have a matrix for each key head, which serves the value heads that follow it; seen
+  is as corrected takes it. On the chip, the decays and the scaled rows come from tensor ops in fp32, and the rest from
+  rule_kernel in one launch."""
+  f, s, rep = llama.fns(q), q.shape[-2], v.shape[0] // q.shape[0]
+  if isinstance(q, np.ndarray):
+    q, k = f.repeat(q, rep), f.repeat(k, rep)
+    cum, decay, u, w = corrected(k, v, beta, g, seen)
+    vnew = u - w @ S
+    o = (q * np.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ vnew
+    if not state: return o, vnew, cum
+    G = cum[:, s - 1:s, :]
+    return o, vnew, cum, S * np.exp(G) + f.t(k * np.exp(G - cum)) @ vnew
+  (h, kd, vd), (st, kt, vt) = (S.batch, S.rows, S.cols), (-(-n // 32) for n in (s, S.rows, S.cols))
+  if q.batch * rep != h or k.shape != q.shape: raise ValueError("rule needs q and k for the key heads of the value heads")
+  # The FPU reads its operands as TF32, which the unpacker truncates, a bias that sums over K, so they're rounded first,
+  # each once
+  near = lambda t: t.rounded("fp16")
+  qr, kr, seen = f.repeat(q, rep), f.repeat(k, rep), f.tri(s, True) if seen is None else seen
+  cum = f.now(f.bf16(seen) @ g)  # seen is 0 or 1, which bf16 holds exactly
+  decay = f.exp(f.minimum(cum - f.t(cum), 0)) * seen
+  e, kb = f.exp(cum), kr * beta
+  extra = (f.exp(G := cum[:, s - 1:s, :]) * ones(q.rt), near(f.t(kr * f.exp(G - cum)))) if state else ()
+  out = Tensor(q.rt, 64 * st + 32 * kt * state, vd, batch=h, dtype="fp32")  # its padding stays 0, as the inputs' does
+  key = ("rule", st, kt, vt, rep, state)
+  out.run(key, lambda: rule_kernel(*key[1:]), out, *map(near, (q, k, kb, kb * e, qr * e, v * beta)), decay, S,
+          constants(q.rt), *extra, units=h, name="rule")
+  o, vnew = out[:, :s, :], out[:, 32 * st:32 * st + s, :]
+  return (o, vnew, cum, out[:, 64 * st:64 * st + kd, :]) if state else (o, vnew, cum)
+
+@functools.cache
+def constants(rt):  # the identity, then llama.pairs of 32 for spans 1 to 16, made once on the chip (rule_kernel)
+  return Tensor.of(rt, [np.eye(32).tolist()] + [llama.pairs(32, span).tolist() for span in (1, 2, 4, 8, 16)], "fp32")
+
+@functools.cache
+def ones(rt): return Tensor.of(rt, np.ones((32, 32)).tolist(), "fp32")  # a tile of ones, that a column times fills
 
 def moe(h, p, c, phases=lambda op: None, live=None):
   """A mixture of experts in place of the MLP, as in Qwen3 and Mixtral. The router picks the c.k best experts for each
