@@ -445,15 +445,20 @@ class Tensor:
     return self._view(self.rows // n, self.cols, self.batch * n, 0,
                       self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
-  def _split_cols(self, n, cols):
+  def _split_cols(self, n, cols, made=None):
     """This elementwise expression with each tensor of cols columns in it split into n parts by columns, or None.
-    A column or a number broadcasts as it is."""
-    if self.cols != cols: return self if self.cols == 1 else None
-    if self.op is None: return self.split(n) if self.batch == 1 and self.cols % (32 * n) == 0 else None
-    if self.op not in ELEMENTWISE or self.batch != 1: return None
-    srcs = [s._split_cols(n, cols) for s in self.srcs]
-    if any(s is None for s in srcs): return None
-    return _lead(Tensor(self.rt, self.rows, cols // n, self.op, tuple(srcs), n, self.dtype), (n,))
+    A column or a number broadcasts as it is. made keeps each split once, so a value read twice is computed once."""
+    made = {} if made is None else made
+    if id(self) in made: return made[id(self)]
+    if self.cols != cols: t = self if self.cols == 1 else None
+    elif self.op is None: t = self.split(n) if self.batch == 1 and self.cols % (32 * n) == 0 else None
+    elif self.op not in ELEMENTWISE or self.batch != 1: t = None
+    else:
+      srcs = [s._split_cols(n, cols, made) for s in self.srcs]
+      t = None if any(s is None for s in srcs) else _lead(Tensor(self.rt, self.rows, cols // n, self.op, tuple(srcs), n,
+                                                                 self.dtype), (n,))
+    made[id(self)] = t
+    return t
 
   @_matrices
   def merge(self):
