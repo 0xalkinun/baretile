@@ -63,7 +63,7 @@ def table(chip, probe=None):
   row("Gated DeltaNet, a decode step", seconds(lambda: qwen.delta(S, x, conv, taps, dt, decay, live).realize()),
       2 * VH * HD * HD * 4, "GB/s of the states")
   for m in (32, 64):  # and by the chunked rule, from tensor operations, as a prompt's piece or a tree of drafts runs it
-    q, k, v, beta, g = (zeros(m, c, VH, "fp32") for c in (HD, HD, HD, 1, 1))
+    (q, k), (v, beta, g) = (zeros(m, HD, KH, "fp32") for _ in range(2)), (zeros(m, c, VH, "fp32") for c in (HD, 1, 1))
     row(f"Gated DeltaNet, {m} tokens by the chunked rule", seconds(lambda: [t.realize() for t in qwen.chunk(q, k, v, beta, g, S)]))
   x, w = zeros(32, DIM), zeros(1, DIM)
   row(f"RMSNorm, 32 rows of {DIM}", seconds(lambda: llama.rms(x, w, SimpleNamespace(eps=1e-6, centered=True)).realize()))

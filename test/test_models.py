@@ -1661,8 +1661,9 @@ def test_delta_solve(chip):
   # the whole piece forms powers of L that reach 1e10 in Qwen3.5-9B's later blocks, where a piece's keys point nearly
   # the same way, and float32 loses the answer in their cancellation: the block outputs were off by up to 50%. Here
   # the keys are a few degrees apart, beta is near 1 and the decay near 0, so L is close to a triangle of ones. chunk
-  # must match the rule run a token at a time (qwen.step) to 1e-5 in NumPy. On the chip, where an fp32 matmul is good to
-  # about 2^-11 of its largest terms, it's within 1% (0.4% here); the product over the whole piece was off by 1e13.
+  # must match the rule run a token at a time (qwen.step) to 1e-5 in NumPy. On the chip, where qwen.rule's products read
+  # fp32 as TF32 (good to about 2^-10 of their largest terms), it's within 1% (0.6% here, the state 0.8%); the product
+  # over the whole piece was off by 1e13.
   rng = np.random.default_rng(53)
   h, m, kd, vd = 4, 64, 32, 48
   k = rng.normal(0, 1, (h, 1, kd)) + rng.normal(0, 0.05, (h, m, kd))
@@ -1681,6 +1682,27 @@ def test_delta_solve(chip):
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
   o, after = qwen.chunk(*(up(a) for a in (q, k, v, beta, g, S)))
   assert rel(value(o), want) < 1e-2 and rel(value(after), state) < 1e-2, (rel(value(o), want), rel(value(after), state))
+
+def test_delta_tree(chip):
+  # qwen.rule in one kernel, for tokens in a tree's order (seen holds each token's ancestors) and for a prompt piece
+  # with its state, both with key heads that serve two value heads each: within 1% of NumPy, as TF32 products give.
+  rng = np.random.default_rng(71)
+  rt = Runtime(chip)
+  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
+  rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
+  for m, tree in ((20, True), (40, False)):
+    unit = lambda a: a / np.linalg.norm(a, axis=-1, keepdims=True)
+    q, k = unit(rng.normal(0, 1, (2, m, 64))) * 64 ** -0.5, unit(rng.normal(0, 1, (2, m, 64)))
+    v, beta, g, S = rng.normal(0, 1, (4, m, 32)), rng.uniform(0, 1, (4, m, 1)), -rng.uniform(0, 1, (4, m, 1)), rng.normal(0, 0.1, (4, 64, 32))
+    seen = np.tril(np.ones((4, m, m)))
+    if tree:
+      parents, seen = [-1] + [int(rng.integers(0, i)) for i in range(1, m)], np.zeros((4, m, m))
+      for i in range(m):
+        j = i
+        while j >= 0: seen[:, i, j], j = 1, parents[j]
+    want = qwen.rule(q, k, v, beta, g, S, seen, state=not tree)
+    got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), state=not tree)
+    assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
 
 def test_delta_rule(chip):
   # deltanet's rule takes the place of the conv and the gated delta rule, for tokens in an order of the caller's, and
