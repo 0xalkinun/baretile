@@ -158,28 +158,43 @@ machine for the card, and its runner for this repository. It becomes a required
 check once it has passed reliably for a week
 ([#11](https://github.com/0xalkinun/baretile/issues/11)).
 
+## What a card has shown
+
+A P150a has settled these, which ttsim doesn't model:
+
+- DMA reaches host memory both ways, ARC turns the clocks on (the probe runs at
+  the busy clock, 1350 MHz), and the status writes arrive in order.
+- Loading a new kernel where another was invalidates the old instructions: 40
+  kernels loaded in turn at one address each ran on every core. A kernel
+  arrives before the doorbell that launches it, though they go through
+  different TLBs: one loaded over zeros, which no core can run, ran right every
+  time.
+- A request initiator can hold a request before the NIU counts it, so
+  `noc_wait` waits for the initiators to be free first.
+- A write that the PCIe tile forwards to host memory is posted, so
+  `Chip.write` reads it back.
+- A packer's offset past its L1 address wraps at 256 KiB (`bh.PACK_REACH`), so
+  what a kernel packs stays within that of the packer's address.
+- Multicasts into one rectangle from several workers queue up behind each
+  other, so one worker shares a row that every worker needs.
+- The Tensix config bank isn't on the NoC. Reading it from the host took the
+  card off its PCIe link until `tt-smi -r 0` reset it.
+
 ## What still needs checking
 
-On a card, we need to check that DMA reaches host memory, ARC turns the clocks
-on, and the status writes arrive in order. We also need to check that loading
-a new kernel invalidates the old instructions and that the Tensix registers
-are at the indices we use. The BAR2 offsets and parts of ARC's protocol come
-from the drivers and simulator because the ISA doesn't document them. The SFPU
-programs read -1.0 from LReg 11, which leaving the SFPU's soft reset sets and
-tt-llk keeps there. baretile doesn't reset the SFPU itself, so check that the
-value is there when kernels start.
+The BAR2 offsets and parts of ARC's protocol come from the drivers and
+simulator because the ISA doesn't document them. The SFPU programs read -1.0
+from LReg 11, which leaving the SFPU's soft reset sets and tt-llk keeps there.
+baretile doesn't reset the SFPU itself; the card's SFPU tests pass, but nothing
+reads the register itself.
 
 `python3 -m baretile.chip release` is tested against fake sysfs files only.
 
 The host relies on x86 ordering between writes to the ring and the doorbell.
-There's no explicit barrier for other host architectures. A kernel loads through
-one TLB and the doorbell goes through another, and `Runtime.load` relies on
-them arriving in that order, which a card has yet to show.
+There's no explicit barrier for other host architectures.
 
-Through tt-kmd, `Kmd` asks for the busy AI clock with `SET_POWER_STATE` from a
-file opened without `O_APPEND`; check that the clock reaches it. `chip reset`
-gives the card 10 seconds to reset, come back and be bound to tt-kmd again;
-check that this is enough on a card.
+`chip reset` gives the card 10 seconds to reset, come back and be bound to
+tt-kmd again; check that this is enough on a card.
 
 There are also ISA and simulator differences: `UNPACR` fields have different
 names, `SETDVALID` is unavailable in ttsim, and some address-mode documentation
