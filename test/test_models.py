@@ -1716,7 +1716,7 @@ def test_delta_rule(chip):
   def causal(rows, taps, gates, S):  # the prompt's recurrence as a rule: the conv in order, then the rule from S
     f, m = llama.fns(rows), rows.shape[-2] - (c.conv - 1)
     rows = f.cat(rows[:, m:, :], rows[:, :m, :])  # the last inputs, then this call's
-    q, k, v, b, g = gates(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv)))
+    q, k, v, b, g = gates(f.silu(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))))
     q, k = f.repeat(q, c.vh // c.kh), f.repeat(k, c.vh // c.kh)
     cum, decay, u, w = qwen.corrected(k, v, f.sigmoid(b), g)
     return (q * f.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ (u - w @ S)
