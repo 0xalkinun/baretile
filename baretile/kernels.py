@@ -25,7 +25,8 @@ def grid_parts(rt, w, kt, grid, base, more=0):
   Return None if A's rows and B's three buffers fit below slot 256. Otherwise return (kp, q, acc): split K
   into kp-tile parts, process q columns per worker at a time, and accumulate the partial results in fp32
   from L1 address acc. Read A again for each group of q columns. Prefer parts of at least 4 tiles, reducing
-  q if necessary, and reserve more slots for single inputs. Return False if the accumulators won't fit.
+  q if necessary, and reserve more slots for single inputs. Return False if the accumulators won't fit, in
+  L1 or within the packer's reach (bh.PACK_REACH).
 
   Choose the layout independently of B's format, so a block-float B and a bf16 B containing the same values
   produce bitwise-identical results."""
@@ -34,6 +35,7 @@ def grid_parts(rt, w, kt, grid, base, more=0):
   for least in (max(min(4, kt - 1), 1), 1):  # a part is a tile or more, so a K of one tile has none
     for q in range(bq, 0, -1):
       q = -(-bq // -(-bq // q))  # make the groups as even as possible
+      if bp * q * tile_bytes("fp32") > bh.PACK_REACH: continue  # the packer reaches every accumulator from acc
       acc = OUTS - bp * q * tile_bytes("fp32")
       for kp in range(min(kt - 1, B8_SLOTS), least - 1, -1):
         top = base + more + 3 * (bp + 1) * kp
@@ -742,23 +744,24 @@ def attention_l1(ht, R, wt, parts):
   - R is at most 8. A row's largest scores take a quarter of a Dst accumulator tile, and Dst holds two.
   - fs is the slots in a frame: the masks, then the keys and values if they're bf16.
   - T is the output tiles for each row: p v, the sums, and with parts the largest scores.
-  - Slot 1 holds a tile of ones and slot 2 a tile of -inf. The two frames come next, then each row's p and
-    its queries. used is the first free slot after them.
-  - From the top of L1 down: the output tiles at oacc, which are each row's p v and then its sums, in fp32. Then the
+  - Slot 1 holds a tile of ones and slot 2 a tile of -inf. Each row's p comes next, which the packer reaches only
+    below slot 128 (bh.PACK_REACH), then the two frames and the queries. used is the first free slot after them.
+  - From the top of L1 down: the output tiles at oacc, which are each row's p v and then its sums, in fp32, all
+    within the packer's reach of oacc. Then the
     unit's places, and at ranges the key ranges of two units. A key range is the first and last key tile, the first
     and end of the unmasked ones, and whether the part has none."""
   if ht < 2 or not 1 <= R <= 8 or parts < 1:
     raise ValueError("attention needs heads of 64 columns or more, 1 to 8 tile rows a unit, positive parts")
   fs, T = R + (0 if wt else 2 * ht), ht + 1 + (parts > 1)
-  p_slot = 3 + 2 * fs
+  p_slot = 3
   oacc = bh.L1_SIZE - R * T * tile_bytes("fp32")
   places = oacc - R * tile_bytes("int32")
-  used, ranges = p_slot + R + R * ht, places - 64
+  used, ranges = p_slot + R + 2 * fs + R * ht, places - 64
   # a block float's two frames are at B8. bf16's are among the slots, which must end below the key ranges
   below = B8 + 4 * ht * tile_bytes(wt) if wt else slot_base("bf16") + used * tile_bytes("bf16")
-  if used > UNPACKABLE or ranges < below or (wt and 2 * ht > B8_SLOTS):
+  if used > UNPACKABLE or ranges < below or (wt and 2 * ht > B8_SLOTS) or R * T * tile_bytes("fp32") > bh.PACK_REACH:
     raise ValueError(f"attention head width {32 * ht} with {32 * R} query rows a unit does not fit in L1")
-  return fs, T, (p_slot, p_slot + R), oacc, places, used, ranges
+  return fs, T, (p_slot, p_slot + R + 2 * fs), oacc, places, used, ranges
 
 def attention_store(ht, R, wt, parts):
   """Reserve L1 space to retain keys between the two attention sweeps. Return the storage location and the
@@ -842,7 +845,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   are read from DRAM once per unit."""
   fs, T, (p_slot, q_row), oacc, places, _, ranges = attention_l1(ht, R, wt, parts)
   per = -(-ra // R)  # units per head
-  ones, none, fr0 = 1, 2, 3  # tiles of ones and of -inf, made by the SFPU once a launch, then the frames
+  ones, none, fr0 = 1, 2, p_slot + R  # tiles of ones and of -inf, made by the SFPU once a launch, then the frames
   # The slot of frame fr's mask tile for row r, and where the unpackers find its key tile m and value tile j. A block
   # float's are in the frame's region at B8. into() is where BRISC puts a tile: getb's region and slot.
   mask = lambda r: f"{fr0} + fr * {fs} + {r}"

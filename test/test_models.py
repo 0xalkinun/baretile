@@ -3134,9 +3134,13 @@ def test_serve_http(chip, tmp_path, start):
   chances = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "logprobs": 2}))["choices"][0]["logprobs"]
   assert len(chances["tokens"]) == 6 and all(p == max(top.values()) <= 0 for p, top in zip(chances["token_logprobs"], chances["top_logprobs"]))
   assert json.load(urllib.request.urlopen(url + "/models", timeout=60))["data"][0]["id"] == "smol"
-  # two streams take both slots, and each holds its slot from the headers on
+  # two streams take both slots, and each holds its slot from the headers on. The engine waits to decode them until the
+  # third request has been answered, since on a card they'd be done before it arrived
+  go, advance = threading.Event(), engine.advance
+  engine.advance = lambda: (go.wait(), advance())
   holding = [post({"prompt": "Hi there", "max_tokens": 20, "temperature": 0, "stream": True}) for _ in range(2)]
   with pytest.raises(urllib.error.HTTPError) as e: post({"prompt": "Hi", "max_tokens": 2})
+  go.set()
   assert e.value.code == 429 and json.load(e.value)["error"]["code"] == 429, "with no slot free, expected an immediate 429, not a wait"
   for h in holding: assert streamed(h)[1] is None, "usage only when the request asks for it"
   assert json.load(post({"prompt": "Hi", "max_tokens": 2}))["usage"]["completion_tokens"] == 2, "the slots should be free once the streams end"

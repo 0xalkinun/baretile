@@ -137,49 +137,73 @@ top.
 
 Once bring-up passes, CI can run it on the card for every change, so the card
 path doesn't break between manual checks. The `card` job in
-[the workflow](../.github/workflows/test.yml) has no runner yet. Once one
-exists, it runs `test/bringup.py` from preflight through the model tests, keeps
-the record as an artifact, and fails at the first failing stage. It names the
-SmolLM stage in `--only`, and so runs it, only when the repository variable
-`SMOLLM` gives a SmolLM-135M folder on the card's machine. It leaves out the
-probe, which measures, and the Llama stages, which take hours.
+[the workflow](../.github/workflows/test.yml) runs `test/bringup.py` from
+preflight through the model tests, keeps the record as an artifact, and fails
+at the first failing stage. It names the SmolLM stage in `--only`, and so runs
+it, only when the repository variable `SMOLLM` gives a SmolLM-135M folder on the
+card's machine. It leaves out the probe, which measures, and the Llama stages,
+which take hours. It runs in a venv of the machine's own Python, and waits for
+the card while another process has it open, such as someone's work at the
+machine.
 
-To set it up on the card's machine:
+A self-hosted runner runs whatever a pull request's code does, with its
+user's access. The job never runs for a pull request from a fork, and the
+runner runs as a user of its own, `baretile-ci`, which can reach the card, the
+checkout and its own files, and nothing in other users' homes. To set it up on
+the card's machine, with tt-kmd, clang and lld installed:
 
-1. Install tt-kmd, so the runner needs no root, and clang and lld.
-2. Add a self-hosted runner for the repository, with the label `p150a`, running
-   as an ordinary user. The repository's runner settings give the commands.
-3. In the repository's variables, set `CARD` to `true`, and `SMOLLM` if you
-   like.
+```sh
+sudo useradd --create-home baretile-ci
+sudo -u baretile-ci sh -c 'mkdir ~/runner && cd ~/runner && curl -fsSLo r.tgz https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-linux-x64-2.338.2.tar.gz && echo "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40  r.tgz" | sha256sum -c && tar xzf r.tgz && rm r.tgz'
+token=$(gh api -X POST repos/0xalkinun/baretile/actions/runners/registration-token --jq .token)
+sudo -u baretile-ci sh -c "cd ~/runner && ./config.sh --unattended --url https://github.com/0xalkinun/baretile --token $token --name p150a --labels p150a"
+sudo sh -c 'cd /home/baretile-ci/runner && ./svc.sh install baretile-ci && ./svc.sh start'
+```
 
-The job never runs for a pull request from a fork. A self-hosted runner runs
-whatever a pull request's code does, with the machine's access, so keep the
-machine for the card, and its runner for this repository. It becomes a required
-check once it has passed reliably for a week
+The token lasts an hour. Then, in the repository's variables, set `CARD` to
+`true`, and `SMOLLM` to a SmolLM-135M folder that `baretile-ci` can read. The
+job becomes a required check once it has passed reliably for a week
 ([#11](https://github.com/0xalkinun/baretile/issues/11)).
+
+## What a card has shown
+
+A P150a has settled these, which ttsim doesn't model:
+
+- DMA reaches host memory both ways, ARC turns the clocks on (the probe runs at
+  the busy clock, 1350 MHz), and the status writes arrive in order.
+- Loading a new kernel where another was invalidates the old instructions: 40
+  kernels loaded in turn at one address each ran on every core. A kernel
+  arrives before the doorbell that launches it, though they go through
+  different TLBs: `test_relaunch_without_reset` loads 40 in turn just before
+  their doorbells, and one loaded over zeros, which no core can run, ran right
+  every time.
+- A request initiator can hold a request before the NIU counts it, so
+  `noc_wait` waits for the initiators to be free first. The NIU counts requests
+  in flight modulo 256, so no core has more than 255 out at once.
+- A write that the PCIe tile forwards to host memory is posted, so
+  `Chip.write` reads it back.
+- A packer's offset past its L1 address wraps at 256 KiB (`bh.PACK_REACH`), so
+  what a kernel packs stays within that of the packer's address.
+- Multicasts into one rectangle from several workers queue up behind each
+  other, so one worker shares a row that every worker needs.
+- The Tensix config bank isn't on the NoC. Reading it from the host took the
+  card off its PCIe link until `tt-smi -r 0` reset it.
 
 ## What still needs checking
 
-On a card, we need to check that DMA reaches host memory, ARC turns the clocks
-on, and the status writes arrive in order. We also need to check that loading
-a new kernel invalidates the old instructions and that the Tensix registers
-are at the indices we use. The BAR2 offsets and parts of ARC's protocol come
-from the drivers and simulator because the ISA doesn't document them. The SFPU
-programs read -1.0 from LReg 11, which leaving the SFPU's soft reset sets and
-tt-llk keeps there. baretile doesn't reset the SFPU itself, so check that the
-value is there when kernels start.
+The BAR2 offsets and parts of ARC's protocol come from the drivers and
+simulator because the ISA doesn't document them. The SFPU programs read -1.0
+from LReg 11, which leaving the SFPU's soft reset sets and tt-llk keeps there.
+baretile doesn't reset the SFPU itself; the card's SFPU tests pass, but nothing
+reads the register itself.
 
 `python3 -m baretile.chip release` is tested against fake sysfs files only.
 
 The host relies on x86 ordering between writes to the ring and the doorbell.
-There's no explicit barrier for other host architectures. A kernel loads through
-one TLB and the doorbell goes through another, and `Runtime.load` relies on
-them arriving in that order, which a card has yet to show.
+There's no explicit barrier for other host architectures.
 
-Through tt-kmd, `Kmd` asks for the busy AI clock with `SET_POWER_STATE` from a
-file opened without `O_APPEND`; check that the clock reaches it. `chip reset`
-gives the card 10 seconds to reset, come back and be bound to tt-kmd again;
-check that this is enough on a card.
+`chip reset` gives the card 10 seconds to reset, come back and be bound to
+tt-kmd again; check that this is enough on a card.
 
 There are also ISA and simulator differences: `UNPACR` fields have different
 names, `SETDVALID` is unavailable in ttsim, and some address-mode documentation

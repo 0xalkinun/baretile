@@ -473,7 +473,8 @@ class Engine:
     if r.gone: return self.take(u, None)
     ids = r.ids[at:at + self.chunk]
     places, n = self.on(list(range(at, at + len(ids)))), self.length(at + len(ids) - 1)
-    out = llama.forward(self.on(ids), places, self.t, self.c, self.slot[u], hidden=self.spec, length=n, capacity=self.places)
+    out = llama.forward(self.on(ids), places, self.t, self.c, self.slot[u], hidden=self.spec, length=n, capacity=self.places,
+                        prompt=True)
     out, h = out if self.spec else (out, None)
     self.held[u] += ids
     self.prefilled += len(ids)

@@ -333,7 +333,8 @@ def firsts(rt, n, slots, part):
   row = [i // (n // slots) * part for i in range(n)]
   return np.asarray(row) if rt is None else Tensor.of(rt, [row], "int32")
 
-def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hidden=False, length=None, capacity=None):
+def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hidden=False, length=None, capacity=None,
+            prompt=False):
   """Return logits after processing ids at places, updating each block's cache. Each token sees positions
   up to its own. NumPy takes lists for ids and places; baretile takes int32 rows. Weight lookups happen
   one block at a time so NumPy doesn't need the whole model in memory.
@@ -347,7 +348,9 @@ def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hid
   length: limit ordinary attention to this many cache rows per sequence. Use a multiple of 32 beyond
   the current positions. Tensor.attend uses positions to limit its reads regardless of length.
   capacity: positions per sequence, needed for all-linear stacks whose slot capacity is smaller than
-  the RoPE tables. Otherwise capacity comes from an attention cache, or from the tables if none exists."""
+  the RoPE tables. Otherwise capacity comes from an attention cache, or from the tables if none exists.
+  prompt: the ids are a prompt's, so they take prefill's precision even when there's one of them, as for a cached
+  prompt's last token or a prompt's last chunk. A prompt then gives the same tokens however it's cut."""
   f = fns(w["norm"])
   size = next((k.shape[-2] for k in caches if not isinstance(k, list)), None)
   table = min(w[k].shape[-2] for k in ("cos", "sin"))
@@ -356,7 +359,7 @@ def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hid
   size = size if size is not None else (capacity or table) * (slots or 1)
   x = f.float(f.rows(w["embed"], ids))  # the residual stream, in fp32 (layer)
   rows, rotary, mask, window, live = around(w, c, places, size, slots, length)
-  prefill = slots is None and x.shape[-2] > 1
+  prefill = slots is None and (prompt or x.shape[-2] > 1)
   for l in range(c.layers):
     seen = window if window is not None and windowed(c, l) else mask
     x = layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, seen, caches[l], rows, l, prefill, live, accept, slots)
@@ -370,7 +373,8 @@ def prefill(ids, w, c, caches, tokens, on=lambda row: row):
   prompt token. on converts IDs and positions to the representation used by forward, an int32 tensor on
   baretile."""
   if not len(ids) or tokens < 1: raise ValueError("prefill needs a nonempty prompt and a chunk of at least one token")
-  for i in range(0, len(ids), tokens): out = forward(on(ids[i:i + tokens]), on(list(range(i, min(i + tokens, len(ids))))), w, c, caches)
+  for i in range(0, len(ids), tokens):
+    out = forward(on(ids[i:i + tokens]), on(list(range(i, min(i + tokens, len(ids))))), w, c, caches, prompt=True)
   return out
 
 def kv_cache(c, size, zeros, slots=1, speculative=False):

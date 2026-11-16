@@ -57,10 +57,15 @@ static inline void l1_settle(unsigned addr) {{
   (void)*(volatile unsigned *)addr;
   asm volatile("fence" ::: "memory");
 }}
+// On a card the NIU counts requests in flight with transaction id 0 modulo 256: with 256 out, noc_wait sees none.
+// Each unicast request counts in noc_sent, and the 256th waits for the 255 before it. noc_wait restarts the count.
+static unsigned noc_sent;
+static inline void noc_wait(void);
+static inline void noc_count(void) {{ if (++noc_sent == 256) noc_wait(); }}
 // Copy n bytes between (x, y, addr) and this tile's L1. The low 4 bits of the two addresses must match (6 for DRAM).
 static inline void noc_read(unsigned x, unsigned y, unsigned long long addr, unsigned l1, unsigned n) {{
   for (unsigned k; n; addr += k, l1 += k, n -= k)
-    noc_issue(addr, x | y << 6, l1, noc_me(), READ, k = n < MAX_PACKET ? n : MAX_PACKET);
+    noc_count(), noc_issue(addr, x | y << 6, l1, noc_me(), READ, k = n < MAX_PACKET ? n : MAX_PACKET);
 }}
 // noc_get reads into this L1 and noc_put writes from it, at most MAX_PACKET bytes, through request initiators 1 and 2.
 // The firmware sets those up once (noc_setup), so each call writes only four registers and the go, where noc_read
@@ -73,17 +78,19 @@ static inline void noc_setup(void) {{
   NIU2(TARG_MID) = 0; NIU2(TARG_HI) = noc_me(); NIU2(RET_MID) = 0; NIU2(PACKET_TAG) = 0; NIU2(CTRL) = WRITE;
 }}
 static inline void noc_get(unsigned x, unsigned y, unsigned addr, unsigned l1, unsigned n) {{
+  noc_count();
   while (NIU1(CMD) & 1) {{}}
   NIU1(TARG_LO) = addr; NIU1(TARG_HI) = x | y << 6; NIU1(RET_LO) = l1; NIU1(LEN) = n; NIU1(CMD) = 1;
 }}
 static inline void noc_put(unsigned l1, unsigned x, unsigned y, unsigned addr, unsigned n) {{
+  noc_count();
   while (NIU2(CMD) & 1) {{}}
   NIU2(TARG_LO) = l1; NIU2(RET_LO) = addr; NIU2(RET_HI) = x | y << 6; NIU2(LEN) = n; NIU2(CMD) = 1;
 }}
 static inline void noc_write(unsigned l1, unsigned x, unsigned y, unsigned long long addr, unsigned n) {{
   l1_settle(l1);  // the NIU doesn't see this core's stores in flight, so they must land first
   for (unsigned k; n; addr += k, l1 += k, n -= k)
-    noc_issue(l1, noc_me(), addr, x | y << 6, WRITE, k = n < MAX_PACKET ? n : MAX_PACKET);
+    noc_count(), noc_issue(l1, noc_me(), addr, x | y << 6, WRITE, k = n < MAX_PACKET ? n : MAX_PACKET);
 }}
 // Publish the active region before checking cancellation. Once the host requests cancellation and sees no active
 // region, no later multicast can issue. Ordinary requests can still issue until reset; shutdown drains their counters.
@@ -110,6 +117,7 @@ static inline void noc_wait(void) {{  // wait until reads have landed and writes
   // An initiator still holding a request hasn't counted it yet, which a busy NoC shows (ttsim never holds one)
   while ((NIU(CMD) | NIU1(CMD) | NIU2(CMD)) & 1) {{}}
   while (NIU(OUTSTANDING)) {{}}
+  noc_sent = 0;
   asm volatile("fence" ::: "memory");  // drop L0 data cache lines that the NoC may have overwritten
 }}
 // TRISC only. Wait until its Tensix thread has run everything pushed so far. The store keeps the load behind those

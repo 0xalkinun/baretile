@@ -238,6 +238,7 @@ THREAD_CFG = {"StateID": 0, "MATH_Offset": 1, "DISABLE_IMPLIED_SRCA": 2, "DISABL
               "CLR_DVALID": 7, "FIDELITY_BASE": 11, "UNPACK_MISC": 41}
 SRCA_SET_BY_ADDR = 1 << 2  # SrcA and SrcB rows come from the unpacker's address. our UNPACRs rely on that
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter, so it reads tiles below this (ISA ADCs.md)
+PACK_REACH = 1 << 18  # a packer's offset past its L1 address wraps here on a card, though not on ttsim
 BFP_FIRST_DATUM = 1 << 16  # the unpacker finds a bfp tile's exponents from its first datum, which must stay below this
 # SFPU registers that hold these constants (see the SFPU note above). LReg 8 holds 0.8373
 LREG_CONSTS = {0.0: 9, 1.0: 10, -1.0: 11}

@@ -224,7 +224,8 @@ def gate(folder, tokens=32):
                 "usage": usage.get("prompt_tokens") == want and (made == tokens if answer.get("finish_reason") == "length" else 0 < made <= tokens),
                 "same in both forms": streamed["text"] == answer.get("text") and counts(streamed["usage"]) == counts(usage)}
       prompts.append(dict(prompt=prompt, text=answer.get("text"), finish_reason=answer.get("finish_reason"), usage=usage,
-                          first_text_s=streamed["first_text_s"], checks=checks))
+                          first_text_s=streamed["first_text_s"], checks=checks)
+                     | ({} if checks["same in both forms"] else dict(streamed=dict(text=streamed["text"], usage=streamed["usage"]))))
       failures += [dict(prompt=prompt, check=k) for k, ok in checks.items() if not ok]
     cancelled, _ = post(port, dict(prompt=generation.PROMPTS[0], max_tokens=tokens, stream=True, **SAMPLING), cancel=True)
     for _ in range(RETRIES):  # the server frees a slot once it notices the hang-up, within a second (test_serve_hangup)

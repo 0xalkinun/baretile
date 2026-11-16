@@ -71,6 +71,8 @@ class Chip:
   # [addr, addr+n) as (BAR0 offset, size) pieces, split where the window moves
   def chunks(self, x, y, addr, n, start=None):
     if addr < 0 or n < 0: raise ValueError("addresses and transfer sizes must be nonnegative")
+    if x in bh.TENSIX_X and y in bh.TENSIX_Y and addr + n > bh.TENSIX_CFG and addr < bh.TENSIX_CFG + (1 << 16):
+      raise ValueError("a Tensix tile's config bank isn't on the NoC, and an access there takes a card off its link")
     while n:
       size = min(n, bh.TLB_WINDOW - addr % bh.TLB_WINDOW)
       yield self.window(x, y, addr, start), size

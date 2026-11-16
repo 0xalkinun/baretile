@@ -215,14 +215,17 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   BB, AA = (lambda t, e, o=o: f"(F0 + {I0 + 2 * kt + rep * vt + o} + ({t}) * {per} + ({e}))" for o in (0, rep))
   F = I0 + m * per  # slots in a frame
   mine = per + 1  # the broadcast tiles of a token, packed: k, q and v, then e^g, beta and k . q
-  KC, QC, VV, E, BT, KQ = (lambda t, o=o: 1 + 2 * F + t * mine + o
+  # What the packer writes comes first, after slot 0, since it reaches only bh.PACK_REACH past slot 0. The frames follow.
+  KC, QC, VV, E, BT, KQ = (lambda t, o=o: 1 + t * mine + o
                            for o in (0, kt, 2 * kt, 2 * kt + rep * vt, 2 * kt + rep * vt + rep, mine - 1))
-  COL = 1 + 2 * F + m * mine  # the new tiles of the column after the first of two tokens: the S of the second
+  COL = 1 + m * mine  # the new tiles of the column after the first of two tokens: the S of the second
   OUT = COL + kt * (m - 1)  # an output slot for each Dst half
+  FR = OUT + 2  # the first frame
   sources = 7 + m  # the rows of the conv that a unit reads: the 3 last inputs, one for each token, and the 4 taps
-  STAGE = slot_base("fp32") + (OUT + 2) * 4096  # BRISC stages the q and k runs of each source here, then a 64-byte block per scalar
+  STAGE = slot_base("fp32") + (FR + 2 * F) * 4096  # BRISC stages the q and k runs of each source here, then a 64-byte block per scalar
   scalars = 2 + 2 * rep + 2 * m * rep  # live and accept, dt and decay, and b and a for each token
-  if STAGE + sources * 256 * kt + 64 * scalars > OUTS or OUT + 2 > UNPACKABLE: raise ValueError("delta_kernel: a unit's tiles don't fit in L1")
+  if STAGE + sources * 256 * kt + 64 * scalars > OUTS or FR + 2 * F > UNPACKABLE or FR * 4096 > bh.PACK_REACH:
+    raise ValueError("delta_kernel: a unit's tiles don't fit in L1")
   # Dst rows, 64 to a tile in fp32. R2 and R3 take fills, R4 and R5 the two sums (or a norm, or decay), R6 takes e^g,
   # and R7 takes d or x set aside.
   R2, R3, R4, R5, R6, R7 = 128, 192, 256, 320, 384, 448
@@ -316,7 +319,7 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   steps.append(loop("e", rep, loop("j", vt, (" ".join(c for c, _ in column), " ".join(c for _, c in column)))))
   math, packs = [w for w, _ in steps], [w for _, w in steps]
   units = lambda body: f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, F0 = 1 + (u & 1) * {F};
+    unsigned unit = a[0] + u, F0 = {FR} + (u & 1) * {F};
     {body}
   }}"""
   # For each unit, BRISC waits for its frame to be free, then puts its states, the runs of its channels and its scalars in
@@ -375,7 +378,7 @@ static void put_runs(unsigned i, unsigned d, unsigned s, unsigned col, unsigned 
 void kmain(volatile unsigned *args) {{
   A = (const unsigned *)args;
   for (unsigned u = 0; u < A[1]; u++) {{
-    unsigned unit = A[0] + u, F0 = 1 + (u & 1) * {F}, s = unit / {kh}, hk = unit % {kh};
+    unsigned unit = A[0] + u, F0 = {FR} + (u & 1) * {F}, s = unit / {kh}, hk = unit % {kh};
     unsigned cq = hk * {kd}, ck = {qk} + hk * {kd}, cv = {2 * qk} + hk * {rep * vd};  // its q and k channels, and the v channels of its value heads
     reached(frame_done[u & 1]);
     {scalar(10, f's * {m}', 0, 0, 2)} {scalar(18, 0, 's', 1) if m > 1 else ""}
