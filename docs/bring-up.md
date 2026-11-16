@@ -157,7 +157,7 @@ sudo useradd --create-home baretile-ci
 sudo -u baretile-ci sh -c 'mkdir ~/runner && cd ~/runner && curl -fsSLo r.tgz https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-linux-x64-2.338.2.tar.gz && echo "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40  r.tgz" | sha256sum -c && tar xzf r.tgz && rm r.tgz'
 token=$(gh api -X POST repos/0xalkinun/baretile/actions/runners/registration-token --jq .token)
 sudo -u baretile-ci sh -c "cd ~/runner && ./config.sh --unattended --url https://github.com/0xalkinun/baretile --token $token --name p150a --labels p150a"
-cd /home/baretile-ci/runner && sudo ./svc.sh install baretile-ci && sudo ./svc.sh start
+sudo sh -c 'cd /home/baretile-ci/runner && ./svc.sh install baretile-ci && ./svc.sh start'
 ```
 
 The token lasts an hour. Then, in the repository's variables, set `CARD` to
