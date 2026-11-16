@@ -409,6 +409,17 @@ class Tensor:
     if not all(len(t.shape) == n and t.shape[a] == self.shape[a] for t in xs for a in range(n) if a != axis):
       raise ValueError("cat requires matching dimensions outside its axis")
     m, out, at = sum(t.shape[axis] for t in ts), None, 0
+    starts = [sum(t.shape[axis] for t in ts[:i]) for i in range(len(ts))]
+    if n == 3 and axis and all(a % 32 == 0 and t.shape[axis] > 1 and t.dtype == self.dtype for a, t in zip(starts, ts)):
+      # each part starts a tile, so it's written into its view of the result: nothing to pad and add up
+      shape = [*self.shape]
+      shape[axis] = m
+      out = Tensor(self.rt, shape[1], shape[2], batch=shape[0], dtype=self.dtype)
+      for a, t in zip(starts, ts):
+        part = [slice(None)] * 3
+        part[axis] = slice(a, a + t.shape[axis])
+        out[tuple(part)].assign(t)
+      return out
     for t in ts:
       widths = [(0, 0)] * n
       widths[axis] = (at, m - at - t.shape[axis])
