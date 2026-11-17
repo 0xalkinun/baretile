@@ -1443,6 +1443,9 @@ def test_attention_capacity(chip):
     assert rt.launches == before and rt.used == used, "reject before allocating or submitting an output"
   assert attention_store(42, 1, None, 1)[1] == 0
   assert attention_parts(42, 1, None, 2, 1, len(rt.cores)) == 1
+  # a 9B verify's 16 heads over 32k bfp8 keys: no part's keys fit the store, and more parts than 7 would put a second unit
+  # on some of the 119 workers
+  assert attention_parts(8, 1, "bfp8", 1024, 16, 119) == 7
   q, k = Tensor.of(rt, [[0] * 1344]), Tensor.of(rt, [[0] * 1344] * 32)
   v = Tensor.of(rt, [[1] * 1344] * 32)
   assert np.array_equal(value(q.attend(k, v, Tensor.of(rt, [[31]], "int32"))), np.ones((1, 1, 1344)))
