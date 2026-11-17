@@ -858,12 +858,18 @@ class Tensor:
       raise ValueError(f"attend needs places as an int32 column with a row for "
                        f"each query: {places.shape} {places.dtype} for {self.shape}")
     wt = k.dtype if k.dtype in BFP else None
-    R, units, P, kept = attention_plan(ht, ra, self.batch, wt, kt, len(self.rt.cores), parts)
+    # A key head's query heads share its tiles where their units, a unit a worker, can sit side by side in a grid row,
+    # and they see the same keys: one places for all
+    (xs, ys) = self.rt.grid
+    share = 1 < rep <= 4 and len(xs) % rep == 0 and self.batch % rep == 0 and places.batch == 1
+    R, units, P, kept = attention_plan(ht, ra, self.batch, wt, kt, len(xs) * len(ys) if share else len(self.rt.cores),
+                                       parts)
+    share = share and units * P <= len(xs) * len(ys)
     q, places = (_plain(t.realize()) for t in (self, places))
     k, v = k.realize(), v.realize()
     out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
     # the exact row count is an argument, so the key rounds it up to tiles
-    key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0)
+    key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0 and not share, self.rt.grid if share else None)
     out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(),
             *places._where(), kt,
             self.rows, units=units * P, name="attention")
