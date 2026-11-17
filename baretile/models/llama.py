@@ -166,18 +166,26 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   attention, n = phases("attention", "prefill" if prefill else "decode"), h.shape[-2]
   q, k, v = heads[:c.heads, :, :], cache[:c.kv, :, :], cache[c.kv:, :, :]
   sinks = p.get("sinks")  # gpt-oss: each head has a sink, a logit that counts in the softmax but has no value
+  # A decode step's or a draft's few rows: a key head's query heads as the rows of one tile row, which reads each key and
+  # value tile once for them all. Verify's 32 rows would take 4 tile rows a unit, which is slower than a unit a head.
+  grouped = not slots and places is not None and attends(c, p) and n * rep <= 32 and places.shape == (1, n, 1)
+  if grouped:
+    q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv, n * rep, hd)
+    by_head = places.__dict__.setdefault("by_head", {})  # each row's place, made once for a call's layers
+    if rep not in by_head: by_head[rep] = f.expand(places, (1, n, rep)).reshape(1, n * rep, 1).realize()
+    places = by_head[rep]
   if slots:  # a batch entry for each key head and sequence, with its query heads' rows side by side
     k, v, t = f.parts(k, slots), f.parts(v, slots), n // slots
     q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv * slots, t * rep, hd)
     if sinks is not None: sinks = f.expand(sinks.reshape(c.kv, 1, rep), (c.kv, n, rep)).reshape(c.kv * slots, t * rep, 1)
   if (m := mask.shape[-1]) < k.shape[-2]: k, v = k[:, :m, :], v[:, :m, :]  # views of the first m rows
-  if not slots: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a key head for each query head, in place
+  if not slots and not grouped: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a key head for each query head, in place
   if places is not None and attends(c, p):  # one kernel, which keeps the scores on the chip
     o = q.attend(k, v, places, window, attention)
   else:
     s = f.mm(q, f.t(k), attention)
     o = f.mm(f.softmax(s + mask) if sinks is None else f.sink_softmax(s + mask, sinks), v, attention)
-  if slots: o = o.reshape(c.kv, n, rep * hd)  # each key head's query heads side by side again
+  if slots or grouped: o = o.reshape(c.kv, n, rep * hd)  # each key head's query heads side by side again
   if gated: o = o * f.sigmoid(f.split(qkv[:, (c.heads + 2 * c.kv) * hd:], o.shape[0]))
   o = f.mm(f.merge(o), p["o_proj"], phases("o"), "fp32")
   return o + p["o_proj.bias"] if "o_proj.bias" in p else o
