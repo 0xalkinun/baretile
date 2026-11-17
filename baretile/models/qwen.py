@@ -575,14 +575,101 @@ def conv(table, picks, taps):
   return out.run(("conv", picks.batch), lambda: conv_kernel(picks.batch), out, table, picks, taps, -(-width // 32),
                  m, units=out.tiles, name="conv")
 
+R2, R3 = 2 * DST_HALF, 3 * DST_HALF  # where an op fills tiles for the SFPU beside its result, as Dst rows for half 0
+
+class Tiles:
+  """A kernel of tile ops for one unit at a time, all in fp32 (rule_kernel, carry_kernel). Every product runs on the
+  FPU, which reads fp32 tiles as TF32 (10 bits of mantissa, as the GPU engine's tree kernel), and everything else on
+  the SFPU. The unpacker truncates to TF32, a bias that sums over K, so every tile the FPU reads is rounded to nearest
+  first: op rounds what it keeps, unless it's exact, for the SFPU alone. The math thread unpacks everything: into Dst
+  for the SFPU, into SrcA and SrcB for the FPU. Each op makes one tile in a Dst half, which pack writes into L1 for the
+  ops after it, or for BRISC to write out to a tile of the result.
+
+  A unit's tiles are L1 slots from take. What the packer writes comes first, after slot 0, then the output slots
+  (outs), all within bh.PACK_REACH of slot 0; the inputs follow. BRISC fetches a unit's inputs once math has reported
+  the last unit done, and writes results out as they're packed."""
+  programs = {"mul": lambda r: [sfp_load(0, r), sfp_load(1, R2), mul(2, 0, 1), sfp_store(2, r)],
+              "rsub": lambda r: [sfp_load(0, r), sfp_load(1, R2), mad(2, 0, ONE, 1, neg=1), sfp_store(2, r)],  # R2 - r
+              "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, r)],
+              "fma": lambda r: [sfp_load(0, r), sfp_load(1, R2), sfp_load(2, R3), mad(3, 1, 2, 0), sfp_store(3, r)],
+              "round": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_store(0, r, mod0=RAW)],  # to TF32's 10 bits
+              # what rounding to TF32 leaves: x - round(x), exact in fp32, and min(x, 0)
+              "lo": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_load(5, r), mad(6, 0, ONE, 5, neg=1), sfp_store(6, r)],
+              "min0": lambda r: [sfp_load(0, r), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=0, vc=1, mod1=1),
+                                 sfp_store(0, r)]}
+
+  def __init__(self): self.used, self.ops, self.made, self.drained, self.keeps, self.replays = 1, [], {}, 0, {}, allocate({"mm", "mmT"})
+
+  def take(self, n, cols=None):
+    """n slots, from the first unused: the first, or with cols, tile (i, j) of rows of cols tiles."""
+    self.used += n
+    base = self.used - n
+    return base if cols is None else (lambda i, j: base + i * cols + j)
+
+  def outs(self):  # an output slot for each Dst half, after what the packer writes
+    self.OUT = self.take(2)
+    return self.OUT
+
+  def op(self, slot, terms=(), start=None, posts=(), home=None, exact=False):
+    """One tile into slot: the sum of the products in terms, as (A's tile, B's tile, B transposed), or start's tile,
+    then posts, (program, tiles) in turn, each with its tiles filled beside the result. With home, it goes out to that
+    tile of the result, and stays in L1 if slot isn't OUT. A kept tile is rounded to TF32 for the FPU, unless it's
+    exact, for the SFPU alone. "fexp" is the library's fp32 e^x."""
+    srca = lambda on: [ins("SETC16", setc16_reg=bh.THREAD_CFG[r], setc16_value=v) for r, v in  # unpacker 0 into SrcA, or Dst
+                       (("UNPACK_MISC", 1 - on), ("SRCA_SET", bh.SRCA_SET_BY_ADDR * on))]
+    formats = lambda f: reconfigure(SEC0_out_format=f, SEC1_out_format=f)
+    free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]  # a fill waits for the SFPU to finish
+    read = [a for a, _, _ in terms] + [b for _, b, _ in terms] + [t for _, ts in posts for t in ts] + ([start] if start else [])
+    # Wait for what pack has put in L1 before reading it, and before SEM_L1 would hold more than 15
+    waiting = sum(1 for j in self.made.values() if j >= self.drained)
+    words = ["drain();"] if any(self.made.get(t, -1) >= self.drained for t in read) or waiting >= 15 else []
+    if words: self.drained = len(self.ops)
+    if terms:
+      mm, was = math_begin(True) + srca(1) + formats(bh.TF32), False
+      for a, b, T in terms:  # a transposed B comes as it lies: unpacker 0 turns its faces, and the walk picks them
+        if T != was: mm += haloize(T) + walk(T)
+        mm, was = mm + unpack(b, a) + matmul(self.replays, 4, T), T
+      if was: mm += haloize(0) + walk(False)
+      words.append(tt(mm + formats(bh.FP32) + srca(0) + aim(0)))
+    else: words.append(tt([DST_FREE] + free + fill(start, "h") + FILLED))
+    kept = home is None or slot != self.OUT
+    for p, ts in [*posts, *[("round", ())] * (kept and not exact)]:  # an FPU operand: TF32 to nearest, unbiased
+      run = f"{tt(aim('h'))} p_{p}(); {tt(aim(0))}" if p == "fexp" else f"p_{p}(h);"
+      words.append((f"{tt(free + [w for t, r in zip(ts, (R2, R3)) for w in fill(t, r)] + FILLED)} " if ts else "") + run)
+    words.append(f"{tt(MATH_END)} h ^= {DST_HALF};")
+    if kept: words.append("posted++;"); self.made[slot] = len(self.ops)
+    if home is None: pack_ = f"{tt(pack('h', slot, SEM_L1))}"
+    else:
+      to, keep = ((f"{self.OUT} + h / {DST_HALF}", f"h / {DST_HALF}") if slot == self.OUT else
+                  (slot, self.keeps.setdefault(slot, 2 + len(self.keeps))))
+      pack_ = f"output({keep}, {to}, {tile_of(2, 'e', home[0], home[1])}); {tt(pack('h', to, SEM_PACKED, *[SEM_L1] * kept))}"
+    self.ops.append((" ".join(words), f"{pack_} h ^= {DST_HALF};"))
+
+  def parts(self, at, i, **made):  # a tile in two TF32 parts, rounded and what that leaves, for the FPU: 22 bits of it
+    for p in range(2): self.op(at(i, p), **made, posts=[("lo", ())] * p)
+
+  @staticmethod
+  def get(i, base, rows, cols, b="e"):  # BRISC's fetch of rows x cols tiles of the tensor at word i, from slot base on
+    return (f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) "
+            f"get(a[{i}], {tile_of(i, b, 'r', 'c')}, {base} + r * {cols} + c);")
+
+  def kernel(self, name, fetch, total):
+    """The kernel of the ops, with fetch, BRISC's fetch of a unit's inputs, and total, the tiles a unit writes out."""
+    if self.OUT * 4096 >= bh.PACK_REACH or self.used > UNPACKABLE or slot_base("fp32") + self.used * 4096 > OUTS:
+      raise ValueError(f"{name}: a unit's tiles don't fit in L1")
+    units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned e = a[0] + u; {body} }}"
+    brisc = units(f"reached(frame_done[0]); {fetch} ready(); frame_done[0] = ++events;")
+    cfg = kernel_config("fp32", "fp32")
+    library = f"__attribute__((noinline)) static void p_fexp(void) {{ {tt(sfpu(['fexp'], {}))} }}\n"
+    return compile_kernel(brisc_program(f"a[1] * {total}", brisc, "fp32", "fp32"), unpack_program(units("fetched();"), cfg),
+                          math_program(self.replays, units("fetched(); " + " ".join(m for m, _ in self.ops) + " " + tt(REPORT)),
+                                       True, helpers(self.programs, {"round": SFPU["ftoh"][0], "lo": SFPU["ftoh"][0]}) + library,
+                                       wide=True),
+                          pack_program(units(" ".join(c for _, c in self.ops)), 2 + len(self.keeps)))
+
 def rule_kernel(st, kt, vt, rep, state, scaled=False):
-  """The kernel for rule: a piece's gated delta rule after the decays, one value head a unit, all of it in fp32. Every
-  product runs on the FPU, which reads fp32 tiles as TF32 (10 bits of mantissa, as the GPU engine's tree kernel), and
-  everything else on the SFPU. The unpacker truncates to TF32, a bias that sums over K, so every tile the FPU reads is
-  rounded to nearest first: the inputs by rule, except the state, which goes on in fp32, and a copy of the state and
-  each tile this kernel makes by the SFPU, before it's packed. The math
-  thread unpacks everything: into Dst for the SFPU, into SrcA and SrcB for the FPU. Each op makes one tile in a Dst
-  half, which pack writes into L1 for the ops after it, or for BRISC to write out.
+  """The kernel for rule: a piece's gated delta rule after the decays, one value head a unit, in Tiles' ops. The
+  inputs come rounded to TF32 by rule, except the state, which goes on in fp32 and is rounded here for the FPU.
 
   Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile
   stride, row tile stride, tile offset), in this order:
@@ -596,92 +683,35 @@ def rule_kernel(st, kt, vt, rep, state, scaled=False):
   - with state, e^G, where G is cum at the last token, in every place of a tile, and kl = (k e^(G - cum))^T
 
   With scaled, for a piece of one tile without state, whose made tiles fit the packer's reach, the kernel makes cum,
-  which goes out after v_new, its tiles filled, the decays, and the rounded q, k, kb, kbe, qe and vb, each rounded once. cum = seen g,
-  and cum's column filling its tiles, or turned for cum_i - cum_j, come from the FPU, from two TF32 parts of each
-  value: 22 bits of it, where the tensor ops' fp32 matmul has bf16's two parts, 16.
+  which goes out after v_new, its tiles filled, the decays, and the rounded q, k, kb, kbe, qe and vb, each rounded
+  once. cum = seen g, and cum's column filling its tiles, or turned for cum_i - cum_j, come from the FPU, from two
+  TF32 parts of each value: 22 bits of it, where the tensor ops' fp32 matmul has bf16's two parts, 16.
 
   The ops follow corrected and chunk: L = (kb k^T) decay, then the inverse of I + L in blocks, w = inv kbe (kept
   negated), v_new = inv vb - w S, the outputs qe S + ((q k^T) decay) v_new, and the state e^G S + kl v_new. L's diagonal
   is never read, since every pairs mask lies below it. st, kt and vt are the tiles of a piece, a key and a value."""
-  tiles = lambda base, cols: (lambda i, j: base + i * cols + j)
-  # What the packer writes comes first, after slot 0: within bh.PACK_REACH of it. The inputs follow.
-  used = [1]
-  def take(n): used[0] += n; return used[0] - n  # n slots, from the first unused
-  L, INV, LP, X = (tiles(take(st * st), st) for _ in range(4))
-  NW, VN, QK = tiles(take(st * kt), kt), tiles(take(st * vt), vt), tiles(take(st * st), st)
-  SR = tiles(take(kt * vt), vt)  # the state rounded, for the FPU
-  scaled_rows = lambda: ([tiles(take(st * kt), kt) for _ in range(5)], tiles(take(st * vt), vt))
+  t = Tiles()
+  L, INV, LP, X = (t.take(st * st, st) for _ in range(4))
+  NW, VN, QK = t.take(st * kt, kt), t.take(st * vt, vt), t.take(st * st, st)
+  SR = t.take(kt * vt, vt)  # the state rounded, for the FPU
+  scaled_rows = lambda: ([t.take(st * kt, kt) for _ in range(5)], t.take(st * vt, vt))
   if scaled:  # made here, so within the packer's reach: the scaled rows, g and cum in two TF32 parts, cum filling
     (Q, K, KB, KBE, QE), VB = scaled_rows()  # its tiles, e^cum and the decays
-    GP, CP, CU, EE, DC = tiles(take(2 * st), 2), tiles(take(2 * st), 2), take(st), take(st), tiles(take(st * st), st)
-  OUT = take(2)  # an output slot for each Dst half
-  if scaled: QR, KR, VR, BE, GI, SN = (tiles(take(st * kt), kt), tiles(take(st * kt), kt), tiles(take(st * vt), vt),
-                                        take(st), take(st), tiles(take(st * st), st))
+    GP, CP, CU, EE, DC = t.take(2 * st, 2), t.take(2 * st, 2), t.take(st), t.take(st), t.take(st * st, st)
+  OUT = t.outs()
+  if scaled: QR, KR, VR, BE, GI, SN = t.take(st * kt, kt), t.take(st * kt, kt), t.take(st * vt, vt), t.take(st), t.take(st), t.take(st * st, st)
   else:
     (Q, K, KB, KBE, QE), VB = scaled_rows()
-    DC = tiles(take(st * st), st)
-  SS, CN = tiles(take(kt * vt), vt), take(8)
+    DC = t.take(st * st, st)
+  SS, CN = t.take(kt * vt, vt), t.take(8)
   E0, E0T = CN + 6, CN + 7  # ones in row 0, ones in column 0
-  EG, KL = (take(1), tiles(take(kt * st), st)) if state else (None, None)
-  end = used[0]
-  if OUT * 4096 >= bh.PACK_REACH or end > UNPACKABLE or slot_base("fp32") + end * 4096 > OUTS:
-    raise ValueError("rule_kernel: a unit's tiles don't fit in L1")
-  replays, R2, R3 = allocate({"mm", "mmT"}), 2 * DST_HALF, 3 * DST_HALF  # tiles filled for the SFPU beside the result
-  programs = {"mul": lambda r: [sfp_load(0, r), sfp_load(1, R2), mul(2, 0, 1), sfp_store(2, r)],
-              "rsub": lambda r: [sfp_load(0, r), sfp_load(1, R2), mad(2, 0, ONE, 1, neg=1), sfp_store(2, r)],  # R2 - r
-              "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, r)],
-              "fma": lambda r: [sfp_load(0, r), sfp_load(1, R2), sfp_load(2, R3), mad(3, 1, 2, 0), sfp_store(3, r)],
-              "round": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_store(0, r, mod0=RAW)],  # to TF32's 10 bits
-              # what rounding to TF32 leaves: x - round(x), exact in fp32, and min(x, 0)
-              "lo": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_load(5, r), mad(6, 0, ONE, 5, neg=1), sfp_store(6, r)],
-              "min0": lambda r: [sfp_load(0, r), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=0, vc=1, mod1=1),
-                                 sfp_store(0, r)]}
-  srca = lambda on: [ins("SETC16", setc16_reg=bh.THREAD_CFG[r], setc16_value=v) for r, v in  # unpacker 0 into SrcA, or Dst
-                     (("UNPACK_MISC", 1 - on), ("SRCA_SET", bh.SRCA_SET_BY_ADDR * on))]
-  formats = lambda f: reconfigure(SEC0_out_format=f, SEC1_out_format=f)
-  free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]  # a fill waits for the SFPU to finish
-  ops, made = [], {}  # (math, pack) for each op, and which op made each slot
-  names = ["q", "k", *(["v", "beta", "g", "seen"] if scaled else ["kb", "kbe", "qe", "vb", "decay"]), "S", "consts",
-           *(["eg", "kl"] if state else [])]
-  arg = {name: 6 + 4 * i for i, name in enumerate(names)}  # each input's four words, after the result's
-  def op(slot, terms=(), start=None, posts=(), home=None, exact=False):
-    """One tile into slot: the sum of the products in terms, as (A's tile, B's tile, B transposed), or start's tile,
-    then posts, (program, tiles) in turn, each with its tiles filled beside the result. With home, it goes out to that
-    tile of out, and stays in L1 if slot isn't OUT. A kept tile is rounded to TF32 for the FPU, unless it's exact, for
-    the SFPU alone. "fexp" is the library's fp32 e^x."""
-    read = [a for a, _, _ in terms] + [b for _, b, _ in terms] + [t for _, ts in posts for t in ts] + ([start] if start else [])
-    # Wait for what pack has put in L1 before reading it, and before SEM_L1 would hold more than 15
-    waiting = sum(1 for j in made.values() if j >= op.drained)
-    words = ["drain();"] if any(made.get(t, -1) >= op.drained for t in read) or waiting >= 15 else []
-    if words: op.drained = len(ops)
-    if terms:
-      mm, was = math_begin(True) + srca(1) + formats(bh.TF32), False
-      for a, b, T in terms:  # a transposed B comes as it lies: unpacker 0 turns its faces, and the walk picks them
-        if T != was: mm += haloize(T) + walk(T)
-        mm, was = mm + unpack(b, a) + matmul(replays, 4, T), T
-      if was: mm += haloize(0) + walk(False)
-      words.append(tt(mm + formats(bh.FP32) + srca(0) + aim(0)))
-    else: words.append(tt([DST_FREE] + free + fill(start, "h") + FILLED))
-    kept = home is None or slot != OUT
-    for p, ts in [*posts, *[("round", ())] * (kept and not exact)]:  # an FPU operand: TF32 to nearest, unbiased
-      run = f"{tt(aim('h'))} p_{p}(); {tt(aim(0))}" if p == "fexp" else f"p_{p}(h);"
-      words.append((f"{tt(free + [w for t, r in zip(ts, (R2, R3)) for w in fill(t, r)] + FILLED)} " if ts else "") + run)
-    words.append(f"{tt(MATH_END)} h ^= {DST_HALF};")
-    if kept: words.append("posted++;"); made[slot] = len(ops)
-    if home is None: pack_ = f"{tt(pack('h', slot, SEM_L1))}"
-    else:
-      to, keep = (f"{OUT} + h / {DST_HALF}", f"h / {DST_HALF}") if slot == OUT else (slot, slot - VN(0, 0) + 2)
-      pack_ = f"output({keep}, {to}, {tile_of(2, 'e', home[0], home[1])}); {tt(pack('h', to, SEM_PACKED, *[SEM_L1] * kept))}"
-    ops.append((" ".join(words), f"{pack_} h ^= {DST_HALF};"))
-  op.drained = 0
-  lower = [(i, j) for i in range(st) for j in range(i + 1)]
-  def parts(at, i, **made):  # a tile in two TF32 parts, rounded and what that leaves, for the FPU: 22 bits of it
-    for p in range(2): op(at(i, p), **made, posts=[("lo", ())] * p)
+  EG, KL = (t.take(1), t.take(kt * st, st)) if state else (None, None)
+  op, lower = t.op, [(i, j) for i in range(st) for j in range(i + 1)]
   spread = lambda i: [(CP(i, p), E0, False) for p in range(2)]  # cum's column filling its tiles
   if scaled:  # cum = seen g, then filling its tiles (its column times ones in row 0), e^cum, and the decays:
     for i in range(st):  # exp(min(cum_i - cum_j, 0)) where i sees j, cum_j's tile turned by ones in column 0
-      parts(GP, i, start=GI + i)
-      parts(CP, i, terms=[(SN(i, j), GP(j, p), False) for j in range(i + 1) for p in range(2)])
+      t.parts(GP, i, start=GI + i)
+      t.parts(CP, i, terms=[(SN(i, j), GP(j, p), False) for j in range(i + 1) for p in range(2)])
       op(CU + i, spread(i), exact=True), op(OUT, spread(i), home=(2 * st + i, 0))
       op(EE + i, start=CU + i, posts=[("fexp", ())], exact=True)
     for i, j in lower:
@@ -725,9 +755,9 @@ def rule_kernel(st, kt, vt, rep, state, scaled=False):
     for c in range(kt):
       for j in range(vt):  # kl v_new + e^G S, with S as it came
         op(OUT, [(KL(c, l), VN(l, j), False) for l in range(st)], posts=[("fma", (SS(c, j), EG))], home=(2 * st + c, j))
-  # BRISC fetches a unit's inputs once math has reported the last unit done, and writes results out as they're packed.
-  get = lambda i, base, rows, cols, b="e": (f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) "
-                                            f"get(a[{i}], {tile_of(i, b, 'r', 'c')}, {base} + r * {cols} + c);")
+  names = ["q", "k", *(["v", "beta", "g", "seen"] if scaled else ["kb", "kbe", "qe", "vb", "decay"]), "S", "consts",
+           *(["eg", "kl"] if state else [])]
+  arg, get = {name: 6 + 4 * i for i, name in enumerate(names)}, t.get  # each input's four words, after the result's
   rows = ((QR, KR, VR) if scaled else (Q, K, VB))
   fetch = (get(arg["q"], rows[0](0, 0), st, kt, f"e / {rep}") + get(arg["k"], rows[1](0, 0), st, kt, f"e / {rep}") +
            (get(arg["v"], VR(0, 0), st, vt) + get(arg["beta"], BE, st, 1) + get(arg["g"], GI, st, 1) +
@@ -735,17 +765,8 @@ def rule_kernel(st, kt, vt, rep, state, scaled=False):
             "".join(get(arg[n], m(0, 0), st, kt) for n, m in (("kb", KB), ("kbe", KBE), ("qe", QE))) +
             get(arg["vb"], VB(0, 0), st, vt) + get(arg["decay"], DC(0, 0), st, st)) + get(arg["S"], SS(0, 0), kt, vt) +
            f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);" +
-           (f"get(a[{arg['eg']}], {tile_of(arg['eg'], 'e', 0, 0)}, {EG});" + get(arg["kl"], KL(0, 0), kt, st) if state else ""))
-  units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned e = a[0] + u; {body} }}"
-  total = f"a[1] * {2 * st * vt + kt * vt * state + st * scaled}"
-  brisc = units(f"reached(frame_done[0]); {fetch} ready(); frame_done[0] = ++events;")
-  cfg = kernel_config("fp32", "fp32")
-  return compile_kernel(brisc_program(total, brisc, "fp32", "fp32"), unpack_program(units("fetched();"), cfg),
-                        math_program(replays, units("fetched(); " + " ".join(m for m, _ in ops) + " " + tt(REPORT)), True,
-                                     helpers(programs, {"round": SFPU["ftoh"][0], "lo": SFPU["ftoh"][0]}) +
-                                     f"__attribute__((noinline)) static void p_fexp(void) {{ {tt(sfpu(['fexp'], {}))} }}\n",
-                                     wide=True),
-                        pack_program(units(" ".join(c for _, c in ops)), 2 + st * vt))
+           (get(arg["eg"], EG, 1, 1) + get(arg["kl"], KL(0, 0), kt, st) if state else ""))
+  return t.kernel("rule_kernel", fetch, 2 * st * vt + kt * vt * state + st * scaled)
 
 def rule(q, k, v, beta, g, S, seen=None, state=False):
   """A piece's gated delta rule, from state S: each token's output and its v_new, cum (corrected's), and with state,
@@ -782,6 +803,57 @@ def rule(q, k, v, beta, g, S, seen=None, state=False):
   o, vnew = out[:, :s, :], out[:, 32 * st:32 * st + s, :]
   if scaled: cum = out[:, 64 * st:64 * st + s, :1]  # a copy of its tiles' first column
   return (o, vnew, cum, out[:, 64 * st:64 * st + kd, :]) if state else (o, vnew, cum)
+
+def carry_kernel(st, kt, vt, rep, per):
+  """The kernel for carry, one value head a unit, in Tiles' ops: w = on e^min(G - cum, 0) filling its tiles, where G
+  is cum at end (end's row filled down, times cum's column filled, from two TF32 parts), then S = e^G S + (k w)^T
+  v_new, k w turned by the identity, with S as it came. st, kt and vt are as rule_kernel's.
+
+  Arguments: the first unit and the number of units, then four words for each tensor (as rule_kernel's): S, which
+  the kernel writes over; k, for each key head (a unit reads its value head's, e / rep); v_new and cum, for each
+  value head; end and on, for each sequence of per value heads; consts (constants)."""
+  t = Tiles()
+  KW, KT, VR, CP, CF = t.take(st * kt, kt), t.take(kt * st, st), t.take(st * vt, vt), t.take(2 * st, 2), t.take(2 * st, 2)
+  GF, EG, W, ENF, ONF = t.take(1), t.take(1), t.take(st), t.take(st), t.take(st)
+  OUT = t.outs()
+  SS, K, VN, CC, EN, ON, CN = (t.take(kt * vt, vt), t.take(st * kt, kt), t.take(st * vt, vt), t.take(st), t.take(st),
+                               t.take(st), t.take(8))
+  E0, E0T, op = CN + 6, CN + 7, t.op  # ones in row 0, ones in column 0
+  for j in range(st):  # end's row filled down, on's column across, and cum's, in parts for the FPU
+    op(ENF + j, [(E0T, EN + j, False)]), op(ONF + j, [(ON + j, E0, False)])
+    t.parts(CP, j, start=CC + j)
+    for p in range(2): op(CF(j, p), [(CP(j, p), E0, False)])
+  op(GF, [(ENF + j, CF(j, p), False) for j in range(st) for p in range(2)], exact=True)  # G in every place
+  op(EG, start=GF, posts=[("fexp", ())], exact=True)
+  for j in range(st):
+    op(W + j, [(CP(j, p), E0, False) for p in range(2)], posts=[("rsub", (GF,)), ("min0", ()), ("fexp", ()), ("mul", (ONF + j,))],
+       exact=True)
+    for c in range(kt): op(KW(j, c), start=K(j, c), posts=[("mul", (W + j,))])
+    for v in range(vt): op(VR(j, v), start=VN(j, v))
+  for c in range(kt):
+    for j in range(st): op(KT(c, j), [(CN, KW(j, c), True)])
+  for c in range(kt):
+    for v in range(vt): op(OUT, [(KT(c, j), VR(j, v), False) for j in range(st)], posts=[("fma", (SS(c, v), EG))], home=(c, v))
+  arg, get = {name: 6 + 4 * i for i, name in enumerate(["k", "vnew", "cum", "end", "on", "consts"])}, t.get
+  fetch = (get(2, SS(0, 0), kt, vt) + get(arg["k"], K(0, 0), st, kt, f"e / {rep}") + get(arg["vnew"], VN(0, 0), st, vt) +
+           get(arg["cum"], CC, st, 1) + get(arg["end"], EN, 1, st, f"e / {per}") + get(arg["on"], ON, st, 1, f"e / {per}") +
+           f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);")
+  return t.kernel("carry_kernel", fetch, kt * vt)
+
+def carry(S, k, vnew, cum, end, on):
+  """The state after a path through a piece that rule ran, as a prompt of the path would leave it, so nothing runs
+  again (Steed's commit of a verified tree): S = e^G S + sum over the path of e^(G - cum_j) k_j v_new_j^T, where G is
+  cum at the path's last token. k is as rule takes it, v_new and cum as it gives them; end is a row with 1 at the
+  path's last token and on a column with 1 on its tokens, for each sequence of S's value heads. S is written over and
+  returned. On the chip it's carry_kernel's one launch."""
+  f, per = llama.fns(S), S.shape[0] // end.shape[0]
+  if isinstance(S, np.ndarray):
+    G = f.repeat(end, per) @ cum
+    w = f.repeat(on, per) * np.exp(np.minimum(G - cum, 0))
+    S[...] = S * np.exp(G) + f.t(f.repeat(k, S.shape[0] // k.shape[0]) * w) @ vnew
+    return S
+  key = ("carry", -(-vnew.rows // 32), -(-S.rows // 32), -(-S.cols // 32), S.batch // k.batch, per)
+  return S.run(key, lambda: carry_kernel(*key[1:]), S, k, vnew, cum, end, on, constants(S.rt), units=S.batch, name="carry")
 
 @functools.cache
 def constants(rt):  # the identity, llama.pairs of 32 for spans 1 to 16, ones in row 0 and in column 0 (rule_kernel)

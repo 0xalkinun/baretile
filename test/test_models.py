@@ -1703,6 +1703,7 @@ def test_delta_solve(chip):
 def test_delta_tree(chip):
   # qwen.rule in one kernel, for tokens in a tree's order (seen holds each token's ancestors) and for a prompt piece
   # with its state, both with key heads that serve two value heads each: within 1% of NumPy, as TF32 products give.
+  # Then qwen.carry along a path of the tree, likewise.
   rng = np.random.default_rng(71)
   rt = Runtime(chip)
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
@@ -1720,6 +1721,12 @@ def test_delta_tree(chip):
     want = qwen.rule(q, k, v, beta, g, S, seen, state=not tree)
     got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), state=not tree)
     assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
+    if tree:  # carry takes the state along the path to the last token as a prompt of the path would, from what rule gave
+      path = [j for j in range(m) if seen[0, m - 1, j]]
+      end, on = np.eye(m)[None, m - 1:], seen[:1, m - 1, :, None]
+      after = qwen.rule(*(a[:, path, :] for a in (q, k, v, beta, g)), S, state=True)[3]
+      assert rel(qwen.carry(S.copy(), k, *want[1:], end, on), after) < 1e-5
+      assert rel(value(qwen.carry(up(S), up(k), *got[1:], up(end), up(on))), after) < 0.01
   qwen.rule_kernel(1, 4, 4, 2, False, True)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
 
 def test_delta_rule(chip):
