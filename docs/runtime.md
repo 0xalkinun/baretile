@@ -56,7 +56,9 @@ code must drain earlier requests and call `mcast_begin()`. Then it reads
 `acks = NIU(WR_ACKS)` before issuing any packets, and calls
 `mcast_done(acks + n)` after issuing all of them, where `n` counts an
 acknowledgement for each packet and receiving tile. `mcast_done` waits for that
-counter value. `mcast` in `tensix.py` is an example. Only one core per tile may
+counter value. On NoC 1 the same goes through `NOC(1, WR_ACKS)`,
+`noc_issue_on(1, ...)` and `mcast_done_on(1, ...)`, with the rectangle given end
+to start; `mcast` in `tensix.py` is an example. Only one core per tile may
 issue requests during that region. The dispatcher and generated kernels already
 use these helpers. Raw custom multicasts bypass cancellation tracking and can
 leave cleanup unable to establish completion.
