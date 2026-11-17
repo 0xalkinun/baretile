@@ -255,6 +255,11 @@ L1 raise `ValueError` before allocation or launch. A supported frame with no
 space to retain keys streams them again for the second sweep.
 
 Decoding often has too few heads to occupy the workers. The implementation
-splits the keys into up to eight parts and combines their maxima, sums and
-weighted outputs afterwards. This adds launches. The Llama model code uses
-ordinary tensor attention for heads narrower than 64 and for gpt-oss sinks.
+splits the keys into up to 16 parts, one unit for each worker, and combines
+their maxima, sums and weighted outputs afterwards in 4 launches, as reductions
+over the parts. With a few rows, as a decode step's or a draft's, the Llama
+model code puts a key head's query heads in the rows of one tile row, so each
+key and value tile is read once for all of them: a Qwen3.5-9B draft pass's 6
+rows over 8k bf16 keys take 159 µs on the card where a unit for each head took
+595. The Llama model code uses ordinary tensor attention for heads narrower
+than 64 and for gpt-oss sinks.

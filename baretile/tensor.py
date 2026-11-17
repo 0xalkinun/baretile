@@ -867,15 +867,15 @@ class Tensor:
     out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(),
             *places._where(), kt,
             self.rows, units=units * P, name="attention")
-    # cols of part p, from tile at
-    part = lambda p, at, cols: out._view(out.rows, cols, self.batch, p * out.bstride + at, out.bstride * P)
-    # each sum fills its tile's 32 columns, a valid 1-column view
-    if P == 1: return (part(0, 0, self.cols) / part(0, ht, 1)).cast("bf16")
-    largest = [part(p, ht + 1, 1) for p in range(P)]
-    top = functools.reduce(Tensor.maximum, largest)
-    weighted = lambda at, cols: functools.reduce(Tensor.__add__,
-                                                 [(m - top).exp() * part(p, at, cols) for p, m in enumerate(largest)])
-    return (weighted(0, self.cols) / weighted(ht, 1)).cast("bf16")
+    # n matrices of t, each its cols from tile at. Each sum fills its tile's 32 columns, a valid 1-column view
+    view = lambda t, n, at, cols: t._view(t.rows, cols, n, at, t.bstride)
+    if P == 1: return (view(out, self.batch, 0, self.cols) / view(out, self.batch, ht, 1)).cast("bf16")
+    # The parts as a leading axis of views (column slices of a reshape would be moved): the max of their largest scores,
+    # then one sum over them of each part's p v and sums, weighted by e^(its largest - the max), in 4 kernels
+    largest, both = (view(out, self.batch * P, at, cols)._relabel((self.batch, P)) for at, cols in
+                     ((ht + 1, 1), (0, 32 * ht + 32)))
+    t = ((largest - largest.max(1)).exp() * both).sum(1).realize()._relabel((self.batch,))
+    return (view(t, self.batch, 0, self.cols) / view(t, self.batch, ht, 1)).cast("bf16")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above so autograd works on them
   @_matrices

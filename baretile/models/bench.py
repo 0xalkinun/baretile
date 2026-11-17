@@ -56,6 +56,12 @@ def table(chip, probe=None):
     cache = 2 * KV * -(-keys // 32) * (HEAD // 32) * tile_bytes("bfp8")
     row(f"attention, 32 rows over {keys} cached positions", seconds(lambda: q.attend(k, v, places, fidelity=4).realize()),
         cache, "GB/s of the cache", dram)
+  # a draft pass's 6 rows over the drafter's 8k bf16 window, each key head's 4 query heads as one tile row, as llama
+  # groups a few rows
+  keys, q, places = 8192, zeros(6 * HEADS // KV, HEAD, KV), Tensor.of(rt, [[8191]] * (6 * HEADS // KV), "int32")
+  k, v = zeros(keys, HEAD, KV), zeros(keys, HEAD, KV)
+  row("attention, a draft pass's 6 rows over 8192 bf16 positions", seconds(lambda: q.attend(k, v, places, fidelity=4).realize()),
+      2 * KV * keys * HEAD * 2, "GB/s of the cache", dram)
   width = 2 * KH * HD + VH * HD  # Gated DeltaNet's decode step for one token: the states are read and written once
   S, x = zeros(HD, HD, VH, "fp32"), zeros(1, width + VH * HD + 2 * VH, 1, "fp32")
   conv, taps, dt, decay = zeros(1, width, 3, "fp32"), zeros(1, width, 4, "fp32"), zeros(1, VH, 1, "fp32"), zeros(1, VH, 1, "fp32")
