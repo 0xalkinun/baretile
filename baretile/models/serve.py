@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 from baretile import bh, pci
 from baretile.kernels import topk_kernel, topk_room
-from baretile.tensix import ITEMSIZE, tile_bytes, tile_of
+from baretile.runtime import DATA, ZEROS, compile_kernel
+from baretile.tensix import ITEMSIZE, ROWS, tile_bytes, tile_of
 from baretile.tensor import Tensor, jit
 from baretile.models import gpt2, llama, qwen
 
@@ -103,6 +104,83 @@ def grouped_scan(k, cols, dtype, groups):
             if (kept < {k} || WORSE(top[0], col[0], d, c)) keep(d, c);
           }}
       }}"""
+
+def frontier(scores, cols, sees, length, vocab, log, row, n=0, start=0, depth=0):
+  """A step of a draft tree grown best first, on the chip: the n best of a pass's candidates, from its scores (p, b)
+  fp32, each candidate's path score, cols (p, b) int32, its token's row in vocab (V, 1) int32, and sees (p, 8) int32,
+  attend's tree places of each candidate's parent (row p's): its row, the drafts' first, and bits of the drafts it
+  sees, 16 a column. Return (tokens 1 x n, their parents' rows 1 x n, places n x 8, cache rows 1 x n, position 1 x 1,
+  scores n x 1) for the pass that runs them, each pick i at cache row length + start + i, seeing its parent's drafts
+  and itself (bit start + i), at position length + depth, with length a 1 x 1 int32. Of equal scores, the first in
+  row order wins. Log row `row` of log (R, 96) int32 gets the picks, then the candidates' scores as fp32 bits and
+  their tokens, in tile columns 0, 1 and 2, p b of each. With n 0, it only logs. BRISC does it all, on one worker."""
+  p, b = scores.shape[-2:]
+  if not (n <= p * b <= 32 and start + n <= 96 and cols.shape[-2:] == (p, b) and sees.shape[-2:] == (p, 8)
+          and log.cols == 96 and row < log.rows and scores.dtype == "fp32"
+          and all(t.dtype == "int32" for t in (cols, sees, log))):
+    raise ValueError(f"frontier takes up to 32 fp32 scores, their int32 columns and places 8 wide, n of them at most "
+                     f"and ending by draft 96, and logs into 96 int32 columns: {scores.shape}, n={n}, start={start}")
+  new = lambda r, c, d="int32": Tensor(scores.rt, r, c, dtype=d)
+  outs = [new(1, n), new(1, n), new(n, 8), new(1, n), new(1, 1), new(n, 1, "fp32")] if n else [log] * 6
+  key = ("frontier", p, b, n, start, depth, row)
+  log.run(key, lambda: frontier_kernel(*key[1:]), *outs, log, scores, cols, sees, length, vocab, units=1,
+          name="frontier")
+  return outs if n else None
+
+def frontier_kernel(p, b, n, start, depth, row):
+  """frontier's kernel. args: [first unit, units], then four words for each tensor (DRAM address, batch and row tile
+  strides, tile offset): the six results, the log, then scores, cols, sees, length and vocab. BRISC reads the four
+  small inputs' tiles and each candidate's token, keys the scores as topk does, takes the n best by selection, and
+  writes the results' tiles, a dimension of 1 as copies, and the log row's six runs of 16. In L1 from DATA, a tile each:
+  the four inputs, the six results, the log row's three groups (in their row 0), then 64 bytes for each token."""
+  m, put = p * b, lambda k, i: f"t = {tile_of(i, 0, 0, 0)}; noc_write(TILE({k}), BANK(t), AT(a[{i}], t, 4096), 4096);"
+  picks = f"""
+  unsigned pick[{n}], taken = 0;  // a bit a candidate
+  for (unsigned i = 0; i < {n}; i++) {{  // the best not yet taken; the first of equal keys
+    unsigned best = {m};
+    for (unsigned j = 0; j < {m}; j++) if (!(taken >> j & 1) && (best == {m} || rank[j] > rank[best])) best = j;
+    pick[i] = best, taken |= 1u << best, U(10)[at(0, i)] = best;
+  }}
+  for (unsigned i = 0; i < {n}; i++) {{
+    unsigned j = pick[i], r = j / {b}, crow = L + {start} + i, own = {start} + i;
+    for (unsigned q = 0; q < 32; q++)
+      TOK[at(q, i)] = token[j], PAR[at(q, i)] = r, CROW[at(q, i)] = crow, SCORE[at(i, q)] = s[at(r, j % {b})];
+    PLACE[at(i, 0)] = crow, PLACE[at(i, 1)] = L;
+    for (unsigned h = 0; h < 6; h++) PLACE[at(i, 2 + h)] = prev[at(r, 2 + h)] | (h == own / 16 ? 1u << own % 16 : 0);
+  }}
+  for (unsigned q = 0; q < 1024; q++) POS[q] = L + {depth};
+  {" ".join(put(4 + k, 2 + 4 * k) for k in range(6))}""" if n else ""
+  return compile_kernel(f"""
+#define TILE(k) ({DATA:#x} + (k) * 4096)
+{ROWS}
+#define U(k) ((volatile unsigned *)TILE(k))
+#define VOC(j) ((volatile unsigned *)(TILE(13) + (j) * 64))
+static unsigned key(unsigned v) {{ return v == 0x80000000u ? 0x80000000u : v >> 31 ? ~v : v | 0x80000000u; }}
+void kmain(volatile unsigned *a) {{
+  unsigned t;
+  for (unsigned k = 0; k < 4; k++) {{ t = a[33 + 4 * k]; noc_get(BANK(t), AT(a[30 + 4 * k], t, 4096), TILE(k), 4096); }}
+  for (unsigned k = 4; k < 13; k++) copy({ZEROS:#x}, TILE(k), 4096);
+  noc_wait();
+  volatile unsigned *s = U(0), *c = U(1), *prev = U(2), *TOK = U(4), *PAR = U(5), *PLACE = U(6), *CROW = U(7),
+                    *POS = U(8), *SCORE = U(9);
+  unsigned L = U(3)[0], rank[{m}], token[{m}];
+  for (unsigned j = 0; j < {m}; j++) {{  // each candidate's token: row c of vocab, in the 64 bytes that start its row
+    unsigned r = c[at(j / {b}, j % {b})];
+    t = {tile_of(46, 0, "r / 32", 0)};
+    noc_get(BANK(t), AT(a[46], t, 4096) + at(r % 32, 0) * 4, TILE(13) + j * 64, 64);
+    rank[j] = key(s[at(j / {b}, j % {b})]);
+  }}
+  noc_wait();
+  for (unsigned j = 0; j < {m}; j++) {{
+    token[j] = VOC(j)[0];
+    U(11)[at(0, j)] = s[at(j / {b}, j % {b})], U(12)[at(0, j)] = token[j];
+  }}{picks}
+  for (unsigned k = 0; k < 3; k++) for (unsigned f = 0; f < 2; f++) {{  // the log row, in runs of 16
+    t = {tile_of(26, 0, row // 32, "k")};
+    noc_write(TILE(10) + k * 4096 + f * 1024, BANK(t), AT(a[26], t, 4096) + at({row % 32}, 16 * f) * 4, 64);
+  }}
+  noc_wait();
+}}""")
 
 def heads(logits, t=None, k=64):
   """The head of each row of logits, on the chip: (values, ids[, lse]), realized, which is what Head holds.

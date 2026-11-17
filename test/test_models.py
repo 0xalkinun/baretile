@@ -2527,6 +2527,36 @@ def test_grouped_topk(chip):
   assert np.array_equal(value(serve.grouped_topk(x, 32)[1]).reshape(2, 32), np.tile(np.arange(32), (2, 1)))
   with pytest.raises(ValueError, match="k up to 32"): serve.grouped_topk(x, 33)
 
+def test_frontier(chip):
+  # serve.frontier takes a draft tree's next pass on the chip: the n best of a pass's candidates by score, ties to the
+  # first, and for each its token, its parent's row, attend's places (its row, the drafts' first, its parent's bits with
+  # its own), its cache row, the position and its score, with the candidates logged. The cases: a pass from the root's
+  # 4, then 6 of 24 with ties, -0 and 0 and negative scores, with bits in every column; then a log alone.
+  rt, rng = Runtime(chip), np.random.default_rng(7)
+  vocab = rng.choice(250000, 300, replace=False)
+  table, log = Tensor.of(rt, [[int(v)] for v in vocab], "int32"), Tensor.zeros(rt, 12, 96, dtype="int32").realize()
+  length = Tensor.of(rt, [[1000]], "int32")
+  for p, b, n, start, depth, row in ((1, 4, 4, 0, 0, 0), (6, 4, 6, 40, 7, 5), (6, 4, 0, 0, 0, 11)):
+    s = -rng.random((p, b)).astype(np.float32) * 5
+    if p > 1: s[1, 2] = s[4, 0] = s.max() + 1; s[2, 3], s[3, 1] = -0.0, 0.0
+    cols, sees = rng.integers(0, 300, (p, b)), np.zeros((p, 8), np.int64)
+    sees[:, 2:] = rng.integers(0, 1 << 16, (p, 6)) if p > 1 else 0
+    got = serve.frontier(Tensor.frombytes(rt, p, b, s.tobytes(), dtype="fp32"), Tensor.of(rt, cols.tolist(), "int32"),
+                         Tensor.of(rt, sees.tolist(), "int32"), length, table, log, row, n, start, depth)
+    keys = np.where(s == 0, 0.0, s).ravel()  # -0 as 0, as topk keys it
+    pick = np.argsort(-keys, kind="stable")[:n]
+    logged = value(log).reshape(12, 96)[row]
+    assert np.array_equal(logged[:n], pick) and np.array_equal(logged[32:32 + p * b].astype(np.int32).view(np.float32), s.ravel())
+    assert np.array_equal(logged[64:64 + p * b], vocab[cols.ravel()])
+    if not n: assert got is None; continue
+    tok, parent, places, rows, pos, score = (value(t).reshape(t.shape[-2:]) for t in got)
+    want = sees[pick // b].copy()
+    want[:, 0], want[:, 1] = 1000 + start + np.arange(n), 1000
+    for i in range(n): want[i, 2 + (start + i) // 16] |= 1 << (start + i) % 16
+    assert np.array_equal(tok, vocab[cols.ravel()[pick]][None]) and np.array_equal(parent, (pick // b)[None])
+    assert np.array_equal(places, want) and np.array_equal(rows, want[None, :, 0]) and pos.tolist() == [[1000 + depth]]
+    assert np.array_equal(score.astype(np.float32).view(np.uint32), s.ravel()[pick, None].view(np.uint32))
+
 def test_sampling():
   # Request.pick samples from the head of a row (serve.Head), checked against a full sort of the vocabulary. top_p on a
   # flat distribution reaches past the head into the rest of the row. At temperature 0 the penalties match vLLM's,
