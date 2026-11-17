@@ -575,7 +575,7 @@ def conv(table, picks, taps):
   return out.run(("conv", picks.batch), lambda: conv_kernel(picks.batch), out, table, picks, taps, -(-width // 32),
                  m, units=out.tiles, name="conv")
 
-def rule_kernel(st, kt, vt, rep, state):
+def rule_kernel(st, kt, vt, rep, state, scaled=False):
   """The kernel for rule: a piece's gated delta rule after the decays, one value head a unit, all of it in fp32. Every
   product runs on the FPU, which reads fp32 tiles as TF32 (10 bits of mantissa, as the GPU engine's tree kernel), and
   everything else on the SFPU. The unpacker truncates to TF32, a bias that sums over K, so every tile the FPU reads is
@@ -588,11 +588,16 @@ def rule_kernel(st, kt, vt, rep, state):
   stride, row tile stride, tile offset), in this order:
   - out: for each value head, its outputs, then v_new, then with state the state after the piece
   - q and k, for each key head; a unit reads those of its value head's (e / rep)
-  - kb = beta k, kbe = beta k e^cum, qe = q e^cum and vb = beta v, for each value head
+  - kb = beta k, kbe = beta k e^cum, qe = q e^cum and vb = beta v, for each value head; with scaled, v, then beta
+    and e^cum as tiles of each row's value, in their place
   - decay: the decay from token j to token i where i follows j (or is it), else 0
   - S, the state before the piece
   - consts: the identity, then the pairs masks of spans 1, 2, 4, 8 and 16 (llama.pairs)
   - with state, e^G, where G is cum at the last token, in every place of a tile, and kl = (k e^(G - cum))^T
+
+  With scaled, q, k and v come as they are, beta and e^cum as tiles of each row's value, and the kernel makes the
+  rounded q, k, kb, kbe, qe and vb itself, each rounded once: for a piece of one tile, whose made tiles fit the
+  packer's reach. That's 4 launches fewer a 9B DeltaNet layer of Steed's verify.
 
   The ops follow corrected and chunk: L = (kb k^T) decay, then the inverse of I + L in blocks, w = inv kbe (kept
   negated), v_new = inv vb - w S, the outputs qe S + ((q k^T) decay) v_new, and the state e^G S + kl v_new. L's diagonal
@@ -604,9 +609,12 @@ def rule_kernel(st, kt, vt, rep, state):
   L, INV, LP, X = (tiles(take(st * st), st) for _ in range(4))
   NW, VN, QK = tiles(take(st * kt), kt), tiles(take(st * vt), vt), tiles(take(st * st), st)
   SR = tiles(take(kt * vt), vt)  # the state rounded, for the FPU
+  scaled_rows = lambda: ([tiles(take(st * kt), kt) for _ in range(5)], tiles(take(st * vt), vt))
+  if scaled: (Q, K, KB, KBE, QE), VB = scaled_rows()  # made here, so within the packer's reach
   OUT = take(2)  # an output slot for each Dst half
-  Q, K, KB, KBE, QE = (tiles(take(st * kt), kt) for _ in range(5))
-  VB, DC, SS, CN = tiles(take(st * vt), vt), tiles(take(st * st), st), tiles(take(kt * vt), vt), take(6)
+  if scaled: QR, KR, VR, BE, EE = tiles(take(st * kt), kt), tiles(take(st * kt), kt), tiles(take(st * vt), vt), take(st), take(st)
+  else: (Q, K, KB, KBE, QE), VB = scaled_rows()
+  DC, SS, CN = tiles(take(st * st), st), tiles(take(kt * vt), vt), take(6)
   EG, KL = (take(1), tiles(take(kt * st), st)) if state else (None, None)
   end = used[0]
   if OUT * 4096 >= bh.PACK_REACH or end > UNPACKABLE or slot_base("fp32") + end * 4096 > OUTS:
@@ -650,6 +658,13 @@ def rule_kernel(st, kt, vt, rep, state):
       pack_ = f"output({keep}, {to}, {tile_of(2, 'e', home[0], home[1])}); {tt(pack('h', to, SEM_PACKED, *[SEM_L1] * kept))}"
     ops.append((" ".join(words), f"{pack_} h ^= {DST_HALF};"))
   op.drained = 0
+  if scaled:  # the scaled rows, each rounded once (op rounds what it keeps)
+    for i in range(st):
+      for c in range(kt):
+        op(Q(i, c), start=QR(i, c)), op(K(i, c), start=KR(i, c)), op(KB(i, c), start=KR(i, c), posts=[("mul", (BE + i,))])
+        op(KBE(i, c), start=KR(i, c), posts=[("mul", (BE + i,)), ("mul", (EE + i,))])
+        op(QE(i, c), start=QR(i, c), posts=[("mul", (EE + i,))])
+      for j in range(vt): op(VB(i, j), start=VR(i, j), posts=[("mul", (BE + i,))])
   for c in range(kt):
     for j in range(vt): op(SR(c, j), start=SS(c, j))  # rounded, as rule rounds the other inputs
   lower = [(i, j) for i in range(st) for j in range(i + 1)]
@@ -686,11 +701,17 @@ def rule_kernel(st, kt, vt, rep, state):
   # BRISC fetches a unit's inputs once math has reported the last unit done, and writes results out as they're packed.
   get = lambda i, base, rows, cols, b="e": (f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) "
                                             f"get(a[{i}], {tile_of(i, b, 'r', 'c')}, {base} + r * {cols} + c);")
-  fetch = (get(6, Q(0, 0), st, kt, f"e / {rep}") + get(10, K(0, 0), st, kt, f"e / {rep}") +
-           "".join(get(i, m(0, 0), st, kt) for i, m in ((14, KB), (18, KBE), (22, QE))) + get(26, VB(0, 0), st, vt) +
-           get(30, DC(0, 0), st, st) + get(34, SS(0, 0), kt, vt) +
-           f"for (unsigned t = 0; t < 6; t++) get(a[38], {tile_of(38, 't', 0, 0)}, {CN} + t);" +
-           (f"get(a[42], {tile_of(42, 'e', 0, 0)}, {EG});" + get(46, KL(0, 0), kt, st) if state else ""))
+  names = ["q", "k", *(["v", "beta", "e"] if scaled else ["kb", "kbe", "qe", "vb"]), "decay", "S", "consts",
+           *(["eg", "kl"] if state else [])]
+  arg = {name: 6 + 4 * i for i, name in enumerate(names)}  # each input's four words, after the result's
+  rows = ((QR, KR, VR) if scaled else (Q, K, VB))
+  fetch = (get(arg["q"], rows[0](0, 0), st, kt, f"e / {rep}") + get(arg["k"], rows[1](0, 0), st, kt, f"e / {rep}") +
+           (get(arg["v"], VR(0, 0), st, vt) + get(arg["beta"], BE, st, 1) + get(arg["e"], EE, st, 1) if scaled else
+            "".join(get(arg[n], m(0, 0), st, kt) for n, m in (("kb", KB), ("kbe", KBE), ("qe", QE))) +
+            get(arg["vb"], VB(0, 0), st, vt)) +
+           get(arg["decay"], DC(0, 0), st, st) + get(arg["S"], SS(0, 0), kt, vt) +
+           f"for (unsigned t = 0; t < 6; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);" +
+           (f"get(a[{arg['eg']}], {tile_of(arg['eg'], 'e', 0, 0)}, {EG});" + get(arg["kl"], KL(0, 0), kt, st) if state else ""))
   units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned e = a[0] + u; {body} }}"
   total = f"a[1] * {2 * st * vt + kt * vt * state}"
   brisc = units(f"reached(frame_done[0]); {fetch} ready(); frame_done[0] = ++events;")
@@ -722,13 +743,15 @@ def rule(q, k, v, beta, g, S, seen=None, state=False):
   qr, kr, seen = f.repeat(q, rep), f.repeat(k, rep), f.tri(s, True) if seen is None else seen
   cum = f.now(f.bf16(seen) @ g)  # seen is 0 or 1, which bf16 holds exactly
   decay = f.exp(f.minimum(cum - f.t(cum), 0)) * seen
-  e, beta = f.now(f.exp(cum)), f.now(beta)  # columns, made once: the scaled rows would each work them out again
-  kb = kr * beta
   extra = (f.exp(G := cum[:, s - 1:s, :]) * ones(q.rt), near(f.t(kr * f.exp(G - cum)))) if state else ()
   out = Tensor(q.rt, 64 * st + 32 * kt * state, vd, batch=h, dtype="fp32")  # its padding stays 0, as the inputs' does
-  key = ("rule", st, kt, vt, rep, state)
-  out.run(key, lambda: rule_kernel(*key[1:]), out, *map(near, (q, k, kb, kb * e, qr * e, v * beta)), decay, S,
-          constants(q.rt), *extra, units=h, name="rule")
+  scaled = st == 1  # a piece of one tile: the kernel scales and rounds the rows, as its tiles of them fit
+  if scaled: rows = (q, k, v, beta * ones_row(q.rt), f.exp(cum) * ones_row(q.rt))  # beta and e^cum filling their tiles
+  else:
+    e, beta = f.now(f.exp(cum)), f.now(beta)  # columns, made once: the scaled rows would each work them out again
+    rows = tuple(map(near, (q, k, kb := kr * beta, kb * e, qr * e, v * beta)))
+  key = ("rule", st, kt, vt, rep, state, scaled)
+  out.run(key, lambda: rule_kernel(*key[1:]), out, *rows, decay, S, constants(q.rt), *extra, units=h, name="rule")
   o, vnew = out[:, :s, :], out[:, 32 * st:32 * st + s, :]
   return (o, vnew, cum, out[:, 64 * st:64 * st + kd, :]) if state else (o, vnew, cum)
 
@@ -738,6 +761,9 @@ def constants(rt):  # the identity, then llama.pairs of 32 for spans 1 to 16, ma
 
 @functools.cache
 def ones(rt): return Tensor.of(rt, np.ones((32, 32)).tolist(), "fp32")  # a tile of ones, that a column times fills
+
+@functools.cache
+def ones_row(rt): return Tensor.of(rt, [[1.0] * 32], "fp32")  # a row of ones, that a column of any length times fills
 
 def moe(h, p, c, phases=lambda op: None, live=None):
   """A mixture of experts in place of the MLP, as in Qwen3 and Mixtral. The router picks the c.k best experts for each
