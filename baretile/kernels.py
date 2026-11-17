@@ -372,6 +372,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     if isinstance(r, int) or swept(r): return f"{FRAMES + (r if isinstance(r, int) else inputs + r[1])} + fr * {frame}"
     return FRAMES + 2 * frame + r[1]
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
+  # rows r as the SFPU takes them (tensix.live): the result's come from its row argument, in its last tile row
+  sr_of = lambda r, x=arg(inputs): f"(i_ < {ext(size(me), 1) - 1} || !a[{x}] ? 32 : a[{x}])" if r == rows > 1 else r
   # the matrix of r that goes with matrix b of the result: b, b / rep for a repeat, (b / rep) % n for an input spread
   # over the result's leading dimensions, or 0 for a batch of 1
   def which(r):
@@ -436,7 +438,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     # A picked matmul's math reads the indices, which are in L1 once the first frame is.
     if dst or picked: c[M].append("fetched();")
     for j in once + swept_ops:
-      op, me_j = ops[j], ("op", j)
+      op, me_j, sr = ops[j], ("op", j), sr_of(ops[j]["shape"][1])  # sr: its rows, for the SFPU
       cond, posted = "if (k == 0) " if j in once else "", "" if j == root else " posted++;"
       if parts and op["kind"] != "matmul": cond += f"if ({final}) "  # the rest of the tree works on the finished sums
       pk = repacked(j, pack("h", pslot(me_j), SEM_PACKED if j == root else SEM_L1))
@@ -597,20 +599,20 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
           c[M].append(f"{cond}{{ if ({final}) {{ {reloaded} }} else {{ {zeroed} }} {tt(walk(True) * bt)} "
                       f"for (unsigned m = 0; "
                       f"m < kn; m++) {{ {tt(matmul(replays, op['phases'], bt))} }} {tt(walk(False) * bt)} "
-                      f"if ({final}) {{ {tt(sfpu(op['posts'], replays))} {math_end(j)} }} "
+                      f"if ({final}) {{ {tt(sfpu(op['posts'], replays, sr))} {math_end(j)} }} "
                       f"else {{ {tt(MATH_END)} }} h ^= {DST_HALF}; }}")
         # walk a transposed B, then set the modes back
         else: c[M].append(f"{cond}{{ {tt(math_begin(True) + walk(True) * bt)} "
                           f"{live}for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(replays, op['phases'], bt))} }} "
-                          f"{tt(walk(False) * bt + sfpu(op['posts'], replays))} {math_end(j)} h ^= {DST_HALF}; }}")
+                          f"{tt(walk(False) * bt + sfpu(op['posts'], replays, sr))} {math_end(j)} h ^= {DST_HALF}; }}")
         continue
       drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
       x, y = slot(op["x"]), slot(op["y"])
-      prog = sfpu([sfpu_name(op)], replays) if sfpu_op(op) else []
+      prog = sfpu([sfpu_name(op)], replays, sr) if sfpu_op(op) else []
       if dst:  # the math thread fills or widens x into the op's Dst half and y 128 rows on, then runs the SFPU
         load = lambda r, s, d: widen(replays, s, d) if r in wide else fill(s, f"h + {d}" if d else "h")
         fills = load(op["x"], x, 0) + (load(op["y"], y, 128) if op["y"] != "zero" else []) + FILLED
-        math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], replays))
+        math = tt(math_begin(False) + fills + prog + sfpu(op['posts'], replays, sr))
         c[M].append(f"{cond}{{ {drain}{math} {math_end(j)} h ^= {DST_HALF};{posted} }}")
         continue
       if op["kind"] in BINARY:  # x and y each go into Dst for the SFPU: x in the op's half, y 128 rows on
@@ -618,7 +620,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                         elementwise("add", replays) + elementwise("add", replays, dst=128))
       else: unpacks, fpu = unpack(x, y), elementwise(op["kind"], replays)
       c[U].append(f"{cond}{{ {drain}{tt(unpacks)}{posted} }}")
-      math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], replays))
+      math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], replays, sr))
       c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= {DST_HALF}; }}")
     for acc, j in enumerate(reductions):
       if acc >= len(ACCS): raise ValueError("at most two reductions in a pass")
@@ -629,9 +631,10 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       end = f"k == {L - 1}" if swept(x) else "k == 0"  # the line's last tile. A narrow operand is one tile a line
       src = slot(x) if dst else None
       def step(first):  # the last tile's padding must not count
-        part = lambda e: tt(reduce_step(kind, replays, acc, first, e, src, x in wide))  # e: rows or columns that count
+        # e: rows or columns that count
+        part = lambda e: tt(reduce_step(kind, replays, acc, first, e, src, x in wide, sr_of(size(x)[1])))
         return f"if ({end}) {{ {part(edge)} }} else {{ {part(0)} }}" if edge else part(0)
-      finish, posted = (f'{tt(reduce_finish(kind, replays, acc, op["posts"]))} {math_end(j)}',
+      finish, posted = (f'{tt(reduce_finish(kind, replays, acc, op["posts"], sr_of(op["shape"][1])))} {math_end(j)}',
                         "" if j == root else " posted++;")
       pk = repacked(j, pack(ACCS[acc][0], pslot(me_j), SEM_PACKED if j == root else SEM_L1, ACCS[acc][1]))
       unpacks = "" if dst else tt(unpack(slot(x), ZERO_SLOT))  # with dst, math fills Dst and nothing is unpacked
