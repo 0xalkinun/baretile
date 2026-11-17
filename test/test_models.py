@@ -1720,6 +1720,7 @@ def test_delta_tree(chip):
     want = qwen.rule(q, k, v, beta, g, S, seen, state=not tree)
     got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), state=not tree)
     assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
+  qwen.rule_kernel(1, 4, 4, 2, False, True)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
 
 def test_delta_rule(chip):
   # deltanet's rule takes the place of the conv and the gated delta rule, for tokens in an order of the caller's, and
