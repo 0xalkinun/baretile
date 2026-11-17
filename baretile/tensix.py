@@ -896,27 +896,27 @@ static void unflag(unsigned a, unsigned b) {{
   for (unsigned k = 0; k < b; k++) FLAGS[{FLAGS_B} + k] = 0;
   l1_settle({FLAGS:#x});
 }}
-// Multicasts n bytes of this L1 to the same address in the other `tiles` workers in rect (end | start << 12), then the
-// word at `word` if it isn't 0, and waits until they all have them. The packets go as one transaction, so the routers
-// reserve the path once, for the first, and the rest follow it in order (ISA NoC/MemoryMap.md, NOC_CMD_VC_LINKED).
+// Multicasts n bytes of this L1, already in, to the same address in the other `tiles` workers in rect (end | start <<
+// 12), then the word at `word` if it isn't 0, and waits until they all have them. They go on NoC 1, so they hold up
+// none of the reads on NoC 0, and as one transaction, so the routers reserve the path once, for the first packet, and
+// the rest follow it in order (ISA NoC/MemoryMap.md, NOC_CMD_VC_LINKED).
 static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles, unsigned word) {{
-  noc_wait();
   mcast_begin();
-  unsigned acks = NIU(WR_ACKS) + ((n + MAX_PACKET - 1) / MAX_PACKET + !!word) * tiles;
+  unsigned acks = NOC(1, WR_ACKS) + ((n + MAX_PACKET - 1) / MAX_PACKET + !!word) * tiles;
+  rect = rect >> 12 | (rect & 0xFFF) << 12;  // NoC 1 takes the rectangle from its end
   l1_settle(l1);
   if (word) l1_settle(word);
   for (unsigned k; n; l1 += k, n -= k) {{
     k = n < MAX_PACKET ? n : MAX_PACKET;
-    noc_issue(l1, noc_me(), l1, rect, MCAST | (n > k || word ? LINKED : 0), k);
+    noc_issue_on(1, l1, noc_me(), l1, rect, MCAST | (n > k || word ? LINKED : 0), k);
   }}
-  if (word) noc_issue(word, noc_me(), word, rect, MCAST, 4);
-  mcast_done(acks);
+  if (word) noc_issue_on(1, word, noc_me(), word, rect, MCAST, 4);
+  mcast_done_on(1, acks);
 }}
-// Sends this worker's part of what a row or column of the grid shares: n bytes at l1, already read in. They go to the
-// same address in the other `tiles` workers in rect, and then flag, set to v, goes the same way. With no other workers,
-// it waits for the reads and sets the flag.
+// Sends this worker's part of what a row or column of the grid shares: n bytes at l1, once its reads are in. They go to
+// the same address in the other `tiles` workers in rect, and then flag, set to v, goes the same way.
 static void share(unsigned l1, unsigned n, unsigned rect, unsigned tiles, unsigned flag, unsigned v) {{
-  if (!tiles) noc_wait();
+  noc_wait();
   FLAGS[flag] = v;
   if (tiles) mcast(l1, n, rect, tiles, (unsigned)&FLAGS[flag]);
 }}
