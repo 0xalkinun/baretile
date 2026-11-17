@@ -49,26 +49,28 @@ def grouped_topk(x, k):
   """topk's (values, int32 indices) of each row's k largest, k up to 32, in one call for a row too wide for topk's L1,
   such as a vocabulary's logits: batch 1, bf16 or fp32 with no NaN, and a tile count with a factor G from 8 to 32
   (topk_groups). Column g of each of G equal parts makes group g. The Tensix engines take each group's maximum, an
-  elementwise maximum of the parts, and topk finds the 64 best groups. With tau the k-th of those maxima, at least k
-  values reach tau, so each of the row's k best lies in a group whose maximum reaches tau, and BRISC reads just those
-  groups' columns, a run of 16 for each (grouped_scan). If the 64th maximum reaches tau too, groups past the 64 may
-  tie with it, and BRISC reads the whole row instead. Exact, and ties keep column order, as in topk."""
+  elementwise maximum of the parts, and topk finds the k + 1 best groups. With tau the k-th of those maxima, at least
+  k values reach tau, so each of the row's k best lies in a group whose maximum reaches tau, and BRISC reads just those
+  groups' columns, a run of 16 for each (grouped_scan). If the (k + 1)-th maximum reaches tau too, groups past it may
+  tie with it, and BRISC reads the whole row instead. Exact, and ties keep column order, as in topk. Keeping no more
+  groups than that keeps topk's threshold high: a draft's best 4 of 98,304 take 1/3 less than with 64 groups kept."""
   groups = topk_groups(x.cols // 32) if x.cols % 32 == 0 else 0
   if not (0 < k <= 32 and x.batch == 1 and x.dtype in ("bf16", "fp32") and groups):
     raise ValueError(f"grouped_topk needs k up to 32, batch 1, bf16 or fp32 and a tile count with a factor from 8 to 32: "
                      f"k={k}, batch {x.batch}, {x.dtype}, {x.cols} columns")
   m = x.split(groups).max(0)  # each group's maximum
   tiles = m.cols // 32
-  p = next(p for p in range(1, tiles + 1) if tiles % p == 0 and tiles // p <= topk_room(x.dtype, 64))
-  best, at = m.topk(64, p)  # the 64 best groups
-  best, at = best.topk(64, labels=at) if p > 1 else (best, at)
+  most = 32 * -(-(k + 1) // 32)  # what a part keeps: a multiple of 32
+  p = next(p for p in range(1, tiles + 1) if tiles % p == 0 and tiles // p <= topk_room(x.dtype, most))
+  best, at = m.topk(k + 1, p) if p == 1 else m.topk(most, p)  # the k + 1 best groups, of the parts' best if split
+  best, at = best.topk(k + 1, labels=at) if p > 1 else (best, at)
   values, ids = (Tensor(x.rt, x.rows, k, dtype=d) for d in (x.dtype, "int32"))
   key = ("grouped topk", k, x.cols, x.dtype, groups)
   return values.run(key, lambda: topk_kernel(k, x.cols, x.dtype, scan=grouped_scan(*key[1:])), values.addr, ids.addr,
                     x, x.rows, best, at, units=-(-x.rows // 32) * 32, name="topk"), ids
 
 def grouped_scan(k, cols, dtype, groups):
-  """grouped_topk's scan for topk_kernel. Its args, from a[9]: the row's 64 best group maxima and their groups, each an
+  """grouped_topk's scan for topk_kernel. Its args, from a[9]: the row's k + 1 best group maxima and their groups, each an
   address, tile strides for batch and row, and a tile offset. In L1 from SCRATCH: TOPK_RUNS runs read at a time, in 64
   bytes each, then the tiles of the maxima and of the groups. A read keeps its offset in 64 bytes, SKEW."""
   item, tb, w = ITEMSIZE[dtype], tile_bytes(dtype), cols // groups  # w, a part's width: group g is column g of each
@@ -79,16 +81,16 @@ def grouped_scan(k, cols, dtype, groups):
 #define GID (GV + {2 * tb})
 #define MAXIMUM(j) key(((const datum *)GV)[(j) / 32 * 1024 + at(s, (j) % 32)])  // the j-th best group's maximum, as a key
 #define GROUP(j) ((const unsigned *)GID)[(j) / 32 * 1024 + at(s, (j) % 32)]
-      for (unsigned q = 0; q < 2; q++) {{  // the tiles of the row's 64 best group maxima and their groups
+      for (unsigned q = 0; q < {-(-(k + 1) // 32)}; q++) {{  // the tiles of the row's k + 1 best group maxima and groups
         unsigned g = {tile_of(9, "b", "i", "q")}, h = {tile_of(13, "b", "i", "q")};
         noc_get(BANK(g), AT(a[9], g, {tb}), GV + q * {tb}, {tb});
         noc_get(BANK(h), AT(a[13], h, 4096), GID + q * 4096, 4096);
       }}
       noc_wait();
-      // tau, the k-th best group maximum, and the groups that reach it, best first. If the 64th reaches it too, groups
-      // past the 64 may tie with it: then read the whole row, a run at a time
-      unsigned tau = MAXIMUM({k - 1}), whole = MAXIMUM(63) >= tau, reach = 0, visits;
-      while (reach < 64 && MAXIMUM(reach) >= tau) reach++;
+      // tau, the k-th best group maximum, and the groups that reach it, best first. If the (k + 1)-th reaches it too,
+      // groups past it may tie with it: then read the whole row, a run at a time
+      unsigned tau = MAXIMUM({k - 1}), whole = MAXIMUM({k}) >= tau, reach = 0, visits;
+      while (reach < {k + 1} && MAXIMUM(reach) >= tau) reach++;
       visits = whole ? {cols // 16} : reach * {groups};
       for (unsigned v0 = 0; v0 < visits; v0 += {TOPK_RUNS}) {{
         unsigned end = v0 + {TOPK_RUNS} < visits ? v0 + {TOPK_RUNS} : visits;

@@ -73,10 +73,11 @@ def table(chip, probe=None):
     row(f"Gated DeltaNet, {m} tokens by the chunked rule", seconds(lambda: [t.realize() for t in qwen.chunk(q, k, v, beta, g, S)]))
   x, w = zeros(32, DIM, 1, "fp32"), zeros(1, DIM)  # the fp32 residual stream, as a step reads it
   row(f"RMSNorm, 32 rows of {DIM}", seconds(lambda: llama.rms(x, w, SimpleNamespace(eps=1e-6, centered=True)).realize()))
-  logits = np.random.default_rng(0).normal(0, 4, (32, VOCAB)).astype(np.float32)
-  z = Tensor.frombytes(rt, 32, VOCAB, logits.tobytes(), 1, "fp32")
-  row(f"sampling's top-k, the 32 largest of 32 rows of {VOCAB} logits",
-      seconds(lambda: [t.realize() for t in serve.grouped_topk(z, 32)]))
+  # sampling's top-k at the served 20, and a draft pass's best 4 (the tree's branch) of its 96k-token head
+  for rows, cols, k, what in ((32, VOCAB, 20, "sampling's top-k"), (6, 96 * 1024, 4, "a draft pass's top-k")):
+    logits = np.random.default_rng(0).normal(0, 4, (rows, cols)).astype(np.float32)
+    z = Tensor.frombytes(rt, rows, cols, logits.tobytes(), 1, "fp32")
+    row(f"{what}, the {k} largest of {rows} rows of {cols} logits", seconds(lambda: [t.realize() for t in serve.grouped_topk(z, k)]))
   return rows
 
 if __name__ == "__main__":
