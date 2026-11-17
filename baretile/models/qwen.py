@@ -33,8 +33,9 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   the copies before the rejected draft.
 
   rule, a recurrence of the caller's, takes the place of the conv and the gated delta rule, for tokens in
-  an order of its own, and the states stay as they were. rule(rows, taps, gates, S) gets each sequence's
-  conv inputs (this call's, then its last c.conv - 1, so that this call's start a tile), the conv taps, gates,
+  an order of its own, and the states stay as they were. rule(rows, last, taps, gates, S) gets this call's conv
+  inputs (rows of x, each sequence's in turn), the last c.conv - 1 of each sequence as the conv state holds them (as
+  conv takes them), the conv taps, gates,
   which takes the conv's output (with its SiLU, as conv gives it) to q, k, v, b (before its sigmoid) and g with a
   batch entry for each head of each sequence, and S. It returns the outputs as chunk does, a batch entry for each
   value head of each sequence.
@@ -58,8 +59,8 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
     g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus: the log decay of each head
     return q, k, each(y[:, 2 * qk:], c.vd), each(b, 1), g
-  if rule is not None:  # the caller's recurrence, from the conv inputs: this call's, then the last ones
-    o = rule(f.now(f.cat(x[:, :width].reshape(seqs, m, width), f.swap(past))), taps, gates, S)
+  if rule is not None:  # the caller's recurrence, from the conv inputs: this call's, and the last ones where they lie
+    o = rule(x[:, :width], past, taps, gates, S)
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   elif (m == 1 and accept is None or m == 2 and accept is not None) and not isinstance(state[0], Row):
     # A decode step's token, or a verify step's token and then its draft, in one kernel with a unit for each key head
@@ -508,7 +509,8 @@ def conv_kernel(n):
 
   Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile
   stride, row tile stride, tile offset): the result, the table, the picks (an int32 row for each tap) and the taps (a
-  row for each), then the result's tile columns and rows.
+  row for each), then the result's tile columns and rows, then last's four words, the table's rows and last's: a pick
+  past the table's rows p reads last's row (p - rows) as conv takes it.
 
   For each unit, BRISC reads its picks once a tile row, then the taps' tiles (a 1-row tensor repeats its row down its
   tiles), and each tap's picked rows: from the table's tiles that they reach, through a cache of 4, by NoC copies within
@@ -530,15 +532,17 @@ def conv_kernel(n):
     noc_wait();
     for (unsigned c = 0; c < 4; c++) tag[c] = ~0u;  // the cache holds tiles of this unit's column
     for (unsigned k = 0; k < {n}; k++) for (unsigned r = 0; r < rows; r++) {{
-      unsigned p = ((volatile unsigned *)SLOT({IDS} + k))[at(0, r)], q = p / 32, c = 0;
+      unsigned p = ((volatile unsigned *)SLOT({IDS} + k))[at(0, r)], L = p >= a[24], b = L ? (p - a[24]) / a[25] : 0;
+      unsigned w = L ? (p - a[24]) % a[25] : p, q = w / 32 | b << 16 | L << 31, c = 0;  // the row, in the table or last
       while (c < 4 && tag[c] != q) c++;
       if (c == 4) {{  // a miss takes the next place, once the copies from it are done
         c = next++ % 4, tag[c] = q;
         noc_wait();
-        get(a[6], {tile_of(6, 0, 'q', 'j')}, {CACHE} + c);
+        if (L) get(a[20], {tile_of(20, 'b', 'w / 32', 'j')}, {CACHE} + c);
+        else get(a[6], {tile_of(6, 0, 'w / 32', 'j')}, {CACHE} + c);
         noc_wait();
       }}
-      for (unsigned f = 0; f < 2; f++) copy(SLOT({CACHE} + c) + at(p % 32, 16 * f) * 4, SLOT(F + k) + at(r, 16 * f) * 4, 64);
+      for (unsigned f = 0; f < 2; f++) copy(SLOT({CACHE} + c) + at(w % 32, 16 * f) * 4, SLOT(F + k) + at(r, 16 * f) * 4, 64);
     }}
     noc_wait(); ready(); frame_done[u & 1] = ++events;""")
   free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
@@ -560,21 +564,25 @@ def conv_kernel(n):
                         unpack_program(units("fetched();"), cfg), math_program({}, math, True, helpers(programs) + library),
                         pack_program(packer))
 
-def conv(table, picks, taps):
+def conv(table, picks, taps, last=None):
   """SiLU of the sum over taps t of table[picks[t]] times taps[t]: Gated DeltaNet's conv, for tokens whose inputs are
   rows of table in any order, such as a prompt's in turn or a tree's along each path (conv_kernel, one launch). table
-  is a matrix of fp32 rows, picks an int32 row of indices for each tap, and taps a row of fp32 weights for each.
-  Unchecked indices, as Tensor.gather's."""
+  is a matrix of fp32 rows, picks an int32 row of indices for each tap, and taps a row of fp32 weights for each. With
+  last, the conv state as deltanet keeps it (conv - 1, sequences, width), a pick p past table's rows reads row
+  p - table.rows of last's, sequence b's j-th last input at j sequences + b, where it lies. Unchecked indices, as
+  Tensor.gather's."""
   if isinstance(table, np.ndarray):
-    y = sum(table.reshape(-1, table.shape[-1])[np.ravel(p)] * w for p, w in zip(picks, taps))[None]
+    table = table.reshape(-1, table.shape[-1])
+    table = table if last is None else np.concatenate([table, last.reshape(-1, table.shape[-1])])
+    y = sum(table[np.ravel(p)] * w for p, w in zip(picks, taps))[None]
     return y / (1 + np.exp(-y))
   m, width = picks.cols, table.cols
   if not (table.batch == 1 and table.dtype == taps.dtype == "fp32" and picks.dtype == "int32" and picks.rows == 1 and
-          taps.shape == (picks.batch, 1, width)):
+          taps.shape == (picks.batch, 1, width) and (last is None or (last.cols, last.dtype) == (width, "fp32"))):
     raise ValueError("conv needs an fp32 table, an int32 row of picks and an fp32 row of taps for each tap")
   out = Tensor(table.rt, m, width, dtype="fp32")
   return out.run(("conv", picks.batch), lambda: conv_kernel(picks.batch), out, table, picks, taps, -(-width // 32),
-                 m, units=out.tiles, name="conv")
+                 m, *((table, 0xFFFFFFFF, 1) if last is None else (last, table.rows, last.rows)), units=out.tiles, name="conv")
 
 R2, R3 = 2 * DST_HALF, 3 * DST_HALF  # where an op fills tiles for the SFPU beside its result, as Dst rows for half 0
 

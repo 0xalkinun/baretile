@@ -1729,6 +1729,19 @@ def test_delta_tree(chip):
       assert rel(value(qwen.carry(up(S), up(k), *got[1:], up(end), up(on))), after) < 0.01
   qwen.rule_kernel(1, 4, 4, 2, False, 128)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
 
+def test_conv_last(chip):
+  # qwen.conv reads each token's inputs from the table, or past its rows from the conv state where it lies (last): as
+  # conv over the table with last's rows after it, exactly in NumPy and within 1e-5 on the chip (the SiLU's e^x).
+  rng, rt = np.random.default_rng(73), Runtime(chip)
+  seqs, m, width, n = 2, 40, 96, 4
+  table, last, taps = rng.normal(0, 1, (seqs * m, width)), rng.normal(0, 1, (n - 1, seqs, width)), rng.normal(0, 1, (n, 1, width))
+  picks = rng.integers(0, seqs * m + (n - 1) * seqs, (n, 1, 50))
+  want = qwen.conv(np.concatenate([table, last.reshape(-1, width)]), picks[:, 0], taps)
+  assert np.array_equal(qwen.conv(table, picks[:, 0], taps, last), want)
+  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), int(np.prod(a.shape[:-2])), "fp32")
+  got = value(qwen.conv(up(table), up(picks).cast("int32"), up(taps), up(last)))
+  assert np.abs(got - want).max() / np.abs(want).max() < 1e-5
+
 def test_delta_rule(chip):
   # deltanet's rule takes the place of the conv and the gated delta rule, for tokens in an order of the caller's, and
   # leaves the states as they were. A rule that runs a prompt's own recurrence, from the conv inputs and gates it's
@@ -1738,9 +1751,9 @@ def test_delta_rule(chip):
   c, weights = qwen35(rng)
   first, then = (bf16(rng.normal(0, 1, (n, c.dim))) for n in (10, 6))
   phases = lambda op: None
-  def causal(rows, taps, gates, S):  # the prompt's recurrence as a rule: the conv in order, then the rule from S
-    f, m = llama.fns(rows), rows.shape[-2] - (c.conv - 1)
-    rows = f.cat(rows[:, m:, :], rows[:, :m, :])  # the last inputs, then this call's
+  def causal(rows, last, taps, gates, S):  # the prompt's recurrence as a rule: the conv in order, then the rule from S
+    f, m = llama.fns(rows), rows.shape[-2]
+    rows = f.cat(f.swap(last), rows.reshape(1, m, rows.shape[-1]))  # the last inputs, then this call's
     q, k, v, b, g = gates(f.silu(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))))
     q, k = f.repeat(qwen.unit(q, c.kd ** -0.5), c.vh // c.kh), f.repeat(qwen.unit(k), c.vh // c.kh)
     cum, decay, u, w = qwen.corrected(k, v, f.sigmoid(b), g)
