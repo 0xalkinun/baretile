@@ -78,6 +78,13 @@ reads it rounded to bf16. In bf16, a large activation that a later block cancels
 would lose the low bits of what's left: SmolLM-135M has one of about 31,000,
 which a bf16 copy holds only to within 128. GPT-2's stream is still bf16.
 
+With a few rows, as in a decode or verify step, a norm is one launch,
+`llama.rms_kernel`: a tile row of the stream goes to a row of the grid, each
+worker sums the squares of its share of the columns, and the workers of the row
+send each other their sums over NoC 1 before each scales its share. In
+Qwen3.5-9B's shapes, 32 rows of 4,096, that's 19 µs on the card in place of 4
+kernels and 31 µs.
+
 Qwen3 and Qwen3.5 RMS-norm each head of q and k before RoPE. The norm reads the
 qkv matmul's fp32 sum, runs in fp32 and rounds once to bf16 for RoPE. In bf16,
 the norm's scale would round once for a whole head, and a score doesn't average

@@ -1292,6 +1292,23 @@ def test_llama_layer(chip, n):
   change = np.abs(want - x).max()
   assert change > 0.5 and np.abs(np.array(got.tolist()) - want).max() < 0.03 * change, (np.abs(np.array(got.tolist()) - want).max(), change)
 
+def test_rms_kernel(chip):
+  # A few long fp32 rows, a verify's or a draft's, take RMSNorm in one launch (llama.rms_kernel): x rounded to bf16, its
+  # rows' sums exchanged by the workers of a grid row, scaled by w or 1 + w. Within a bf16 step of the same in numpy,
+  # also with rows past the last tile's and columns that don't split evenly, and a bf16 x takes the expressions.
+  rt, rng = Runtime(chip), np.random.default_rng(13)
+  for rows, cols, centered in ((32, 4096, True), (6, 1056, False), (40, 1000, True)):
+    x, w = rng.normal(0, 3, (rows, cols)).astype(np.float32), bf16(rng.normal(0, 0.5, (1, cols)))
+    xb, c = bf16(x).astype(np.float64), SimpleNamespace(eps=1e-6, centered=centered)
+    want = xb / np.sqrt((xb * xb).mean(-1, keepdims=True) + 1e-6) * (w + 1 if centered else w)
+    tx, tw = Tensor.frombytes(rt, rows, cols, x.tobytes(), 1, "fp32"), Tensor.of(rt, w.tolist())
+    llama.rms(tx, tw, c)  # makes w's scale, kept with it
+    before = rt.launches
+    got = llama.rms(tx, tw, c)
+    assert got.dtype == "bf16" and rt.launches == before + 1
+    assert np.abs(value(got) - want).max() <= 2**-7 * np.abs(want).max()
+  assert llama.rms_launch(Tensor.of(rt, x.tolist()), Tensor.of(rt, w.tolist()), c) is None  # bf16
+
 def test_kv_cache(chip):
   # A two-block Llama decodes 5 tokens after a 5-token prompt, against numpy. Positions are data, not shapes, so the
   # steps launch the same kernels and replay from the third: only the first two run forward's Python.

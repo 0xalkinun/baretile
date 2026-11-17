@@ -10,6 +10,11 @@
 import functools, heapq, json, math, os, re, sys, time, unicodedata
 from types import SimpleNamespace
 import numpy as np
+from baretile import bh
+from baretile.runtime import compile_kernel
+from baretile.tensix import (ACROSS, DST_FREE, DST_HALF, FILLED, MATH_END, ONE, REPORT, SEM_PACKED, aim, brisc_program,
+                             fill, ins, kernel_config, mad, math_program, mul, pack, pack_program, repack, sfp_bits,
+                             sfp_const, sfp_load, sfp_store, sfpu, table, tile_of, tt, unpack_program)
 from baretile.tensor import Tensor, jit
 from baretile.models import gpt2, qwen
 
@@ -98,12 +103,93 @@ def precision_of(c, op, block=None): return (c.precision or {}).get((op, block),
 def cache_format(c): return precision_of(c, "kv")[0] or "bf16"  # the KV cache's format
 
 # RMSNorm scaled by w. Qwen3.5 scales by 1 + w as n w + n, which stays exact where 1 + w would round in bf16. It reads
-# the fp32 residual stream rounded to bf16, so the norm runs on the FPU, where fp32 would run it all on the SFPU.
+# the fp32 residual stream rounded to bf16, so the norm runs on the FPU, where fp32 would run it all on the SFPU. A few
+# long fp32 rows, as a decode or verify step's, go through rms_kernel in one launch.
 def rms(x, w, c):
+  if isinstance(x, Tensor) and (out := rms_launch(x, w, c)) is not None: return out
   f = fns(x)
   x = f.bf16(x)
   n = x * f.rsqrt(f.mean(x * x) + c.eps)
   return n * w + n if c.centered else n * w
+
+def rms_kernel(grid, ct, n, eps):
+  """The kernel for rms_launch: RMSNorm of an fp32 x's rows, rounded to bf16 as they're read, by its fp32 scale, in
+  one launch. A tile row of x goes to a row of the grid, and worker j of it takes its share of the row's ct tiles.
+
+  Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile stride,
+  row tile stride, tile offset): the result in bf16, x, and the scale, a row (w, or 1 + w), both in fp32.
+
+  BRISC reads the worker's tiles of x and the scale. Math sums their squares along the rows (across_rows), and pack
+  writes the sums to the worker's slot j of the row's sums in L1, which BRISC then sends to the same slot of the row's
+  other workers over NoC 1, flagged j. Once every flag is in, math adds the row's sums and takes rsqrt(sum / n + eps)
+  once, then scales each of its tiles by it, which pack writes out as bf16. A unit a worker, so units are the grid's
+  workers in order, and a row of them is a rectangle."""
+  (xs, ys), g = grid, len(grid[0])
+  share = lambda j: (f"{j} * {ct} / {g}", f"({j} + 1) * {ct} / {g}")
+  most = -(-ct // g)  # the most tiles a worker takes
+  OUT, X = 1, 3  # the output slots for each Dst half, then x's tiles, the scale's and the row's sums
+  W, SUMS = X + most, X + 2 * most
+  R2, R3 = 2 * DST_HALF, 3 * DST_HALF
+  head = f"unsigned i = a[0] / {g}, j = a[0] % {g}, t0 = {share('j')[0]}, nt = {share('j')[1]} - t0;"
+  rects = table("rect", [bh.noc_rect((xs[0], y), (xs[-1], y)) for y in ys]) + "\n"
+  brisc = (f"  {head}\n"
+           f"  for (unsigned t = 0; t < nt; t++) {{ get(a[6], {tile_of(6, 0, 'i', 't0 + t')}, {X} + t); "
+           f"get(a[10], {tile_of(10, 0, 0, 't0 + t')}, {W} + t); }}\n"
+           "  ready();  // math sums the squares\n"
+           "  while (!peek(7)) send();  // pack has written them to slot j\n"
+           f"  share(SLOT({SUMS} + j), 4096, rect[i], {g - 1}, j, 1);\n"
+           f"  await(0, {g}, 1);\n"
+           "  ready();  // math takes the row's\n")
+  free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
+  fills = lambda *pairs: tt(free + [w for slot, row in pairs for w in fill(slot, row)] + FILLED)
+  lib = lambda name: f"{tt(aim(R2))} p_{name}(); {tt(aim(0))}"  # an SFPU library program, on the tile at R2
+  math = (f"  {head}\n  fetched(); {tt([DST_FREE])}\n"
+          f"  for (unsigned t = 0; t < nt; t++) {{ {fills((f'{X} + t', R2))} if (t) p_sqacc(h); else p_sq(h); }}\n"
+          f"  {tt(aim('h') + ACROSS[2]('sum2') + aim(0) + MATH_END)} h ^= {DST_HALF}; {tt(REPORT)}\n"
+          f"  fetched(); {fills((SUMS, R2))}\n"
+          f"  for (unsigned k = 1; k < {g}; k++) {{ {fills((f'{SUMS} + k', R3))} p_add(0); }}\n"
+          f"  p_mean(0); {lib('sqrt')} {lib('frecip')}  // R2: the row's rsqrt\n"
+          f"  for (unsigned t = 0; t < nt; t++) {{ {tt([DST_FREE])} {fills((f'{X} + t', 'h'), (f'{W} + t', R3))} "
+          f"p_norm(h); {tt(MATH_END)} h ^= {DST_HALF}; }}\n  {tt(REPORT)}\n")
+  cfg, sums = kernel_config("fp32", "bf16"), kernel_config("fp32", "fp32")
+  packer = (f"  {head}\n  {tt(repack(cfg, sums) + pack('h', f'{SUMS} + j') + repack(sums, cfg))} h ^= {DST_HALF};\n"
+            "  tensix_idle(); SYNC[7] = 1;  // the sums are in L1, for BRISC\n"
+            f"  for (unsigned t = 0; t < nt; t++) {{ output(h / {DST_HALF}, {OUT} + h / {DST_HALF}, "
+            f"{tile_of(2, 0, 'i', 't0 + t')}); {tt(pack('h', f'{OUT} + h / {DST_HALF}', SEM_PACKED))} "
+            f"h ^= {DST_HALF}; }}\n")
+  # x rounded to bf16 as the packer rounds it (ftob), with its constants in LRegs 6 and 7
+  rounded = lambda d, at: [sfp_load(d, at), ins("SFPIADD", vd=d, vc=6, mod1=4), ins("SFPAND", vd=d, vc=7)]
+  half = [ins("SFPLOADI", vd=6, mod0=2, imm16=0x8000), *sfp_bits(7, 0xFFFF0000)]
+  programs = {"sq": lambda r: rounded(0, R2) + [mul(1, 0, 0), sfp_store(1, r)],
+              "sqacc": lambda r: rounded(0, R2) + [sfp_load(1, r), mad(2, 0, 0, 1), sfp_store(2, r)],
+              "add": lambda r: [sfp_load(0, R2), sfp_load(1, R3), mad(2, 1, ONE, 0), sfp_store(2, R2)],
+              "mean": lambda r: [sfp_load(0, R2), mad(1, 0, 6, 7), sfp_store(1, R2)],
+              "norm": lambda r: rounded(0, r) + [sfp_load(1, R2), mul(2, 0, 1), sfp_load(3, R3), mul(4, 2, 3),
+                                                 sfp_store(4, r)]}
+  setups = {"sq": half, "sqacc": half, "norm": half, "mean": sfp_const(6, 1 / n) + sfp_const(7, eps)}
+  library = "".join(f"__attribute__((noinline)) static void p_{p}(void) {{ {tt(sfpu([p], {}))} }}\n"
+                    for p in ("sqrt", "frecip"))
+  return compile_kernel(brisc_program("nt", brisc, "fp32", "bf16", rects, f"unflag({g}, 0);"),
+                        unpack_program("  fetched(); fetched();", cfg),
+                        math_program({}, math, True, qwen.helpers(programs, setups) + library),
+                        pack_program(packer))
+
+def rms_launch(x, w, c):
+  """RMSNorm of x by rms_kernel, or None where it doesn't apply: x an fp32 matrix of at most a tile row for each row of
+  the grid, at least two tiles a worker wide."""
+  (xs, ys), rows, cols = x.rt.grid, x.rows, x.cols
+  tr, ct = -(-rows // 32), -(-cols // 32)
+  if not (x.dtype == "fp32" and x.batch == 1 and w.shape[-2:] == (1, cols) and tr <= len(ys) and ct >= 2 * len(xs)
+          and not x.requires_grad):
+    return None
+  # the weight's fp32 scale, w or 1 + w, made once and kept with it
+  scales = w.__dict__.setdefault("rms_scales", {})
+  if (scale := scales.get(bool(c.centered))) is None:
+    scale = scales[bool(c.centered)] = ((w.float() + 1) if c.centered else w.float()).realize()
+  out = Tensor(x.rt, rows, cols, dtype="bf16")
+  out.lead = x.lead
+  return out.run(("rms", x.rt.grid, ct, cols, c.eps), lambda: rms_kernel(x.rt.grid, ct, cols, c.eps), out, x, scale,
+                 units=tr * len(xs), name="rms")
 
 def head(c): return c.head_dim or c.dim // c.heads  # the width of a head. Qwen3's config gives it, a Llama's is dim / heads
 
