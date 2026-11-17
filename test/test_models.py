@@ -1688,8 +1688,9 @@ def test_delta_solve(chip):
   q, v = rng.normal(0, 0.3, (h, m, kd)), rng.normal(0, 1, (h, m, vd))
   beta, g, S = rng.uniform(0.9, 1, (h, m, 1)), -rng.uniform(0, 0.01, (h, m, 1)), rng.normal(0, 0.1, (h, kd, vd))
   want, state = [], S
+  qn, kn = qwen.unit(q, kd ** -0.5), qwen.unit(k)  # chunk takes q and k to length 1, and step takes them so
   for t in range(m):  # step takes q and k as columns, the rest as rows
-    o, state = qwen.step(q[:, t, :, None], k[:, t, :, None], v[:, t, None, :], beta[:, t, None, :], g[:, t, None, :], state)
+    o, state = qwen.step(qn[:, t, :, None], kn[:, t, :, None], v[:, t, None, :], beta[:, t, None, :], g[:, t, None, :], state)
     want.append(o[:, 0])
   want = np.stack(want, 1)
   rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
@@ -1709,8 +1710,7 @@ def test_delta_tree(chip):
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
   rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
   for m, tree in ((20, True), (40, False)):
-    unit = lambda a: a / np.linalg.norm(a, axis=-1, keepdims=True)
-    q, k = unit(rng.normal(0, 1, (2, m, 64))) * 64 ** -0.5, unit(rng.normal(0, 1, (2, m, 64)))
+    q, k = rng.normal(0, 1, (2, m, 64)), rng.normal(0, 1, (2, m, 64))  # as the conv gives them: rule takes them to length 1
     v, beta, g, S = rng.normal(0, 1, (4, m, 32)), rng.uniform(0, 1, (4, m, 1)), -rng.uniform(0, 1, (4, m, 1)), rng.normal(0, 0.1, (4, 64, 32))
     seen = np.tril(np.ones((4, m, m)))
     if tree:
@@ -1727,7 +1727,7 @@ def test_delta_tree(chip):
       after = qwen.rule(*(a[:, path, :] for a in (q, k, v, beta, g)), S, state=True)[3]
       assert rel(qwen.carry(S.copy(), k, *want[1:], end, on), after) < 1e-5
       assert rel(value(qwen.carry(up(S), up(k), *got[1:], up(end), up(on))), after) < 0.01
-  qwen.rule_kernel(1, 4, 4, 2, False, True)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
+  qwen.rule_kernel(1, 4, 4, 2, False, 128)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
 
 def test_delta_rule(chip):
   # deltanet's rule takes the place of the conv and the gated delta rule, for tokens in an order of the caller's, and
@@ -1742,7 +1742,7 @@ def test_delta_rule(chip):
     f, m = llama.fns(rows), rows.shape[-2] - (c.conv - 1)
     rows = f.cat(rows[:, m:, :], rows[:, :m, :])  # the last inputs, then this call's
     q, k, v, b, g = gates(f.silu(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))))
-    q, k = f.repeat(q, c.vh // c.kh), f.repeat(k, c.vh // c.kh)
+    q, k = f.repeat(qwen.unit(q, c.kd ** -0.5), c.vh // c.kh), f.repeat(qwen.unit(k), c.vh // c.kh)
     cum, decay, u, w = qwen.corrected(k, v, f.sigmoid(b), g)
     return (q * f.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ (u - w @ S)
   def run(p, up, zeros, rule):  # the outputs for then after first, and the states before and after
