@@ -596,7 +596,7 @@ def rule_kernel(st, kt, vt, rep, state, scaled=False):
   - with state, e^G, where G is cum at the last token, in every place of a tile, and kl = (k e^(G - cum))^T
 
   With scaled, for a piece of one tile without state, whose made tiles fit the packer's reach, the kernel makes cum,
-  which goes out after v_new, the decays, and the rounded q, k, kb, kbe, qe and vb, each rounded once. cum = seen g,
+  which goes out after v_new, its tiles filled, the decays, and the rounded q, k, kb, kbe, qe and vb, each rounded once. cum = seen g,
   and cum's column filling its tiles, or turned for cum_i - cum_j, come from the FPU, from two TF32 parts of each
   value: 22 bits of it, where the tensor ops' fp32 matmul has bf16's two parts, 16.
 
@@ -641,6 +641,9 @@ def rule_kernel(st, kt, vt, rep, state, scaled=False):
   formats = lambda f: reconfigure(SEC0_out_format=f, SEC1_out_format=f)
   free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]  # a fill waits for the SFPU to finish
   ops, made = [], {}  # (math, pack) for each op, and which op made each slot
+  names = ["q", "k", *(["v", "beta", "g", "seen"] if scaled else ["kb", "kbe", "qe", "vb", "decay"]), "S", "consts",
+           *(["eg", "kl"] if state else [])]
+  arg = {name: 6 + 4 * i for i, name in enumerate(names)}  # each input's four words, after the result's
   def op(slot, terms=(), start=None, posts=(), home=None, exact=False):
     """One tile into slot: the sum of the products in terms, as (A's tile, B's tile, B transposed), or start's tile,
     then posts, (program, tiles) in turn, each with its tiles filled beside the result. With home, it goes out to that
@@ -725,9 +728,6 @@ def rule_kernel(st, kt, vt, rep, state, scaled=False):
   # BRISC fetches a unit's inputs once math has reported the last unit done, and writes results out as they're packed.
   get = lambda i, base, rows, cols, b="e": (f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) "
                                             f"get(a[{i}], {tile_of(i, b, 'r', 'c')}, {base} + r * {cols} + c);")
-  names = ["q", "k", *(["v", "beta", "g", "seen"] if scaled else ["kb", "kbe", "qe", "vb", "decay"]), "S", "consts",
-           *(["eg", "kl"] if state else [])]
-  arg = {name: 6 + 4 * i for i, name in enumerate(names)}  # each input's four words, after the result's
   rows = ((QR, KR, VR) if scaled else (Q, K, VB))
   fetch = (get(arg["q"], rows[0](0, 0), st, kt, f"e / {rep}") + get(arg["k"], rows[1](0, 0), st, kt, f"e / {rep}") +
            (get(arg["v"], VR(0, 0), st, vt) + get(arg["beta"], BE, st, 1) + get(arg["g"], GI, st, 1) +
@@ -780,7 +780,7 @@ def rule(q, k, v, beta, g, S, seen=None, state=False):
   key = ("rule", st, kt, vt, rep, state, scaled)
   out.run(key, lambda: rule_kernel(*key[1:]), out, *rows, S, constants(q.rt), *extra, units=h, name="rule")
   o, vnew = out[:, :s, :], out[:, 32 * st:32 * st + s, :]
-  if scaled: cum = out._view(s, 1, h, 2 * st * out.stride, out.bstride)  # its tiles filled: a column of them
+  if scaled: cum = out[:, 64 * st:64 * st + s, :1]  # a copy of its tiles' first column
   return (o, vnew, cum, out[:, 64 * st:64 * st + kd, :]) if state else (o, vnew, cum)
 
 @functools.cache
