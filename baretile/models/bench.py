@@ -71,7 +71,7 @@ def table(chip, probe=None):
   for m in (32, 64):  # and by the chunked rule, from tensor operations, as a prompt's piece or a tree of drafts runs it
     (q, k), (v, beta, g) = (zeros(m, HD, KH, "fp32") for _ in range(2)), (zeros(m, c, VH, "fp32") for c in (HD, 1, 1))
     row(f"Gated DeltaNet, {m} tokens by the chunked rule", seconds(lambda: [t.realize() for t in qwen.chunk(q, k, v, beta, g, S)]))
-  x, w = zeros(32, DIM), zeros(1, DIM)
+  x, w = zeros(32, DIM, 1, "fp32"), zeros(1, DIM)  # the fp32 residual stream, as a step reads it
   row(f"RMSNorm, 32 rows of {DIM}", seconds(lambda: llama.rms(x, w, SimpleNamespace(eps=1e-6, centered=True)).realize()))
   logits = np.random.default_rng(0).normal(0, 4, (32, VOCAB)).astype(np.float32)
   z = Tensor.frombytes(rt, 32, VOCAB, logits.tobytes(), 1, "fp32")
