@@ -15,6 +15,8 @@ from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_O
                              sfp_store, slot_base, step_unpack, table, tile_bytes, tile_of, tt, unpack, unpack_program,
                              walk, widen)
 
+A_PIECE = 128  # tiles of A's row in each multicast by which a token's matmul shares it (bcast)
+
 def worker_block(rt, w, grid):  # each worker's block of a grid matmul's rt x w result tiles: bp rows by bq columns
   return -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
 
@@ -243,7 +245,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   stream = ring * tile_bytes(mm["wt"] or "bf16") if ring else DEPTH * tile_bytes("bfp8")
   long = (one and rows_at[0] is None and mm["ids"] is None and  # leave room for the singles and B's stream
           slot_base(dtype) + (top + inputs + mm["kt"]) * tile_bytes(dtype) + stream <= OUTS)
-  bcast, local = None, None
+  bcast, local, idle = None, None, None
   if one and not mc and (rows_at[0] is not None or long) and nb <= len(grid[1]):
     per = len(grid[1]) // nb * len(grid[0])  # workers for each matrix
     bp, bq = 1, -(-w // min(per, w))
@@ -253,13 +255,23 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     banks = collections.Counter(b for b, _ in readers or ())
     if (nb == 1 and (w % len(bh.DRAM) == 0 or mm["bc"]) and not mm["bt"] and mm["ids"] is None
         and len(banks) == len(bh.DRAM)):
-      local = [bh.noc_xy(*port) | b << 12 | [c for c, _ in readers[:u]].count(b) << 16 | banks[b] << 24
+      # The worker that shares A's row (below) is a reader of a bank with the most. It takes no columns if another bank
+      # has fewer readers, since that bank sets the time anyway.
+      sharer = max(range(len(readers)), key=lambda u: (banks[readers[u][0]], u))
+      if banks[mine := readers[sharer][0]] > min(banks.values()): idle, banks[mine] = sharer, banks[mine] - 1
+      order = [b if u != idle else None for u, (b, _) in enumerate(readers)]  # the readers that take columns
+      local = [bh.noc_xy(*port) | b << 12 | order[:u].count(b) << 16 | banks[b] << 24
                for u, (b, port) in enumerate(readers)]
       most = -(-w // len(bh.DRAM))  # columns in each bank
       bcast, bq = (len(grid[0]), len(grid[1])), -(-most // min(banks.values()))
   # all four programs get the readers table, since they walk the same tiles
   ours = table("reader", local) + "\n" if local else ""
   long = long and bcast is not None  # without bcast, A streams like any row that doesn't fit
+  # With bcast, one worker of each matrix reads A's row and multicasts it in pieces of A_PIECE tiles, flag 0 counting
+  # the pieces out, and the others stream B from the start, each step waiting for its piece only. Without local, that's
+  # the worker with the fewest columns, since its own work starts once the row is out.
+  if bcast and not local: sharer = min(range(bcast[0] * bcast[1]), key=lambda u: (min(bq, max(w - u * bq, 0)), -u))
+  wait_a = lambda end: f"await(0, 1, ({end} + {A_PIECE - 1}) / {A_PIECE}); " if bcast else ""  # A's tiles below end
   # shared: a tile row of A that the matrices of a bigger batch all read, like a decode step's tokens going through the
   # experts that any of them picked. The grid's first row reads it once, in shares, and multicasts it to the grid.
   # Workers outside the grid read it from DRAM. All grid workers take part, so the batch needs at least as many units
@@ -503,7 +515,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
           if bfp:  # into region jj % 3 of B8: the share's exponents, then its values
             region = f"{b8_at if parts else B8} + {seq} % 3 * {kb * tile_bytes(wt)}"
             get_b += (f"if ({gy_n - 1} && {b1} > {b0}) mcast({region} + 64 * ({b0}), ({b1} - {b0}) * "
-                      f"64, col_rect[{gx}], {gy_n - 1}); " +
+                      f"64, col_rect[{gx}], {gy_n - 1}, 0); " +
                       share_b(f"{region} + {64 * kb} + {BFP[wt]} * ({b0})", BFP[wt]))
           else: get_b += share_b(f"SLOT({buf} + {b0})", tile_bytes(dtype))
           c[B].append("{ if (ii == 0) { "  # a column's first tile brings B's column, and in the first column A's rows
@@ -546,7 +558,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
           c[U].append(f"{{ {tt([setadc(bh.UNPACK1, rows_at[q]), setadc(bh.UNPACK0, line)])} {on} "
                       f"for (unsigned m = 0; m < {kt}; m++) {{ landed(); {tt(WALK)} }} {off}{posted} }}")
         else:
-          # with bcast or shared, A's row is in already
+          # with bcast or shared, A's row is in already, or with bcast comes in pieces (wait_a)
           new = "0" if bcast or shared else f"fresh({q}, {which(op['x'])} * {rt} + i_)"
           # B's column comes per tiles a chunk, into part p of the ring, with A's tiles beside it if the row is new. A
           # block float's ring is at b8_at or B8, a bf16's at ring_slot.
@@ -556,7 +568,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                         f"unsigned nk = {kt} - m0 < {per} ? {kt} - m0 : {per}, "
                         f"p = chunk_part(); {run_b('m0', f'{ring_first} + p * {per}', 'nk')}; "
                         f"if (new) for (unsigned m = m0; m < m0 + nk; m++) get(a[{x}], {a_tile}, {rows_at[q]} + m); "
-                        f"chunk_issued(p, nk); }} "
+                        f"{wait_a('m0 + nk')}chunk_issued(p, nk); }} "
                         "tagged(0); }")
             steps_u = lambda lo, hi: (f"for (unsigned m = {lo}; m < {hi}; m++) {{ unsigned z = landed_chunk(m, {per}); "
                                       f"{tt(step_unpack('z'))} }}")
@@ -564,8 +576,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
               at = lambda slot: tt(reconfigure(SEC0_base=(slot_base(dtype) + slot * tile_bytes(dtype)) // 16 - 1))
               on, off = at(ring_slot), at(0)
           else:
-            c[B].append(f"{cond}{live}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) "
-                        f"{step_b(f'{bs} + steps % {DEPTH}', f'a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT')}; "
+            c[B].append(f"{cond}{live}{{ unsigned new = {new}; for (unsigned m = 0; m < {kt}; m++) {{ {wait_a('m + 1')}"
+                        f"{step_b(f'{bs} + steps % {DEPTH}', f'a[{x}], {a_tile}, new ? {rows_at[q]} + m : KEPT')}; }} "
                         f"tagged(0); }}")
             steps_u = lambda lo, hi: (f"for (unsigned m = {lo}; m < {hi}; m++) {{ unsigned z = landed(); "
                                       f"{tt(step_unpack(f'{bs} + z'))} }}")
@@ -652,7 +664,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       tiles_c = f"""for (unsigned {cols}; jj++) for (unsigned ii = 0; ii < {bp}; ii++) {{
       unsigned i_ = i0 + ii, j = {f"j0 + {len(bh.DRAM)} * (reader[unit] >> 24) * jj" if local else "j0 + jj"},
                k = 0{sz};
-      if (i_ >= {rt} || j >= {w}) continue;
+      if (i_ >= {rt} || j >= {w}{"" if idle is None else f" || unit == {idle}"}) continue;
       {tile_c(passes[0][1])}
     }}"""
       # With parts, the block's columns go a group at a time, and each group goes through the parts of K in turn. v is
@@ -695,22 +707,25 @@ j0 = {col0};
   # result tiles to write to DRAM
   total = f"a[1] * {L if swept(me) else 1}" if reducing else f"tiles / {n_parts}" if parts else "tiles"
   first = ""
-  # With bcast, a worker waits for A's row before its first tile. The first grid row of its matrix reads and sends it.
+  # With bcast, the sharer of each matrix reads A's row and sends it, a piece at a time (wait_a).
   if bcast:
     (gx_n, gy_n), (xs, ys), kt, x = bcast, grid, mm["kt"], arg(mm["x"])
     # each matrix's grid rows
     rects = [bh.noc_rect((xs[0], ys[g]), (xs[gx_n - 1], ys[g + gy_n - 1])) for g in range(0, nb * gy_n, gy_n)]
-    decls, tail = decls + table("rect", rects) + "\n" + ours, "unflag(1, 0);"
+    # every worker sees the last piece's flag before zeroing it, also one with no columns
+    decls, tail = decls + table("rect", rects) + "\n" + ours, f"await(0, 1, {-(-kt // A_PIECE)}); unflag(1, 0);"
     in_batch = matrix(mm["x"], x)
     near = (f"  for (unsigned i = 0; i < {len(bh.DRAM)}; i++) near[i] = bank[i];\n"
             "  near[reader[a[0]] >> 12 & 7] = reader[a[0]] & 0xFFF; "
             " // its own bank through its reader's port\n") if local else ""
-    # One worker of each matrix reads A's row and multicasts it: on a card, multicasts into one rectangle from several
-    # workers queue up behind each other, and sharing A's row this way took 2-3x as long
-    first = (near + f"  {{ unsigned b = a[0] / {bcols};\n    if (a[0] % {bcols} == 0) {{ "
-                    f"for (unsigned m = 0; m < {kt}; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
-             f"      share(SLOT({rows_at[0]}), {kt * tile_bytes(dtype)}, rect[b], {bcols - 1}, 0, 1); }}\n"
-             "    await(0, 1, 1);\n  }\n")
+    # One worker of each matrix sends it all: on a card, multicasts into one rectangle from several workers queue up
+    # behind each other, and sharing A's row this way took 2-3x as long
+    first = (near + f"  if (a[0] % {bcols} == {sharer}) {{ unsigned b = a[0] / {bcols};\n"
+             f"    for (unsigned m0 = 0, n = 1; m0 < {kt}; m0 += {A_PIECE}, n++) {{\n"
+             f"      unsigned m1 = m0 + {A_PIECE} < {kt} ? m0 + {A_PIECE} : {kt};\n"
+             f"      for (unsigned m = m0; m < m1; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
+             f"      share(SLOT({rows_at[0]} + m0), (m1 - m0) * {tile_bytes(dtype)}, rect[b], {bcols - 1}, 0, n); }}\n"
+             "  }\n")
   # With shared, grid workers wait for A's row before their first tile. The grid's first row reads and sends it.
   if shared:
     (xs, ys), kt, x = grid, mm["kt"], arg(mm["x"])
