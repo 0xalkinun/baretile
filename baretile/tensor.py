@@ -117,11 +117,15 @@ class Tensor:
       raise ValueError(f"{len(data)} bytes for {batch} x {rows} x {cols} of {dtype}")
     t = cls(rt, rows, cols, batch=batch, dtype=dtype)
     tb, run = tile_bytes(dtype), 2 * n  # bytes per tile, and 8-byte words per run of 16 values (a row of a face)
-    tiles = memoryview(bytearray(t.tiles * tb)).cast("Q")  # the tiles in order, zero where they're padding
-    for b, r in ((b, r) for b in range(batch) for r in range(rows if rows > 1 else 32)):  # a single row fills its tile
-      at = n * (b * rows + (r if rows > 1 else 0)) * cols
-      row = bytes(data[at:at + n]) * 32 if cols == 1 else bytes(data[at:at + n * cols]) + bytes(n * (32 * tc - cols))
-      src, first = memoryview(row).cast("Q"), (b * tr + r // 32) * tc * tb // 8 + r % 16 * run
+    pad = lambda m: bytes(m) * 32 if cols == 1 else bytes(m) + bytes(n * (32 * tc - cols))  # a row across its tiles
+    if rows == 1:  # a single row fills its tile: each face is 16 of its values 16 times, a half row of the tile's 32
+      halves = (pad(data[b * n * cols:(b + 1) * n * cols]) for b in range(batch))
+      tiles = memoryview(b"".join(2 * (h[k:k + 16 * n] * 16 + h[k + 16 * n:k + 32 * n] * 16)
+                                  for h in halves for k in range(0, 32 * n * tc, 32 * n))).cast("Q")
+    else: tiles = memoryview(bytearray(t.tiles * tb)).cast("Q")  # the tiles in order, zero where they're padding
+    for b, r in ((b, r) for b in range(batch) for r in range(rows) if rows > 1):
+      at = n * (b * rows + r) * cols
+      src, first = memoryview(pad(data[at:at + n * cols])).cast("Q"), (b * tr + r // 32) * tc * tb // 8 + r % 16 * run
       # word q of the runs in the left or right faces
       for half, q in ((half, q) for half in (0, 1) for q in range(run)):
         start = first + (r % 32 // 16 * 2 + half) * tb // 32 + q  # faces as in the tile layout at the top of tensix.py
