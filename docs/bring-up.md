@@ -188,6 +188,11 @@ A P150a has settled these, which ttsim doesn't model:
   what a kernel packs stays within that of the packer's address.
 - Multicasts into one rectangle from several workers queue up behind each
   other, so one worker shares a row that every worker needs.
+- A multicast reserves its path through the grid before each transaction, which
+  costs ~370 cycles over all 108 grid workers and holds up the reads around it.
+  So `mcast` links a share's 16 KiB packets and its flag into one transaction:
+  a token's matmul shares A's row in pieces of 128 tiles while B streams, and
+  MLP down at 32 rows takes 93 µs, not 123.
 - The Tensix config bank isn't on the NoC. Reading it from the host took the
   card off its PCIe link until `tt-smi -r 0` reset it.
 
