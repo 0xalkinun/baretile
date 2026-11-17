@@ -39,17 +39,21 @@ STAGE = 1 << 16  # the biggest read that the dispatcher makes from the ring into
 # firmware sets up at boot (noc_setup).
 DEVICE = f"""
 #define L1_DATA {DATA:#x}
-#define NIU(reg) (((volatile unsigned *){bh.NIU:#x})[(reg) / 4])
+// the registers of NoC noc's NIU
+#define NOC(noc, reg) (((volatile unsigned *)({bh.NIU:#x} + (noc) * {bh.NIU_1 - bh.NIU:#x}))[(reg) / 4])
+#define NIU(reg) NOC(0, reg)
 enum {{ {", ".join(f"{k} = {v:#x}" for k, v in (bh.NIU_REGS | bh.NOC_CMD | {"MAX_PACKET": bh.MAX_PACKET}).items())} }};
 static inline unsigned noc_me(void) {{ return NIU(ID_LOGICAL) & 0xFFF; }}  // this tile's translated x | y << 6
-static inline void noc_issue(unsigned long long targ, unsigned targ_xy, unsigned long long ret, unsigned ret_xy,
-                             unsigned ctrl, unsigned n) {{
-  while (NIU(CMD) & 1) {{}}  // the initiator still holds the previous request
-  NIU(TARG_LO) = targ; NIU(TARG_MID) = targ >> 32; NIU(TARG_HI) = targ_xy;
-  NIU(RET_LO) = ret; NIU(RET_MID) = ret >> 32; NIU(RET_HI) = ret_xy;
-  NIU(PACKET_TAG) = 0; NIU(CTRL) = ctrl; NIU(LEN) = n;
-  NIU(CMD) = 1;
+static inline void noc_issue_on(unsigned noc, unsigned long long targ, unsigned targ_xy, unsigned long long ret,
+                                unsigned ret_xy, unsigned ctrl, unsigned n) {{
+  while (NOC(noc, CMD) & 1) {{}}  // the initiator still holds the previous request
+  NOC(noc, TARG_LO) = targ; NOC(noc, TARG_MID) = targ >> 32; NOC(noc, TARG_HI) = targ_xy;
+  NOC(noc, RET_LO) = ret; NOC(noc, RET_MID) = ret >> 32; NOC(noc, RET_HI) = ret_xy;
+  NOC(noc, PACKET_TAG) = 0; NOC(noc, CTRL) = ctrl; NOC(noc, LEN) = n;
+  NOC(noc, CMD) = 1;
 }}
+static inline void noc_issue(unsigned long long targ, unsigned targ_xy, unsigned long long ret, unsigned ret_xy,
+                             unsigned ctrl, unsigned n) {{ noc_issue_on(0, targ, targ_xy, ret, ret_xy, ctrl, n); }}
 // Wait until this core's earlier stores to L1 are processed: a load from addr behind them only returns once they're
 // out. To settle stores to the config bank, pass an address there.
 static inline void l1_settle(unsigned addr) {{
@@ -104,15 +108,17 @@ static inline void mcast_begin(void) {{
     for (;;) {{}}  // cancelled: the host will reset this core
   }}
 }}
-// Wait until a multicast has all its acknowledgements, which is when the ack counter reaches acks. A multicast leaves
-// the outstanding count wrong, up once and down once per tile, so no other request may be in flight. We clear it after.
-static inline void mcast_done(unsigned acks) {{
-  while (NIU(WR_ACKS) != acks) {{}}
-  NIU(CLEAR_OUTSTANDING) = 0xFFFF;
-  l1_settle({bh.NIU + bh.NIU_REGS["OUTSTANDING"]:#x});
+// Wait until a multicast on NoC noc has all its acknowledgements, which is when the ack counter reaches acks. A
+// multicast leaves the outstanding count wrong, up once and down once per tile, so no other request may be in flight
+// on that NoC. We clear it after.
+static inline void mcast_done_on(unsigned noc, unsigned acks) {{
+  while (NOC(noc, WR_ACKS) != acks) {{}}
+  NOC(noc, CLEAR_OUTSTANDING) = 0xFFFF;
+  l1_settle((unsigned)&NOC(noc, OUTSTANDING));
   MCAST_STATE[1] = 0;
   l1_settle({MCAST_STATE + 4:#x});
 }}
+static inline void mcast_done(unsigned acks) {{ mcast_done_on(0, acks); }}
 static inline void noc_wait(void) {{  // wait until reads have landed and writes are acknowledged
   // An initiator still holding a request hasn't counted it yet, which a busy NoC shows (ttsim never holds one)
   while ((NIU(CMD) | NIU1(CMD) | NIU2(CMD)) & 1) {{}}

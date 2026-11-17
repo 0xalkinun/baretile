@@ -15,7 +15,7 @@ from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_O
                              sfp_store, slot_base, step_unpack, table, tile_bytes, tile_of, tt, unpack, unpack_program,
                              walk, widen)
 
-A_PIECE = 128  # tiles of A's row in each multicast by which a token's matmul shares it (bcast)
+A_PIECE = 16  # tiles of A's row in each multicast by which a token's matmul shares it (bcast)
 
 def worker_block(rt, w, grid):  # each worker's block of a grid matmul's rt x w result tiles: bp rows by bq columns
   return -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
@@ -514,8 +514,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                                    f"{seq} + 1);")
           if bfp:  # into region jj % 3 of B8: the share's exponents, then its values
             region = f"{b8_at if parts else B8} + {seq} % 3 * {kb * tile_bytes(wt)}"
-            get_b += (f"if ({gy_n - 1} && {b1} > {b0}) mcast({region} + 64 * ({b0}), ({b1} - {b0}) * "
-                      f"64, col_rect[{gx}], {gy_n - 1}, 0); " +
+            get_b += (f"if ({gy_n - 1} && {b1} > {b0}) {{ noc_wait(); mcast({region} + 64 * ({b0}), ({b1} - {b0}) * "
+                      f"64, col_rect[{gx}], {gy_n - 1}, 0); }} " +
                       share_b(f"{region} + {64 * kb} + {BFP[wt]} * ({b0})", BFP[wt]))
           else: get_b += share_b(f"SLOT({buf} + {b0})", tile_bytes(dtype))
           c[B].append("{ if (ii == 0) { "  # a column's first tile brings B's column, and in the first column A's rows
@@ -719,13 +719,15 @@ j0 = {col0};
             "  near[reader[a[0]] >> 12 & 7] = reader[a[0]] & 0xFFF; "
             " // its own bank through its reader's port\n") if local else ""
     # One worker of each matrix sends it all: on a card, multicasts into one rectangle from several workers queue up
-    # behind each other, and sharing A's row this way took 2-3x as long
-    first = (near + f"  if (a[0] % {bcols} == {sharer}) {{ unsigned b = a[0] / {bcols};\n"
+    # behind each other, and sharing A's row this way took 2-3x as long. It reads the next piece on NoC 0 while a piece
+    # goes out on NoC 1.
+    get_a = lambda lo: (f"for (unsigned m = {lo}; m < {lo} + {A_PIECE} && m < {kt}; m++) "
+                        f"get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);")
+    first = (near + f"  if (a[0] % {bcols} == {sharer}) {{ unsigned b = a[0] / {bcols};\n    {get_a(0)}\n"
              f"    for (unsigned m0 = 0, n = 1; m0 < {kt}; m0 += {A_PIECE}, n++) {{\n"
-             f"      unsigned m1 = m0 + {A_PIECE} < {kt} ? m0 + {A_PIECE} : {kt};\n"
-             f"      for (unsigned m = m0; m < m1; m++) get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);\n"
-             f"      share(SLOT({rows_at[0]} + m0), (m1 - m0) * {tile_bytes(dtype)}, rect[b], {bcols - 1}, 0, n); }}\n"
-             "  }\n")
+             f"      noc_wait(); FLAGS[0] = n; {get_a(f'm0 + {A_PIECE}')}\n"
+             f"      mcast(SLOT({rows_at[0]} + m0), ({kt} - m0 < {A_PIECE} ? {kt} - m0 : {A_PIECE}) * "
+             f"{tile_bytes(dtype)}, rect[b], {bcols - 1}, (unsigned)&FLAGS[0]); }}\n  }}\n")
   # With shared, grid workers wait for A's row before their first tile. The grid's first row reads and sends it.
   if shared:
     (xs, ys), kt, x = grid, mm["kt"], arg(mm["x"])

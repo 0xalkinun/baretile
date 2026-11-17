@@ -91,6 +91,7 @@ TRISC_STACK_TOP = LOCAL_RAM + 4 * 1024
 TRISC_RESET_PC = 0xFFB12228  # RISCV_DEBUG_REG_TRISC0_RESET_PC, then TRISC1's and TRISC2's
 TRISC_RESET_PC_OVERRIDE = 0xFFB12234  # bit i makes TRISC i start at its RESET_PC instead of 0x6000 / 0xA000 / 0xE000
 NIU = 0xFFB20000  # NoC 0 interface (ISA NoC/MemoryMap.md). request initiator i at +i * INITIATOR, counters at +0x200
+NIU_1 = 0xFFB30000  # NoC 1's, the same registers. NoC 1 flows the other way, so a broadcast gives it end to start
 NIU_REGS = {  # offsets from NIU
   # A request has a target and a return address (64 bits each, then the tile as x | y << 6), a tag, control bits
   # (NOC_CMD) and a length. Writing CMD = 1 sends it. AT_DATA is the operand of an atomic.
