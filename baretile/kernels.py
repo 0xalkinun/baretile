@@ -800,12 +800,13 @@ def attention_parts(ht, R, wt, kt, units, workers):
   """Choose how many workers share a unit's kt key tiles, for a decode step's few units over a long cache.
 
   Use up to 8 parts with at least 8 key tiles per part, limited by the available workers. Combining parts costs
-  additional launches. If the keys still exceed attention_store's capacity, increase the number of parts, up to 8."""
+  additional launches. If the keys still exceed attention_store's capacity, increase the number of parts, up to 8
+  and still one unit for each worker: a second unit on some took 9B attention over 32k keys from 1.29 to 1.81 ms."""
   room = lambda P: attention_store(ht, R, wt, P)[1]
   try: split = room(2)
   except ValueError: return 1  # a part's extra tile of maxima doesn't fit
   P = max(1, min(8, kt // 8, workers // units))
-  return max(P, min(8, -(-kt // split))) if split and -(-kt // P) > room(P) else P
+  return max(P, min(8, -(-kt // split), workers // units)) if split and -(-kt // P) > room(P) else P
 
 def attention_plan(ht, ra, entries, wt, kt, workers, parts=None):
   """Plan Tensor.attend for entries matrices of ra tile rows of queries over kt key tiles, as (R, units, parts, kept):
