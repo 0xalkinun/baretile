@@ -511,13 +511,16 @@ class Tensor:
       self._alias(x)
       self.op, self.srcs, self.rep, self.runs = None, (), x.rep, x.runs
       return self
-    if self.op in ("T", "move"):  # data movement, into a tensor of its own
-      if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
+    if self.op in ("T", "move"):  # data movement, into a tensor of its own or one laid out as new that it doesn't read
       if self.dtype in BFP:
         raise ValueError("a block float moves only as a matmul's B. Cast it to bf16 to transpose or move it")
       x, op, d = _plain(self.srcs[0].realize()), self.op, self.dtype
+      if into is not None and not _fresh(into, x):
+        raise ValueError("a transpose or a move writes a tensor of its own, or one laid out as new it doesn't read")
       src = x._where()  # check the source before this tensor counts as realized
-      self.addr, self.op, self.srcs = self._alloc(), None, ()
+      if into is not None: self._alias(into)
+      else: self.addr = self._alloc()
+      self.op, self.srcs = None, ()
       where = (self.addr, *src)
       if op == "T" and d == "bf16":
         return self.run(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols), *where,
@@ -553,12 +556,13 @@ class Tensor:
   def assign(self, x):
     """Write x into this tensor in place, as an optimizer updates a weight. An unrealized x is computed into this
     tensor's DRAM. A matmul with an overlapping input, or an overlapping view with a different layout, computes
-    its source before writing. Moves and transposes compute into their own storage first."""
+    its source before writing. Moves and transposes compute into their own storage first, unless this tensor is laid
+    out as a new one and isn't what they read."""
     self._same_runtime(x)
     if not (self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype)):
       raise ValueError("assign requires a realized tensor with rep=1 and an x of the same shape and dtype")
     _writes(self)
-    if x.op in ("T", "move"): x = x.realize()
+    if x.op in ("T", "move") and not _fresh(self, x.srcs[0].realize()): x = x.realize()
     if x.op is not None: x.realize(self); return self
     if x.addr == self.addr and _layout(x) != _layout(self): x = _copy(x)
     return self.run(("copy", self.dtype), lambda: copy_kernel(self.dtype), *self._where(), *x._where(),
@@ -1299,10 +1303,13 @@ class Recording:
 def _writes(t):  # while jit records, note that t's allocation is written in place
   if t.rt.written is not None: t.rt.written.add(t.addr)
 
-def _bindable(t):  # whether a replay can read t where it is, laid out as a new tensor of its shape or by columns
-  tr, tc = -(-t.rows // 32), -(-t.cols // 32)
-  return t.runs is not None or (t.offset, t.rep, t.stride,
-                                t.bstride if t.batch > 1 else 0) == (0, 1, tc, tr * tc if t.batch > 1 else 0)
+def _laid_new(t):  # whether t's matrices lie as a new tensor of its shape's do
+  tr, tc, b = -(-t.rows // 32), -(-t.cols // 32), t.batch > 1
+  return (t.offset, t.rep, t.stride, t.bstride * b) == (0, 1, tc, tr * tc * b)
+
+def _fresh(t, src): return not t.runs and _laid_new(t) and src.addr != t.addr  # a move of src can write t where it is
+
+def _bindable(t): return t.runs is not None or _laid_new(t)  # a replay can read t where it is, as new or by columns
 
 # t, or if it's a view of a recorded input, the same view of this call's input, with a plain address
 def _on_input(t, inputs):

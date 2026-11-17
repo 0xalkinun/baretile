@@ -1148,6 +1148,20 @@ def test_assign_matmul_without_copy(chip):
   assert kernels(rt, since) == 1, "an independent destination is written by the fused matmul"
   assert out.tolist() == [[67.0] * 32] * 32
 
+
+def test_assign_move_without_copy(chip):
+  # assign moves a tensor straight into a destination laid out as new that the move doesn't read, in one kernel, as
+  # a gathered row of conv inputs into the conv state's layout. Into a view, or from itself, it goes through a copy.
+  rt, a = Runtime(chip), np.arange(3 * 64, dtype=np.float32).reshape(3, 64)
+  x, out = Tensor.of(rt, a.tolist(), "fp32"), Tensor(rt, 1, 64, batch=3, dtype="fp32")
+  since = rt.launches
+  out.assign(x.reshape(3, 1, 64))
+  assert kernels(rt, since) == 1 and np.array_equal(value(out)[:, 0], a)
+  square = Tensor.of(rt, np.arange(64 * 64, dtype=np.float32).reshape(64, 64).tolist(), "fp32")
+  since, want = rt.launches, value(square)[0].T
+  square.assign(square.T)
+  assert kernels(rt, since) == 2 and np.array_equal(value(square)[0], want), "a transpose of itself goes through a copy"
+
 def test_realize_overlapping_destination(chip):
   for end in (chip.tensix[1], chip.tensix[-1]):
     rt = Runtime(chip, end=end)
