@@ -2506,11 +2506,12 @@ def test_grouped_topk(chip):
   # groups on the Tensix engines, their 64 best, then BRISC reads only the groups that can hold the k largest. The
   # cases: random rows with the best value tied across groups; -0 and 0, equal and the largest; 70 groups tied at the
   # k-th maximum, so the row is read whole; 300 tiles, in 15 groups rather than 16; rows past one tile, one row of
-  # copies, bf16 and a k of 1. Then rows of equal values, where every group ties and the first columns win, and a k past
-  # 32, which needs topk's parts.
+  # copies, bf16 and a k of 1; a draft's row and a k of 31, whose groups' maxima are wide enough to find their best by
+  # grouped_topk too. Then rows of equal values, where every group ties and the first columns win, and a k past 32,
+  # which needs topk's parts.
   rt, rng = Runtime(chip), np.random.default_rng(41)
   for dtype, rows, cols, k in (("fp32", 3, 8192, 32), ("fp32", 3, 9600, 32), ("fp32", 33, 8192, 20), ("bf16", 1, 16384, 32),
-                               ("bf16", 5, 16384, 1)):
+                               ("bf16", 5, 16384, 1), ("fp32", 3, 98304, 4), ("bf16", 3, 65536, 31)):
     x = rng.normal(-2, 3, (rows, cols))
     x[0, [5, 300, 7000]] = x[0].max() + 1
     if rows > 2:

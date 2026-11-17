@@ -44,6 +44,7 @@ def scale(r): return 1 / r.temperature if r and r.temperature > 0 else 1.0  # th
 # 32, or none. BRISC reads TOPK_RUNS runs of 16 at a time
 def topk_groups(tiles): return min((g for g in range(8, 33) if tiles % g == 0), key=lambda g: abs(g - 16), default=0)
 TOPK_RUNS = 1024
+NESTED = 64  # the fewest tiles of group maxima whose best groups grouped_topk finds by grouped_topk too
 
 def grouped_topk(x, k):
   """topk's (values, int32 indices) of each row's k largest, k up to 32, in one call for a row too wide for topk's L1,
@@ -53,17 +54,22 @@ def grouped_topk(x, k):
   k values reach tau, so each of the row's k best lies in a group whose maximum reaches tau, and BRISC reads just those
   groups' columns, a run of 16 for each (grouped_scan). If the (k + 1)-th maximum reaches tau too, groups past it may
   tie with it, and BRISC reads the whole row instead. Exact, and ties keep column order, as in topk. Keeping no more
-  groups than that keeps topk's threshold high: a draft's best 4 of 98,304 take 1/3 less than with 64 groups kept."""
+  groups than that keeps topk's threshold high: a draft's best 4 of 98,304 take 1/3 less than with 64 groups kept.
+  Maxima of NESTED tiles or more find their k + 1 best by grouped_topk too, as its threshold does for x: a draft's 6
+  rows of 6,144 maxima take 46 us by topk, 36 so."""
   groups = topk_groups(x.cols // 32) if x.cols % 32 == 0 else 0
   if not (0 < k <= 32 and x.batch == 1 and x.dtype in ("bf16", "fp32") and groups):
     raise ValueError(f"grouped_topk needs k up to 32, batch 1, bf16 or fp32 and a tile count with a factor from 8 to 32: "
                      f"k={k}, batch {x.batch}, {x.dtype}, {x.cols} columns")
   m = x.split(groups).max(0)  # each group's maximum
   tiles = m.cols // 32
-  most = 32 * -(-(k + 1) // 32)  # what a part keeps: a multiple of 32
-  p = next(p for p in range(1, tiles + 1) if tiles % p == 0 and tiles // p <= topk_room(x.dtype, most))
-  best, at = m.topk(k + 1, p) if p == 1 else m.topk(most, p)  # the k + 1 best groups, of the parts' best if split
-  best, at = best.topk(k + 1, labels=at) if p > 1 else (best, at)
+  if k < 32 and tiles >= NESTED and topk_groups(tiles):  # the k + 1 best groups by grouped_topk too, the maxima's own
+    best, at = grouped_topk(m, k + 1)
+  else:
+    most = 32 * -(-(k + 1) // 32)  # what a part keeps: a multiple of 32
+    p = next(p for p in range(1, tiles + 1) if tiles % p == 0 and tiles // p <= topk_room(x.dtype, most))
+    best, at = m.topk(k + 1, p) if p == 1 else m.topk(most, p)  # the k + 1 best groups, of the parts' best if split
+    best, at = best.topk(k + 1, labels=at) if p > 1 else (best, at)
   values, ids = (Tensor(x.rt, x.rows, k, dtype=d) for d in (x.dtype, "int32"))
   key = ("grouped topk", k, x.cols, x.dtype, groups)
   return values.run(key, lambda: topk_kernel(k, x.cols, x.dtype, scan=grouped_scan(*key[1:])), values.addr, ids.addr,
