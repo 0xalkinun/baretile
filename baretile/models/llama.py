@@ -70,6 +70,7 @@ def precision(c, mode="bf16", kv=None):
     ("kv", None)             the KV cache's format: kv if given, else bfp8 for tt and experts, else bf16
     ("draft head", None)     experts only: a bfp4 copy of the output layer at one phase, for the multi-token
                              prediction layer to draft with
+    ("fc", None)             with a multi-token prediction layer, its input projection
 
   Modes:
     bf16, bfp8   the matrices in that format at four phases, which gives exact products
@@ -94,6 +95,7 @@ def precision(c, mode="bf16", kv=None):
   p = {(op, l): entry(op) for l in range(c.layers + c.mtp) for op in ("qkv", "o", "gate_up", "down")}
   if mode == "tt" and (c.layers, c.dim) == (32, 4096): p["gate_up", 31] = ("bfp8", 2)
   p["head", None] = entry("head")
+  if c.mtp: p["fc", None] = entry("fc")
   if mode == "experts": p["draft head", None] = ("bfp4", 1)
   attention = {("attention", "decode"): (None, 2 if mode == "tt" else 4), ("attention", "prefill"): (None, 4)}
   return p | attention | {("kv", None): (kv or ("bfp8" if fast else "bf16"), None)}
@@ -586,12 +588,14 @@ def load(folder, places=4096, mtp=None):
 
 def weight_format(name, prec):
   """The format of a weight on the chip. Matrices that matmuls read as B take their format from prec (see precision).
-  Those are the blocks' matrices and the output layer, and experts take the format of their block's MLP. Gated
-  DeltaNet's conv, decay, dt_bias and norm are fp32, and so are the q and k norm's qk_norm and qk_on, since those
-  compute with them in fp32. The rest are bf16, and so are the matrices when there's no prec."""
+  Those are the blocks' matrices, the output layer and the prediction layer's input projection (by rows, which predict
+  slices), and experts take the format of their block's MLP. Gated DeltaNet's conv, decay, dt_bias and norm are fp32,
+  and so are the q and k norm's qk_norm and qk_on, since those compute with them in fp32. The rest are bf16, and so are
+  the matrices when there's no prec."""
   op = name.split(".")[-1].removesuffix("_proj")
   if name.startswith("layers.") and op in ("conv", "decay", "dt_bias", "norm", "qk_norm", "qk_on"): return "fp32"
-  key = {"embed.T": ("head", None), "embed.T draft": ("draft head", None)}.get(name) or ((op, int(name.split(".")[1])) if matrix(name) else None)
+  key = ({"embed.T": ("head", None), "embed.T draft": ("draft head", None), "mtp.fc": ("fc", None)}.get(name)
+         or ((op, int(name.split(".")[1])) if matrix(name) else None))
   return prec[key][0] if prec and key in prec else "bf16"
 
 def matrix(name): return name.endswith(("_proj", "experts.gate_up", "experts.down"))  # a block's matrix, read only as B

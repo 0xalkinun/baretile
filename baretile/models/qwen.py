@@ -1164,7 +1164,7 @@ def predict(ids, h, w, c, cache, rows, rotary, mask, prefill, live=None, slots=N
   reads the normalized embedding and h side by side, and the block writes its keys and values into cache at rows."""
   f, d, l = llama.fns(h), c.dim, c.layers
   e, h = llama.rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), llama.rms(h, w["mtp.pre_fc_norm_hidden"], c)
-  fc = w["mtp.fc"]
-  x = f.mm(e, fc[:d, :], None, "fp32") + f.mm(h, fc[d:, :], None, "fp32")
+  fc, phases = w["mtp.fc"], llama.precision_of(c, "fc")[1]
+  x = f.mm(e, fc[:d, :], phases, "fp32") + f.mm(h, fc[d:, :], phases, "fp32")
   x = llama.layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, cache, rows, l, prefill, live, slots=slots)
   return llama.rms(x, w["mtp.norm"], c)
