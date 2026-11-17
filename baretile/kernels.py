@@ -4,7 +4,7 @@
 # data movement, topk and format conversion.
 import collections
 from baretile import bh
-from baretile.runtime import DATA, ZEROS, compile_kernel
+from baretile.runtime import DATA, FLAGS, ZEROS, compile_kernel
 from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_OFF, CC_ON, CHUNKS, COMBINE, DEPTH,
                              DST_HALF, FILLED, FLAGS_B, FOLDS, FP32_OPS, FRAMES, INT32_OPS, ITEMSIZE, MATH_END, MAX_OPS,
                              ONE, OUTS, PAIR, REPORT, ROWS, SEM_L1, SEM_PACKED, SFPU, SFPU_START, UNPACKABLE, WALK,
@@ -755,6 +755,8 @@ j0 = {col0};
                          pack_program(program(P), decls=ours))
   return image, (nb * rt * w // L if reducing else nb * br * bcols)  # and the number of units in the result
 
+FRAMES_A = 4  # an attention unit's frames, where they fit: its reads run up to 3 frames ahead of its math
+
 def attention_l1(ht, R, wt, parts):
   """Lay out attention_kernel's L1 for a unit of R tile rows of queries.
 
@@ -762,7 +764,8 @@ def attention_l1(ht, R, wt, parts):
   - fs is the slots in a frame: the masks, then the keys and values if they're bf16.
   - T is the output tiles for each row: p v, the sums, and with parts the largest scores.
   - Slot 1 holds a tile of ones and slot 2 a tile of -inf. Each row's p comes next, which the packer reaches only
-    below slot 128 (bh.PACK_REACH), then the two frames and the queries. used is the first free slot after them.
+    below slot 128 (bh.PACK_REACH), then nf frames and the queries: FRAMES_A, or 2 for a head too wide for that.
+    used is the first free slot after them.
   - From the top of L1 down: the output tiles at oacc, which are each row's p v and then its sums, in fp32, all
     within the packer's reach of oacc. Then the
     unit's places, and at ranges the key ranges of two units. A key range is the first and last key tile, the first
@@ -773,12 +776,14 @@ def attention_l1(ht, R, wt, parts):
   p_slot = 3
   oacc = bh.L1_SIZE - R * T * tile_bytes("fp32")
   places = oacc - R * tile_bytes("int32")
-  used, ranges = p_slot + R + 2 * fs + R * ht, places - 64
-  # a block float's two frames are at B8. bf16's are among the slots, which must end below the key ranges
-  below = B8 + 4 * ht * tile_bytes(wt) if wt else slot_base("bf16") + used * tile_bytes("bf16")
+  for nf in (FRAMES_A, 2):
+    used, ranges = p_slot + R + nf * fs + R * ht, places - 64
+    # a block float's frames are at B8. bf16's are among the slots, which must end below the key ranges
+    below = B8 + nf * 2 * ht * tile_bytes(wt) if wt else slot_base("bf16") + used * tile_bytes("bf16")
+    if used <= UNPACKABLE and ranges >= below: break
   if used > UNPACKABLE or ranges < below or (wt and 2 * ht > B8_SLOTS) or R * T * tile_bytes("fp32") > bh.PACK_REACH:
     raise ValueError(f"attention head width {32 * ht} with {32 * R} query rows a unit does not fit in L1")
-  return fs, T, (p_slot, p_slot + R + 2 * fs), oacc, places, used, ranges
+  return fs, T, (p_slot, p_slot + R + nf * fs), oacc, places, used, ranges, nf
 
 def attention_store(ht, R, wt, parts):
   """Reserve L1 space to retain keys between the two attention sweeps. Return the storage location and the
@@ -787,12 +792,12 @@ def attention_store(ht, R, wt, parts):
   For bf16, use the first free slot. For block floats, return region bases. Each region holds complete key
   rows in at most 64 slots, the unpacker's limit. Allocate below B8 after the slots in use, and above the
   regions reserved for frames."""
-  *_, used, top = attention_l1(ht, R, wt, parts)
+  *_, used, top, nf = attention_l1(ht, R, wt, parts)
   if not wt: return used, (UNPACKABLE - used) // ht
   per = B8_SLOTS // ht  # key rows in a region
   size = per * ht * tile_bytes(wt)
   windows = ((slot_base("bf16") + used * tile_bytes("bf16") + 63) // 64 * 64,
-             B8), (B8 + 2 * 2 * ht * tile_bytes(wt), top)
+             B8), (B8 + nf * 2 * ht * tile_bytes(wt), top)
   bases = [b for lo, hi in windows for b in range(lo, hi - size + 1, size)]
   return bases, len(bases) * per
 
@@ -825,7 +830,7 @@ def attention_plan(ht, ra, entries, wt, kt, workers, parts=None):
   P = parts or (attention_parts(ht, R, wt, kt, units, workers) if ra <= 2 else 1)
   return R, units, P, attention_store(ht, R, wt, P)[1]
 
-def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=False):
+def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=False, share=None):
   """Compute weighted sums and normalizers for softmax(q k^T + mask) v, keeping scores on the chip.
 
   q is (E, rows, 32 ht), in ra tile rows. k and v are (E / rep, 32 kt, 32 ht), in bf16 or the block float wt as a KV
@@ -840,7 +845,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
 
   A unit is R tile rows of a head's queries, up to 8, and the rows share the key and value tiles they read. BRISC reads
   the places of its rows first. From them it works out which key tiles the rows reach, and builds mask tiles for the
-  key tiles that some row sees part of. The kernel then sweeps those key tiles twice, a frame at a time. A sweep makes
+  key tiles that some row sees part of. The kernel then sweeps those key tiles twice, a frame each. A sweep makes
   each tile of scores in Dst, starting from the mask or 0 and adding the queries times the key tiles, which are read
   transposed.
   - The first sweep makes each tile of scores in a scratch tile of Dst, folds it across its columns and folds that into
@@ -861,8 +866,18 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   The caller receives maxima in fp32, without rounding them through bf16.
 
   With keep, retain as many initial key rows as attention_store can hold between sweeps, so those rows
-  are read from DRAM once per unit."""
-  fs, T, (p_slot, q_row), oacc, places, _, ranges = attention_l1(ht, R, wt, parts)
+  are read from DRAM once per unit.
+
+  With share, the grid, a key head's rep query heads share its key and value tiles: their units, a unit a worker, go
+  to rep workers side by side in a row of the grid, and each reads its rep-th of a frame's tiles and, once they're
+  in, writes them to the others on NoC 1, then flag jm (FLAGS), in order on the static channel. As multicasts, 4 into
+  one rectangle at once waited on each other's path reservations. A frame is in once all rep flags are. Before a
+  worker sends frame n, its thread 0 is done with frame n + 1 - nf: so once a worker has every flag of frame n - 1,
+  the others are done with frame n - nf, whose places frame n takes. Thread 0 waits for a frame's flags, and BRISC
+  goes on to its next frame: waiting in BRISC made the frames a barrier. BRISC zeroes the flags and their source words
+  once thread 0 is done with the last frame, whose flags are then all in. Without keep: the keys come again for
+  sweep 2."""
+  fs, T, (p_slot, q_row), oacc, places, _, ranges, nf = attention_l1(ht, R, wt, parts)
   per = -(-ra // R)  # units per head
   ones, none, fr0 = 1, 2, p_slot + R  # tiles of ones and of -inf, made by the SFPU once a launch, then the frames
   # The slot of frame fr's mask tile for row r, and where the unpackers find its key tile m and value tile j. A block
@@ -891,20 +906,25 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   rng = f"(volatile unsigned *){ranges:#x} + (u & 1) * 8"
   read = (f"asm volatile(\"fence\" ::: \"memory\"); volatile unsigned *g = {rng}; "
           f"unsigned k0 = g[0], k1 = g[1], f0 = g[2], f1 = g[3], empty = g[4];")
+  # a unit's matrix e, rows from i0 and part. With share a key head's query heads take units in turn, jm the head's
+  unit = (f"unsigned q_ = (a[0] + u) / {rep}, jm = (a[0] + u) % {rep}, w_ = q_ / {parts}, part = q_ % {parts}, "
+          f"e = w_ / {per} * {rep} + jm," if share else
+          f"unsigned w_ = (a[0] + u) / {parts}, part = (a[0] + u) % {parts}, e = w_ / {per},")
   units = lambda start, pass0, between, pass1, end: f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned w_ = (a[0] + u) / {parts}, part = (a[0] + u) % {parts}, e = w_ / {per}, i0 = w_ % {per} * {R},
-             nr = {ra} - i0 < {R} ? {ra} - i0 : {R};
+    {unit} i0 = w_ % {per} * {R}, nr = {ra} - i0 < {R} ? {ra} - i0 : {R};
     {start}
-    for (unsigned kt = k0; kt <= k1; kt++) {{ unsigned fr = tiles++ & 1; {pass0} }}
+    for (unsigned kt = k0; kt <= k1; kt++) {{ unsigned fr = tiles++ % {nf}; {pass0} }}
     {between}
-    for (unsigned kt = k0; kt <= k1; kt++) {{ unsigned fr = tiles++ & 1; {pass1} }}
+    for (unsigned kt = k0; kt <= k1; kt++) {{ unsigned fr = tiles++ % {nf}; {pass1} }}
     {end}
   }}"""
   partial = "(!empty && (kt < f0 || kt >= f1))"  # a key tile that some row sees part of. BRISC builds its mask tiles
   ob = f"e * {parts} + part" if parts > 1 else "e"  # the result's batch entry
   # For each unit, BRISC reads the places and works out the key tiles from them: k0 to k1, and the unmasked ones from f0
   # up to f1. With parts, it takes this part's share. It tells the TRISCs as if a frame were fetched.
-  start = ("unsigned lo = ~0u, hi = 0; " +
+  # Each unit's key ranges take turns in two places, so BRISC writes a unit's once thread 0 has unpacked every frame of
+  # the unit before: with frames read ahead, it would otherwise reach one whose place the TRISCs still have to read
+  start = ("unsigned lo = ~0u, hi = 0; reached(events); " +
            each(f"noc_get(BANK({tile_of(18, 'e', 'i0 + r', 0)}), "
                 f"AT(a[18], {tile_of(18, 'e', 'i0 + r', 0)}, 4096), {places:#x} + r * 4096, 4096);") +
            " noc_wait(); " +
@@ -937,12 +957,42 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   fetch = lambda values: (f"reached(frame_done[fr]); if {partial} {{ " + each(f"masked({mask('r')}, r, kt);") + " } " +
                           keys(values) + (f" {tile_row(14, 'j', getk, into(val('j')))}" if values else "") +
                           f" l1_settle(SLOT({mask(0)})); ready(); frame_done[fr] = ++events;")
+  if share:  # this worker's tiles of a frame, j0 to j1, then the frame's pieces that hold them, which it multicasts
+    (xs, ys), j0, j1 = share, f"jm * {ht} / {rep}", f"(jm + 1) * {ht} / {rep}"
+    mine = lambda at, place: (f"for (unsigned m = {j0}; m < {j1}; m++) "
+                              f"{getk}(a[{at}], {tile_of(at, f'e / {rep}', 'kt', 'm')}, {into(place('m'))});")
+    if wt:  # a region's exponents, then its values
+      at = f"{B8} + fr * {2 * ht * tile_bytes(wt)}"
+      pieces = lambda z: [(f"{at} + 64 * ({z})", f"64 * ({j1} - {j0})"),
+                          (f"{at} + {128 * ht} + {BFP[wt]} * ({z})", f"{BFP[wt]} * ({j1} - {j0})")]
+      kp, vp = pieces(j0), pieces(f"{ht} + {j0}")
+    else: kp, vp = ([(f"SLOT({f(j0)})", f"({j1} - {j0}) * {tile_bytes('bf16')}")] for f in (key, val))
+    # the flag goes from its own word for each frame and head, whose low 4 bits match flag jm's
+    src = "(unsigned)&FLAGS[16 + fr * 4 + jm]"
+    # A head with no tiles of a frame, when the heads outnumber them, sends just its flag
+    post = lambda ps: (f"noc_wait(); FLAGS[16 + fr * 4 + jm] = FLAGS[jm] = tiles; l1_settle({src}); "
+                       f"for (unsigned k = 1; k < {rep}; k++) {{ unsigned to = peer[q_ * {rep} + (jm + k) % {rep}]; "
+                       f"if ({j1} > {j0}) {{ " +
+                       " ".join(f"noc_issue_on(1, {a}, noc_me(), {a}, to, WRITE | STATIC, {n});" for a, n in ps) +
+                       f" acks += {len(ps)}; }} "
+                       f"noc_issue_on(1, {src}, noc_me(), (unsigned)&FLAGS[jm], to, WRITE | STATIC, 4); acks++; }} "
+                       "acks_at[fr] = acks;")
+    fetch = lambda values: (f"reached(frame_done[(fr + 1) % {nf}]); await(0, {rep}, tiles - 1); "
+                            "while ((int)(NOC(1, WR_ACKS) - acks_at[fr]) < 0) {} "
+                            f"if {partial} {{ " + each(f"masked({mask('r')}, r, kt);") + " } " +
+                            mine(10, key) + (" " + mine(14, val) if values else "") + " " +
+                            post(kp + (vp if values else [])) +
+                            f" l1_settle(SLOT({mask(0)})); ready(); frame_done[fr] = ++events;")
+    peers = [bh.noc_xy(xs[c % len(xs)], ys[c // len(xs)]) for c in range(len(xs) * len(ys))]  # the grid's workers
+    start = f"acks = NOC(1, WR_ACKS); for (unsigned f = 0; f < {nf}; f++) acks_at[f] = acks; " + start
   queries = ("if (kt == k0) { reached(events); " +
              each(f"for (unsigned m = 0; m < {ht}; "
                   f"m++) get(a[6], {tile_of(6, 'e', 'i0 + r', 'm')}, {q_row} + r * {ht} + m);") + " }")
-  brisc = units(start, f"{queries} {fetch(False)}", "", fetch(True), f"expect += nr * {T};")
+  brisc = units(start, f"{queries} {fetch(False)}", "", fetch(True),
+                f"expect += nr * {T};" + (" while (NOC(1, WR_ACKS) != acks) {}" if share else ""))
   # unpacker 0 at frame fr's block floats
-  region = lambda words: f"if (fr) {{ {tt(words(1))} }} else {{ {tt(words(0))} }}"
+  region = lambda words: ("switch (fr) { " + " ".join(f"case {f}: {{ {tt(words(f))} }} break;" for f in range(nf)) +
+                           " }")
   on_k, off_k = (region(lambda f: haloize(1) + (bfp_b(wt, 2 * ht, f) if wt else [])),
                  tt(haloize(0) + (bfp_b(wt, 0) if wt else [])))
   first_key = key(0)
@@ -957,9 +1007,14 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   walk_k = (f"{on_k} {tt([setadc(bh.UNPACK1, f'{q_row} + r * {ht}'), setadc(bh.UNPACK0, first_key)])} "
             f"{tt([Loop(ht, PAIR)])} {off_k}")
   the_mask = f"empty ? {none} : {partial} ? {mask('r')} : {ZERO_SLOT}"
+  # with share, every head's tiles of the frame are in
+  # (fenced: the L0 cache could hold a flag of the last launch)
+  arrived = (f"for (unsigned k = 0; k < {rep}; k++) for (;;) {{ asm volatile(\"fence\" ::: \"memory\"); "
+             f"if (((volatile unsigned *){FLAGS:#x})[k] >= tiles) break; relay(); }} " if share else "")
   unpacker = units(f"fetched(); {read} {tt(REPORT)}",
-                   "fetched(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k}") + f" {tt(REPORT)}", "",
-                   "fetched(); drain(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k} posted++;") + " drain(); "
+                   f"fetched(); {arrived}" + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k}") + f" {tt(REPORT)}", "",
+                   f"fetched(); {arrived}drain(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k} posted++;") +
+                   " drain(); "
                    f"{on_v} " +
                    each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(unpack(val('j'), f'{p_slot} + r'))} }}") +
                    f" {off_v} " + each(tt(unpack(ones, f"{p_slot} + r"))) + f" {tt(REPORT)}", "")
@@ -1016,7 +1071,9 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   math = "".join(f"{tt(math_begin(False) + sfpu([p], replays) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math
   packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer
   hide = 0xFF80  # bf16 -inf
-  decls = "static unsigned expect;" + (table("store", store) if keep and wt else "") + f"""
+  decls = ("static unsigned expect;" + (table("store", store) if keep and wt else "") +
+           (f"static unsigned acks, acks_at[{nf}];  // NoC 1's acks once this worker's writes, or a frame's, land\n"
+            + table("peer", peers) if share else "")) + f"""
 // The mask of tile row r for key tile kt, from its places: -inf where a row doesn't see the key, else 0.
 // Two keys go in a word.
 static void masked(unsigned slot, unsigned r, unsigned kt) {{
@@ -1029,7 +1086,9 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
     }}
   }}
 }}"""
-  return compile_kernel(brisc_program("expect", brisc, "bf16", "fp32", decls, b8=2 * ht if wt else 0, wt=wt or "bfp8",
+  # the flags and their source words, which are the grid matmul's B flags, zero for the kernels after this one
+  tail = f"reached(events); unflag({rep}, {32 - FLAGS_B});" if share else ""
+  return compile_kernel(brisc_program("expect", brisc, "bf16", "fp32", decls, tail, 2 * ht if wt else 0, wt or "bfp8",
                                       outs=oacc),
                         unpack_program(f"posted += {len(made)}; drain();" + unpacker, cfg), math_program(replays, math),
                         pack_program("static unsigned needed;" + packer))

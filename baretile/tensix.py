@@ -785,7 +785,7 @@ def brisc_program(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0
 #define SLOT(i) ({slot_base(dtype):#x} + (i) * {tb})  // where the unpackers read slot i
 #define OUT_SLOT(i) ({slot_base(dtype) if out == dtype else outs:#x} + (i) * {to})  // and where the packer writes it
 {banks}
-static unsigned fetched, events, frame_done[2], stream_done[{DEPTH}], steps, sent, out;
+static unsigned fetched, events, frame_done[4], stream_done[{DEPTH}], steps, sent, out;  // 4: attention's frames
 static unsigned rows[16];  // for each place in L1, i + 1 of the row it holds (see fresh)
 // fetches tile t of a tensor at DRAM address base (see BANK and AT)
 static void get(unsigned base, unsigned t, unsigned slot) {{ noc_get(BANK(t), AT(base, t, {tb}), SLOT(slot), {tb}); }}
