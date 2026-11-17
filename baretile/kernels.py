@@ -830,13 +830,15 @@ def attention_plan(ht, ra, entries, wt, kt, workers, parts=None):
   P = parts or (attention_parts(ht, R, wt, kt, units, workers) if ra <= 2 else 1)
   return R, units, P, attention_store(ht, R, wt, P)[1]
 
-def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=False, share=None):
+def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=False, share=None, tree=0):
   """Compute weighted sums and normalizers for softmax(q k^T + mask) v, keeping scores on the chip.
 
   q is (E, rows, 32 ht), in ra tile rows. k and v are (E / rep, 32 kt, 32 ht), in bf16 or the block float wt as a KV
   cache, and each of their matrices serves rep heads of q. places is (E or 1, rows, 1) int32 and holds the last key that
   each row sees.
-  With a window, the first key it sees is window - 1 before that. The mask hides all other keys with -inf.
+  With a window, the first key it sees is window - 1 before that. With tree, places has 2 + tree columns: a base
+  key, then 16 bits a column of which keys from the base on a row sees, bit b % 16 of column 2 + b / 16 for the key
+  base + b, as a tree's tokens see the cache before it and their ancestors in it. The mask hides all other keys.
 
   The kernel's arguments:
   - a[0] and a[1]: the first unit and the number of units.
@@ -921,20 +923,23 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   partial = "(!empty && (kt < f0 || kt >= f1))"  # a key tile that some row sees part of. BRISC builds its mask tiles
   ob = f"e * {parts} + part" if parts > 1 else "e"  # the result's batch entry
   # For each unit, BRISC reads the places and works out the key tiles from them: k0 to k1, and the unmasked ones from f0
-  # up to f1. With parts, it takes this part's share. It tells the TRISCs as if a frame were fetched.
+  # up to f1, which with tree end at the lowest base. With parts, it takes this part's share. It tells the TRISCs
+  # as if a frame were fetched.
   # Each unit's key ranges take turns in two places, so BRISC writes a unit's once thread 0 has unpacked every frame of
   # the unit before: with frames read ahead, it would otherwise reach one whose place the TRISCs still have to read
-  start = ("unsigned lo = ~0u, hi = 0; reached(events); " +
+  start = ("unsigned lo = ~0u, hi = 0, low = ~0u; reached(events); " +
            each(f"noc_get(BANK({tile_of(18, 'e', 'i0 + r', 0)}), "
                 f"AT(a[18], {tile_of(18, 'e', 'i0 + r', 0)}, 4096), {places:#x} + r * 4096, 4096);") +
            " noc_wait(); " +
            each(f"volatile unsigned *t = (volatile unsigned *)({places:#x} + r * 4096); "
                 f"for (unsigned q = 0; q < 32 && (i0 + r) * 32 + q < a[23]; q++) "
-                f"{{ unsigned p = t[at(q, 0)]; lo = p < lo ? p : lo; hi = p > hi ? p : hi; }}") +
+                f"{{ unsigned p = t[at(q, 0)]; lo = p < lo ? p : lo; hi = p > hi ? p : hi; "
+                f"{'p = t[at(q, 1)]; low = p < low ? p : low; ' if tree else ''}}}") +
            f" volatile unsigned *g = {rng}; "
            f"unsigned k0 = {f'lo + 1 > {window} ? (lo + 1 - {window}) / 32 : 0' if window else '0'}, "
            f"k1 = hi / 32 < a[22] - 1 ? hi / 32 : a[22] - 1, "
-           f"f0 = {f'hi + 1 > {window} ? (hi + 1 - {window} + 31) / 32 : 0' if window else '0'}, f1 = (lo + 1) / 32; " +
+           f"f0 = {f'hi + 1 > {window} ? (hi + 1 - {window} + 31) / 32 : 0' if window else '0'}, "
+           f"f1 = {'(low < lo + 1 ? low : lo + 1) / 32' if tree else '(lo + 1) / 32'}; " +
            (f"unsigned n_ = k1 - k0 + 1, a0 = k0 + n_ * part / {parts}, a1 = k0 + n_ * (part + 1) / {parts}, "
             f"empty = a0 == a1; "
             "if (empty) k1 = k0; else k0 = a0, k1 = a1 - 1; " if parts > 1 else "unsigned empty = 0; ") +
@@ -1071,6 +1076,9 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   math = "".join(f"{tt(math_begin(False) + sfpu([p], replays) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math
   packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer
   hide = 0xFF80  # bf16 -inf
+  # whether row q misses key j, from its base on: its bit in places' columns after the base, or past the last of them
+  unseen = lambda j: (f"(({j}) >= base && (({j}) - base >= {16 * tree} || !(places[at(q, 2 + (({j}) - base) / 16)] "
+                      f">> ((({j}) - base) % 16) & 1)))" if tree else "0")
   decls = ("static unsigned expect;" + (table("store", store) if keep and wt else "") +
            (f"static unsigned acks, acks_at[{nf}];  // NoC 1's acks once this worker's writes, or a frame's, land\n"
             + table("peer", peers) if share else "")) + f"""
@@ -1080,9 +1088,11 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
   volatile unsigned *places = (volatile unsigned *)({places:#x} + r * 4096), *m = (volatile unsigned *)SLOT(slot);
   for (unsigned q = 0; q < 32; q++) {{
     int p = places[at(q, 0)], first = {f"p - {window - 1}" if window else "0"};
+    int base = {"places[at(q, 1)]" if tree else "0"};  // with tree, the first key its bits are for
     for (unsigned c = 0; c < 32; c += 2) {{
       int j = kt * 32 + c;
-      m[at(q, c) / 2] = (j > p || j < first ? {hide:#x} : 0) | (j + 1 > p || j + 1 < first ? {hide << 16:#x}u : 0);
+      m[at(q, c) / 2] = (j > p || j < first || {unseen('j')} ? {hide:#x} : 0) |
+                        (j + 1 > p || j + 1 < first || {unseen('j + 1')} ? {hide << 16:#x}u : 0);
     }}
   }}
 }}"""

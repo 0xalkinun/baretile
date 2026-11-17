@@ -842,8 +842,10 @@ class Tensor:
 
     k and v may use block-float storage or repeat views. places is an int32 column giving the last visible
     key per query row. With window, the first visible key is window - 1 positions earlier. Read only keys
-    within these bounds. parts divides keys between workers when decode has too few units. Key length and
-    query row count are kernel arguments, so one compiled kernel handles several lengths."""
+    within these bounds. With a tree, places also has a base key, then up to 6 columns of 16 bits that say which
+    keys from the base on each row sees, bit b % 16 of column 2 + b / 16 for the key base + b, as a tree's tokens see
+    the cache before it and their ancestors in it. parts divides keys between workers when decode has too few units.
+    Key length and query row count are kernel arguments, so one compiled kernel handles several lengths."""
     self._same_runtime(k, v, places)
     fidelity = FIDELITY if fidelity is None else operator.index(fidelity)
     if not 1 <= fidelity <= 4: raise ValueError("attention fidelity must be between one and four phases")
@@ -857,9 +859,9 @@ class Tensor:
     if not (self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows):
       raise ValueError(f"attend needs heads of one width, 64 or more in steps of 32, "
                        f"and a value for each key: {self.shape} {k.shape} {v.shape}")
-    if not (places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1
+    if not (places.rows == self.rows and places.batch in (1, self.batch) and places.cols in (1, *range(3, 9))
             and places.dtype == "int32"):
-      raise ValueError(f"attend needs places as an int32 column with a row for "
+      raise ValueError(f"attend needs places as an int32 column, or with a base and up to 6 of bits, a row for "
                        f"each query: {places.shape} {places.dtype} for {self.shape}")
     wt = k.dtype if k.dtype in BFP else None
     # A key head's query heads share its tiles where their units, a unit a worker, can sit side by side in a grid row,
@@ -873,7 +875,8 @@ class Tensor:
     k, v = k.realize(), v.realize()
     out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
     # the exact row count is an argument, so the key rounds it up to tiles
-    key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0 and not share, self.rt.grid if share else None)
+    key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0 and not share, self.rt.grid if share else None,
+           max(places.cols - 2, 0))
     out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(),
             *places._where(), kt,
             self.rows, units=units * P, name="attention")
