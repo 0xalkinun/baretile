@@ -1741,6 +1741,13 @@ def test_delta_tree(chip):
       assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
   # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree, with deltanet's raw
   qwen.rule_kernel(1, 4, 4, 2, False, 128, (1e-6, 128))
+  # carry on one worker, which takes every unit in turn, along a path through two tiles of rows, against NumPy's. Its
+  # decays are small: at up to e^-1 a token the kernel is ~1% from NumPy
+  with Runtime(chip, end=chip.tensix[1]) as one:
+    given = (S, rng.normal(0, 1, (2, 40, 64)), rng.normal(0, 1, (4, 40, 32)), np.cumsum(-rng.uniform(0, 0.1, (4, 40, 1)), 1),
+             np.eye(40)[None, 39:], (np.arange(40) >= 20)[None, :, None] * 1.0)
+    assert rel(value(qwen.carry(*(Tensor.frombytes(one, *a.shape[1:], np.float32(a).tobytes(), a.shape[0], "fp32") for a in given))),
+               qwen.carry(S.copy(), *given[1:])) < 0.01
 
 def test_conv_last(chip):
   # qwen.conv reads each token's inputs from the table, or past its rows from the conv state where it lies (last): as
