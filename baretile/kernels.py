@@ -1186,16 +1186,6 @@ void kmain(volatile unsigned *a) {{
   noc_wait();
 }}""")
 
-# C shared by put_kernel and bfp4_kernel
-NIBBLE = """
-// The sign and the 3 bits of bf16 b below exponent top, rounded to the nearest.
-static unsigned nibble(unsigned b, unsigned top) {
-  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0),
-           q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
-  if (q > 7) q = 7;
-  return q ? (b >> 15 & 1) << 3 | q : 0;  // no sign on a zero: the unpacker reads -0 as -inf
-}"""
-
 def put_kernel(dtype):
   """Put rows of x into rows of a tensor, in place. It's the inverse of gather. BRISC does it alone.
 
@@ -1212,27 +1202,15 @@ def put_kernel(dtype):
   rows that fill a tile in order, like a prompt's starting at a tile boundary, use their tile of x as it is. Places past
   the tensor's last tile row are skipped, and a place in the padding of its last tile row is written there.
 
-  Into a block float, like a KV cache in bfp8 or bfp4, x is bf16 and each run of 16 rounds as a cast would. The run
-  shares its largest exponent. bfp8 keeps 7 bits of magnitude rounded half up, as the packer does. bfp4 keeps 3 bits
-  rounded to the nearest, as bfp4_kernel does. A 0 loses its sign, since the unpacker reads -0 as -inf."""
-  bfp = dtype in BFP
-  xd = "bf16" if bfp else dtype  # x's dtype
-  tb, xb = tile_bytes(dtype), tile_bytes(xd)  # bytes in a tile of the tensor, of x
-  copy = ("for (unsigned f = 0; f < 2; f++) pack(FROM + run_of(i, f), TILE, r, f);" if bfp else
-          f"for (unsigned f = 0; f < 2; f++) for (unsigned k = 0; k < {4 * ITEMSIZE[xd]}; k++) "
-          f"((volatile unsigned *)(TILE + run_of(r, f)))[k] = ((volatile unsigned *)(FROM + run_of(i, f)))[k];")
+  x has the tensor's dtype. Into a block float, like a KV cache in bfp8 or bfp4, each run of 16 goes with its exponent
+  as it is, so a row keeps the bits it came with."""
+  tb = tile_bytes(dtype)
+  run, head = (BFP[dtype] // 64, 64) if dtype in BFP else (16 * ITEMSIZE[dtype], 0)  # a run's bytes, after exponents
+  exponent = "((volatile unsigned char *)TILE)[run_of(r, f)] = ((volatile unsigned char *)FROM)[run_of(i, f)]; "
+  copy = (f"for (unsigned f = 0; f < 2; f++) {{ {exponent if head else ''}for (unsigned k = 0; k < {run // 4}; k++) "
+          f"((volatile unsigned *)(TILE + {head} + run_of(r, f) * {run}))[k] = "
+          f"((volatile unsigned *)(FROM + {head} + run_of(i, f) * {run}))[k]; }}")
   copy = f"for (unsigned r = a[15] == 1 ? 0 : place[i], end = a[15] == 1 ? 32 : r + 1; r < end; r++) {{ {copy} }}"
-  # value k of the run into the block-float tile: two to a byte for bfp4, 7 bits of magnitude rounded half up for bfp8
-  rounded = ("if (k % 2) continue; ((volatile unsigned char *)tile)[64 + n * 8 + k / 2] = nibble(v[k], "
-             "top) | nibble(v[k + 1], top) << 4;"
-             if dtype == "bfp4" else
-             "unsigned b = v[k], e = b >> 7 & 255, m = (b & 127) | (e ? 128 : 0), shift = top - e < 8 ? top - e : 8, "
-             "q = (m + (1u << shift)) >> (shift + 1); if (q > 127) q = 127; "
-             "((volatile unsigned char *)tile)[64 + n * 16 + k] = q ? (b >> 15) << 7 | q : 0;")
-  as_is = (f"noc_get(BANK(from), AT(a[6], from, {xb}), FROM, {xb}); noc_wait(); "
-           f"for (unsigned r = 0; r < 32; r++) for (unsigned f = 0; f < 2; f++) pack(FROM + run_of(r, f), "
-           f"TILE, r, f);" if bfp else
-           f"noc_get(BANK(from), AT(a[6], from, {tb}), TILE, {tb}); noc_wait();")
   return compile_kernel(f"""
 #define TILE {DATA:#x}
 #define FROM {DATA + 4096:#x}
@@ -1240,26 +1218,15 @@ def put_kernel(dtype):
 #define PLACES {DATA + 12288:#x}
 {BANKS}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}  // place r of the 32, in row 0
-// row r's run in face f, in x, in bytes
-static unsigned run_of(unsigned r, unsigned f) {{ return at(r % 32, 16 * f) * {ITEMSIZE[xd]}; }}
-{NIBBLE}
-// Pack the 16 bf16 values at src into row r's run in face f of the block-float tile: its exponent, then its values.
-static void pack(unsigned src, unsigned tile, unsigned r, unsigned f) {{
-  volatile unsigned short *v = (volatile unsigned short *)src;
-  unsigned top = 0, n = at(r % 32, 16 * f) / 16;  // which of the tile's 64 runs
-  for (unsigned k = 0; k < 16; k++) {{ unsigned e = v[k] >> 7 & 255; if (e > top) top = e; }}
-  ((volatile unsigned char *)tile)[n] = top;
-  for (unsigned k = 0; k < 16; k++) {{
-    {rounded}
-  }}
-}}
+// which of a tile's 64 runs is row r's in face f
+static unsigned run_of(unsigned r, unsigned f) {{ return at(r % 32, 16 * f) / 16; }}
 void kmain(volatile unsigned *a) {{
   unsigned n = a[12], ct = a[13], tr = a[14];
   // each row's place, the next row to land in its tile row (~0: none), and each tile row's first row
   volatile unsigned *place = (volatile unsigned *)PLACES, *next = place + n, *first = next + n;
   for (unsigned i = 0; i < n; i += 32) {{
     unsigned it = a[11] + i / 32;
-    noc_get(BANK(it), AT(a[10], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")});
+    for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(it), AT(a[10], it, 4096) + o, IDS + o, 64);  // row 0
     noc_wait();
     for (unsigned k = 0; k < 32 && i + k < n; k++) place[i + k] = id(k);
   }}
@@ -1271,12 +1238,15 @@ void kmain(volatile unsigned *a) {{
     if (ti >= tr || first[ti] != i0) continue;  // the tile belongs to an earlier row's unit, or there's none
     unsigned to = b * a[3] + ti * a[4] + j + a[5], held = ~0u, whole = i0 % 32 == 0 && i0 + 32 <= n;
     for (unsigned k = 0; whole && k < 32; k++) whole = place[i0 + k] == 32 * ti + k;
-    if (whole) {{ unsigned from = b * a[7] + i0 / 32 * a[8] + j + a[9]; {as_is} }}
+    if (whole) {{
+      unsigned from = b * a[7] + i0 / 32 * a[8] + j + a[9];
+      noc_get(BANK(from), AT(a[6], from, {tb}), TILE, {tb}); noc_wait();
+    }}
     else noc_get(BANK(to), AT(a[2], to, {tb}), TILE, {tb});  // in flight with the first row's tile of x
     for (unsigned i = i0; i != ~0u; i = next[i]) {{
       if (whole && i < i0 + 32) continue;
       unsigned from = b * a[7] + i / 32 * a[8] + j + a[9];
-      if (from != held) noc_get(BANK(from), AT(a[6], from, {xb}), FROM, {xb}), held = from;
+      if (from != held) noc_get(BANK(from), AT(a[6], from, {tb}), FROM, {tb}), held = from;
       noc_wait();
       {copy}
     }}
@@ -1656,23 +1626,40 @@ def bfp4_kernel():
   """Convert bf16 tiles to bfp4. BRISC does it alone, a tile a unit.
 
   args: [first unit, units, out, x's address, tile strides for batch and row, tile offset, x's tile columns, tiles a
-  matrix].
+  matrix, its rows].
 
   Each run of 16 values, a row of a face, shares its largest exponent. Each value keeps the 3 bits below it, rounded to
   the nearest with ties up, the same way Tenstorrent's host conversion rounds. The packer's own bfp4 is its bfp8 with
-  the low 4 bits dropped, which rounds toward zero. This kernel reads and writes L1 a 32-bit word at a time."""
+  the low 4 bits dropped, which rounds toward zero. This kernel reads x a 32-bit word at a time. It rounds a matrix's
+  live rows alone: a padding row's runs get a zero exponent and zero values, whatever its bf16 holds, and a matrix of
+  one row, which has it in every row of its tiles, gets row 0's runs again."""
   return compile_kernel(f"""
 #define IN {DATA:#x}
 #define OUT {DATA + 2048:#x}
 {BANKS}
-{NIBBLE}
+
+// The sign and the 3 bits of bf16 b below exponent top, rounded to the nearest.
+static unsigned nibble(unsigned b, unsigned top) {{
+  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0),
+           q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
+  if (q > 7) q = 7;
+  return q ? (b >> 15 & 1) << 3 | q : 0;  // no sign on a zero: the unpacker reads -0 as -inf
+}}
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b * a[4] + i * a[5] + j + a[6],
-             tops = 0;
+             live = a[9] - 32 * i < 32 ? a[9] - 32 * i : 32;
     noc_get(BANK(from), AT(a[3], from, {tile_bytes("bf16")}), IN, {tile_bytes("bf16")});
     noc_wait();
-    for (unsigned r = 0; r < 64; r++) {{  // a run: 8 words of 2 values, its largest exponent, then 2 words of 8 nibbles
+    volatile unsigned char *tops = (volatile unsigned char *)OUT;  // each run's exponent, then its 2 words of nibbles
+    volatile unsigned *runs = (volatile unsigned *)(OUT + 64);
+    for (unsigned r = 0; r < 64; r++) {{  // a run: 8 words of 2 values
+      if (r / 32 * 16 + r % 16 >= live) {{  // run r is row r / 32 * 16 + r % 16's, a padding row's: zeros, or a matrix
+        unsigned row0 = r / 16 % 2 * 16, one = a[9] == 1;  // of one row has it in every row, row 0's run of the face
+        tops[r] = one ? tops[row0] : 0;
+        for (unsigned w = 0; w < 2; w++) runs[2 * r + w] = one ? runs[2 * row0 + w] : 0;
+        continue;
+      }}
       unsigned v[8], top = 0;
       for (unsigned k = 0; k < 8; k++) {{
         v[k] = ((volatile unsigned *)(IN + 32 * r))[k];
@@ -1680,13 +1667,12 @@ void kmain(volatile unsigned *a) {{
         if (e0 > top) top = e0;
         if (e1 > top) top = e1;
       }}
-      tops |= top << 8 * (r % 4);
-      if (r % 4 == 3) {{ ((volatile unsigned *)OUT)[r / 4] = tops; tops = 0; }}
+      tops[r] = top;
       for (unsigned w = 0; w < 2; w++) {{
         unsigned word = 0;
         for (unsigned k = 0; k < 4; k++)
           word |= (nibble(v[4 * w + k], top) | nibble(v[4 * w + k] >> 16, top) << 4) << 8 * k;
-        ((volatile unsigned *)(OUT + 64 + 8 * r))[w] = word;
+        runs[2 * r + w] = word;
       }}
     }}
     noc_write(OUT, BANK(t), AT(a[2], t, {tile_bytes("bfp4")}), {tile_bytes("bfp4")});

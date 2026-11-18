@@ -2,7 +2,7 @@
 import collections, gc, html, importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
-from baretile import pci, tensor
+from baretile import bh, pci, tensor
 from baretile.tensor import Tensor
 from baretile.runtime import Bound, Runtime
 from conftest import bf16, value
@@ -1007,6 +1007,24 @@ def test_bfp_numpy(chip, dtype):
   rt, rng = Runtime(chip), np.random.default_rng(5)
   a = bf16(rng.normal(0, 1, (64, 96)) * np.exp(rng.normal(0, 2, (64, 96))))
   assert np.array_equal(value(Tensor.of(rt, a.tolist()).cast(dtype))[0], gpt2.bfp(a, dtype))
+  # A matrix's padding rows hold zero runs, exponents and values, and a matrix of one row has it in every row of its
+  # tiles. The tiles checked are the first tile row's with padding: tiles 0 to 2, or for 33 rows tile row 1's, 3 to 5,
+  # each the first of its bank.
+  run = tensor.BFP[dtype] // 64  # a run's bytes after the 64 exponents
+  for rows in (1, 6, 33):
+    a = bf16(rng.normal(0, 1, (rows, 96)) * np.exp(rng.normal(0, 2, (rows, 96))))
+    x = Tensor.of(rt, a.tolist()).cast(dtype).realize()
+    assert np.array_equal(value(x)[0], gpt2.bfp(a, dtype)), rows
+    rt.wait()
+    first, live = (3, 1) if rows == 33 else (0, rows)
+    pad = [r for r in range(64) if r // 32 * 16 + r % 16 >= (32 if rows == 1 else live)]  # run r is a row of its face
+    for j in range(3):
+      raw = chip.read(*bh.DRAM[first + j], x.addr, 64 + 64 * run)
+      want = gpt2.bfp(a, dtype)[32 * (rows == 33):][:32, 32 * j:32 * j + 32]
+      want = np.repeat(want, 32, 0) if rows == 1 else np.pad(want, ((0, 32 - len(want)), (0, 0)))
+      got = (np.frombuffer(tensor._bf16s(raw, dtype), np.uint16).astype(np.uint32) << 16).view(np.float32)
+      assert np.array_equal(got.reshape(2, 2, 16, 16).transpose(0, 2, 1, 3).reshape(32, 32), want), (rows, j)
+      assert not any(raw[r] or any(raw[64 + run * r:64 + run * (r + 1)]) for r in pad), (rows, j)
 
 @pytest.mark.parametrize("n, dtype, size", [(16, "bf16", 0), (40, "bf16", 0), (40, "bfp8", 0), (16, "bf16", 64)])
 def test_gpt2_layer(chip, n, dtype, size):

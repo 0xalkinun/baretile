@@ -22,10 +22,13 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 ### Changed
 
 - baretile needs tt-kmd 2.5 or later. The core's line budget is 4,650, from 4,500.
+- `Tensor.put` into a block float takes rows in its dtype and copies each run with its exponent, where it took bf16
+  and rounded on BRISC. Cast the rows first, or for bfp8 have the matmul that makes them pack it, as
+  `a.matmul(cache, "bfp8")` does.
 - Multicasts go on NoC 1, as linked transactions, so a token's matmul shares A's row while B streams on NoC 0.
 - Faster kernels: attention for a few rows reads each key and value tile once for a key head's query heads, and takes
   p from `exp16`; the SFPU works on a matrix's live rows alone; `gather`, `put`, `topk` and a single row's upload read
-  or spread less; `assign` moves straight into a new destination.
+  or spread less; `assign` moves straight into a new destination; the bfp4 cast rounds a matrix's live rows alone.
 
 ### Fixed
 
