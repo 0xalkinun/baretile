@@ -1162,9 +1162,9 @@ def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
 def predict(ids, h, w, c, cache, rows, rotary, mask, prefill, live=None, slots=None):
   """The multi-token prediction block's normalized output for tokens ids after hidden states h (draft's pass): fc
   reads the normalized embedding and h side by side, and the block writes its keys and values into cache at rows."""
-  f, d, l = llama.fns(h), c.dim, c.layers
+  f, l = llama.fns(h), c.layers
   e, h = llama.rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), llama.rms(h, w["mtp.pre_fc_norm_hidden"], c)
-  fc = w["mtp.fc"]
-  x = f.mm(e, fc[:d, :], None, "fp32") + f.mm(h, fc[d:, :], None, "fp32")
+  eh = np.concatenate([e, h], -1) if isinstance(h, np.ndarray) else e.cat(h, axis=-1)  # side by side, one matmul's A
+  x = f.mm(eh, w["mtp.fc"], llama.precision_of(c, "fc")[1], "fp32")
   x = llama.layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, cache, rows, l, prefill, live, slots=slots)
   return llama.rms(x, w["mtp.norm"], c)
