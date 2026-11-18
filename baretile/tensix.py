@@ -670,7 +670,7 @@ def elementwise(op, replays, dst=0):
   fpu = {"add": "ELWADD", "sub": "ELWSUB"}[op]
   return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [release(ins(fpu, dst=dst))]
 
-def reduce_step(kind, replays, acc, first, edge=0, src=None, wide=False):
+def reduce_step(kind, replays, acc, first, edge=0, src=None, wide=False, rows=32):
   """Accumulate one tile of a reduction. Load bf16 through SrcA plus zeros in SrcB, or fill fp32 from L1 slot
   src, or with wide widen bf16 from it. Put the first tile in the accumulator after waiting for it to become free.
   Load subsequent tiles into scratch and combine them with the SFPU. For a partial final tile, edge gives the number
@@ -680,13 +680,21 @@ def reduce_step(kind, replays, acc, first, edge=0, src=None, wide=False):
   from_slot = lambda d: widen(replays, src, d) if wide else fill(src, row + d) + FILLED
   put = lambda d: from_slot(d) if src is not None else elementwise("add", replays, dst=d)
   if first: return take(sem) + aim(row) + put(0) + mask(0)
-  return aim(row) + put(128) + mask(128) + SFPU_START + runs(replays, kind, 32)
+  return aim(row) + put(128) + mask(128) + live(lambda n: SFPU_START + runs(replays, kind, n), rows, row)
 # folds across the tile and runs the SFPU ops on the result, before MATH_END
-def reduce_finish(kind, replays, acc, posts):
-  return [DST_FREE, *aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, replays)
+def reduce_finish(kind, replays, acc, posts, rows=32):
+  return [DST_FREE, *aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, replays, rows, ACCS[acc][0])
 
-def sfpu(posts, replays):  # runs the SFPU ops in order, over the Dst half that the FPU has written
-  return [w for u in posts for w in SFPU_START + SFPU[u][0] + runs(replays, u, 32)]
+def sfpu(posts, replays, rows=32, at="h"):  # runs the SFPU ops in order, over the Dst half that the FPU has written
+  return posts and live(lambda n: [w for u in posts for w in SFPU_START + SFPU[u][0] + runs(replays, u, n)], rows, at)
+# SFPU work on a tile aimed at Dst row `at` with rows rows, a number or a C expression: program(n) takes n of the
+# tile's 32 steps, each 4 rows of 8 columns, two of them a face's 4 rows (see mask_rows). For 2 to 16 rows it runs on
+# their steps in face 0, then 16 rows on in face 1. The rows past them keep what the FPU left. A tile of one row holds
+# its copies, which broadcasting reads, so it runs whole, as do 17 rows or more.
+def live(program, rows, at):
+  if isinstance(rows, int) and not 2 <= rows <= 16: return program(32)
+  n, few = f"(({rows} + 3) / 4 * 2)", f"({rows} > 1 && {rows} <= 16)"
+  return program(f"({few} ? {n} : 32)") + aim(f"{at} + 16") + program(f"({few} ? {n} : 0)") + aim(at)
 
 def table(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
 BANKS = table("bank", [bh.noc_xy(x, y) for x, y in bh.DRAM]) + f"""
