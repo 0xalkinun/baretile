@@ -2660,10 +2660,10 @@ def test_grouped_topk(chip):
   with pytest.raises(ValueError, match="k up to 32"): serve.grouped_topk(x, 33)
 
 def test_frontier(chip):
-  # serve.frontier takes a draft tree's next pass on the chip: the n best of a pass's candidates by score, ties to the
-  # first, and for each its token, its parent's row, attend's places (its row, the drafts' first, its parent's bits with
-  # its own), its cache row, the position and its score, with the candidates logged. The cases: a pass from the root's
-  # 4, then 6 of 24 with ties, -0 and 0 and negative scores, with bits in every column; then a log alone.
+  # serve.frontier takes a tree's next pass on the chip: the n best of a pass's candidates by score, ties to the first,
+  # and for each its token, its parent's row, attend's places (its row, the base, its parent's bits with its own), its
+  # cache row, the position and its score, with the candidates logged. The cases: 4 of 4 candidates from one row,
+  # then 6 of 24 with ties, -0 and 0 and negative scores, with bits in every column; then a log alone.
   rt, rng = Runtime(chip), np.random.default_rng(7)
   vocab = rng.choice(250000, 300, replace=False)
   table, log = Tensor.of(rt, [[int(v)] for v in vocab], "int32"), Tensor.zeros(rt, 12, 96, dtype="int32").realize()

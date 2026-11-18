@@ -229,8 +229,8 @@ For supported vocabulary shapes, the device returns the largest 64 logits and
 the normalization sum, which greedy selection and top_k up to 64 can use. A
 greedy pick of 4 rows or more takes `serve.grouped_topk`, which reads only the
 groups of a row's columns that can hold its largest. `serve.frontier` picks a
-step of a draft tree grown best first on the chip and logs its picks and
-candidates, so a round reads its tree back once. Penalties, logprobs and
+step of best-first search over a tree of tokens on the chip and logs its picks
+and candidates, so the host reads the tree back once. Penalties, logprobs and
 constrained output need the full row, and so do some other sampling requests.
 When a stop string cuts the text, logprobs cover only the returned text's
 tokens.

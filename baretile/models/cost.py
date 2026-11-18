@@ -39,7 +39,7 @@ CONTROL = {"attention": ((1, 39300), (8, 25400), (32, 41600)), "deltanet": ((1, 
            "draft": ((2, 50400), (16, 41600), (64, 65700))}
 # Assume 120 Tensix tiles: 119 workers and one dispatcher. GRID matches Runtime.grid for that configuration.
 WORKERS, GRID = 119, (tuple(range(12)), tuple(range(9)))
-# A p150. The cost is the p150a's launch price plus a share of a host, over three years, and the power of the card and
+# A P150a. The cost is its launch price plus a share of a host, over three years, and the power of the card and
 # its share of the host at $0.15 a kWh.
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # 8 GDDR6 banks of 4 GiB, with a GiB kept for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # 512 GB/s, and the share of it that a decode step gets (a guess)

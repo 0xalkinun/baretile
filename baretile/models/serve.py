@@ -54,7 +54,8 @@ def grouped_topk(x, k):
   k values reach tau, so each of the row's k best lies in a group whose maximum reaches tau, and BRISC reads just those
   groups' columns, a run of 16 for each (grouped_scan). If the (k + 1)-th maximum reaches tau too, groups past it may
   tie with it, and BRISC reads the whole row instead. Exact, and ties keep column order, as in topk. Keeping no more
-  groups than that keeps topk's threshold high: a draft's best 4 of 98,304 take 1/3 less than with 64 groups kept."""
+  groups than that keeps topk's threshold high: on a P150a, the 4 largest of 6 rows of 98,304 fp32 logits took 97 us,
+  and 166 us with 64 groups kept (python3 -m baretile.models.bench)."""
   groups = topk_groups(x.cols // 32) if x.cols % 32 == 0 else 0
   if not (0 < k <= 32 and x.batch == 1 and x.dtype in ("bf16", "fp32") and groups):
     raise ValueError(f"grouped_topk needs k up to 32, batch 1, bf16 or fp32 and a tile count with a factor from 8 to 32: "
@@ -106,20 +107,21 @@ def grouped_scan(k, cols, dtype, groups):
       }}"""
 
 def frontier(scores, cols, sees, length, vocab, log, row, n=0, start=0, depth=0):
-  """A step of a draft tree grown best first, on the chip: the n best of a pass's candidates, from its scores (p, b)
-  fp32, each candidate's path score, cols (p, b) int32, its token's row in vocab (V, 1) int32, and sees (p, 8) int32,
-  attend's tree places of each candidate's parent (row p's): its row, the drafts' first, and bits of the drafts it
-  sees, 16 a column. Return (tokens 1 x n, their parents' rows 1 x n, places n x 8, cache rows 1 x n, position 1 x 1,
-  scores n x 1) for the pass that runs them, each pick i at cache row length + start + i, seeing its parent's drafts
-  and itself (bit start + i), at position length + depth, with length a 1 x 1 int32. Of equal scores, the first in
-  row order wins. Log row `row` of log (R, 96) int32 gets the picks, then the candidates' scores as fp32 bits and
-  their tokens, in tile columns 0, 1 and 2, p b of each. With n 0, it only logs. BRISC does it all, on one worker."""
+  """A step of best-first search over a tree of tokens, on the chip: the n best of a pass's candidates, from its scores
+  (p, b) fp32, each candidate's path score, cols (p, b) int32, its token's row in vocab (V, 1) int32, and sees (p, 8)
+  int32, attend's tree places of each candidate's parent (row p's): its row, the tree's first key, and bits of the
+  tree's tokens it sees, 16 a column. Return (tokens 1 x n, their parents' rows 1 x n, places n x 8, cache rows 1 x n,
+  position 1 x 1, scores n x 1) for the pass that runs them, each pick i at cache row length + start + i, seeing the
+  tree's tokens its parent sees and itself (bit start + i), at position length + depth, with length a 1 x 1 int32. Of
+  equal scores, the first in row order wins. Log row `row` of log (R, 96) int32 gets the picks, then the candidates'
+  scores as fp32 bits and their tokens, in tile columns 0, 1 and 2, p b of each. With n 0, it only logs. BRISC does it
+  all, on one worker."""
   p, b = scores.shape[-2:]
   if not (n <= p * b <= 32 and start + n <= 96 and cols.shape[-2:] == (p, b) and sees.shape[-2:] == (p, 8)
           and log.cols == 96 and row < log.rows and scores.dtype == "fp32"
           and all(t.dtype == "int32" for t in (cols, sees, log))):
     raise ValueError(f"frontier takes up to 32 fp32 scores, their int32 columns and places 8 wide, n of them at most "
-                     f"and ending by draft 96, and logs into 96 int32 columns: {scores.shape}, n={n}, start={start}")
+                     f"and ending by token 96, and logs into 96 int32 columns: {scores.shape}, n={n}, start={start}")
   new = lambda r, c, d="int32": Tensor(scores.rt, r, c, dtype=d)
   outs = [new(1, n), new(1, n), new(n, 8), new(1, n), new(1, 1), new(n, 1, "fp32")] if n else [log] * 6
   key = ("frontier", p, b, n, start, depth, row)
