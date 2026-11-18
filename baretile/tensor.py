@@ -209,21 +209,20 @@ class Tensor:
 
   @_matrices
   def gather(self, ids):
-    """Read rows selected by ids. Accept a Python list or an int32 tensor row, so indices can be computed on
-    the chip. Python indices are bounds-checked; tensor indices aren't."""
-    if self.dtype not in ITEMSIZE: raise ValueError("cast block-float storage to bf16 before gathering rows")
+    """Read rows selected by ids, the same rows of every matrix. Accept a Python list or an int32 tensor row, so
+    indices can be computed on the chip. Python indices are bounds-checked; tensor indices aren't. Rows of a block
+    float keep their bits, each run of 16 with its exponent."""
     if not isinstance(ids, Tensor):
       if not all(0 <= i < self.rows for i in ids):
         raise IndexError(f"gather picks rows of a {self.rows}-row matrix: {list(ids)}")
       ids = Tensor.of(self.rt, [list(ids)], "int32")
     self._same_runtime(ids)
-    if not (self.batch == 1 and ids.dtype == "int32" and (ids.batch, ids.rows) == (1, 1)):
-      raise ValueError("gather needs batch 1, and ids as an int32 row")
-    out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
-    addr, _, stride, offset = _plain(self.realize())._where()
-    key = ("gather", d, tr if (tr := -(-self.rows // 32)) <= GATHER_SHORT else 0)
-    return out.run(key, lambda: gather_kernel(*key[1:]), out.addr, addr, stride, offset,
-                   -(-self.cols // 32), ids.cols, ids.addr, ids.offset, name="gather")._track("gather", (self,), ids)
+    if not (ids.dtype == "int32" and (ids.batch, ids.rows) == (1, 1)):
+      raise ValueError("gather needs ids as an int32 row")
+    out, ids = _lead(Tensor(self.rt, ids.cols, self.cols, batch=self.batch, dtype=self.dtype), self.lead), ids.realize()
+    key = ("gather", self.dtype, tr if (tr := -(-self.rows // 32)) <= GATHER_SHORT else 0)
+    return out.run(key, lambda: gather_kernel(*key[1:]), out.addr, self, -(-self.cols // 32), ids.cols, ids.addr,
+                   ids.offset, name="gather")._track("gather", (self,), ids)
 
   @_matrices
   def put(self, ids, x):

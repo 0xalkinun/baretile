@@ -17,13 +17,15 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows at once,
   and adds a block's output onto the residual stream as it does. `llama.rope_kernel` norms a Qwen3-family layer's q
   and k heads and turns them by RoPE in one launch.
+- `Tensor.gather` reads the same rows of every matrix of a batch, and rows of a block float, like a KV cache's in
+  bfp8 or bfp4, each run of 16 with its exponent as it is. It refused both.
 - Training in `precision=bf16`, from several shards, saved and resumed, and `test/train_reference.py`
   ([training](docs/training.md)). The server enforces JSON schemas' `pattern`. `test/workload.py` times the first
   workload and runs its HTTP gate.
 
 ### Changed
 
-- baretile needs tt-kmd 2.5 or later. The core's line budget is 4,677, from 4,500.
+- baretile needs tt-kmd 2.5 or later. The core's line budget is 4,684, from 4,500.
 - `Tensor.put` into a block float takes rows in its dtype and copies each run with its exponent, where it took bf16
   and rounded on BRISC. Cast the rows first, or for bfp8 have the matmul that makes them pack it, as
   `a.matmul(cache, "bfp8")` does.

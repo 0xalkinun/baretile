@@ -80,13 +80,14 @@ def test_bytes(chip):
   # On a card or ttsim-chaos, where the NIUs count read data, Runtime.profile has the bytes that each launch read, in
   # 64-byte flits. An add reads the tiles of its two inputs. A token's bfp4 matmul reads A's row once, shared by
   # multicast, and each tile of B in two reads, exponents and values. For each result tile, a gather from a long table
-  # reads its ids, row 0 of their tile in two 64-byte runs, the zero tile, and two runs for each row, in 64-byte blocks.
+  # reads its ids, row 0 of their tile in two 64-byte runs, the zero tile, and two runs for each row, in 64-byte blocks,
+  # but none for a row whose id repeats the one before.
   # Its copy of the zero tile is a read within L1.
   if not chip.pci.counts: pytest.skip("needs ttsim-chaos's libttsim.so: released ttsim doesn't count read data")
   rt, rng = Runtime(chip), np.random.default_rng(0)
   x, y = (Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()) for _ in range(2))
   a, b = Tensor.of(rt, rng.normal(0, 1, (32, 128)).tolist()), Tensor.of(rt, rng.normal(0, 1, (128, 64)).tolist()).cast("bfp4").realize()
-  table, ids = Tensor.of(rt, rng.normal(0, 1, (160, 64)).tolist()), Tensor.of(rt, [[3, 140, 7]], "int32")
+  table, ids = Tensor.of(rt, rng.normal(0, 1, (160, 64)).tolist()), Tensor.of(rt, [[3, 140, 140, 7]], "int32")
   for run, want in ((lambda: (x + y).realize(), 8 * 2048), (lambda: (a @ b).realize(), 4 * 2048 + 8 * (64 + 512)),
                     (lambda: table.gather(ids), 2 * (128 + 2048 + 3 * 2 * 64))):
     run(), rt.wait()  # compile it first
@@ -97,10 +98,10 @@ def test_bytes(chip):
 def test_gather_shared_indices(chip):
   # A worker keeps its index tile across the result tiles that share it, and zeros only partial tiles. A table of a few
   # tile rows, like this one, reads each column of its tiles whole; a longer one reads each row's runs, with the same
-  # result, in bf16 or fp32. A block float can't be gathered, and the refusal comes before any allocation or launch.
+  # result, in bf16 or fp32, from each matrix of a batch. A row whose id repeats the one before takes that row's runs.
   rt = Runtime(chip, end=chip.tensix[1])
   rows = np.arange(65 * 96).reshape(65, 96) % 7
-  selected = list(range(34, -1, -1))
+  selected = [34, 34] + list(range(32, -1, -1))
   x = Tensor.of(rt, rows.tolist())
   ids = Tensor.of(rt, [selected], "int32")
   since = rt.launches
@@ -115,12 +116,33 @@ def test_gather_shared_indices(chip):
     for table in (rows, long):
       t = Tensor.of(rt, table.tolist()).cast(dtype)
       assert np.array_equal(value(t.gather(ids))[0], table[selected])
-  for dtype in ("bfp8", "bfp4"):
-    packed = x.cast(dtype).realize()
-    before = dict(rt.used), rt.launches
-    with pytest.raises(ValueError, match="block-float"): packed.gather([0])
-    assert (rt.used, rt.launches) == before
+      both = np.stack([table, table + 1])
+      assert np.array_equal(value(Tensor.of(rt, both.tolist()).cast(dtype).gather(ids)), both[:, selected])
   with pytest.raises(ValueError, match="int32 row"): x.gather(Tensor.of(rt, [[[[1, 2, 3], [4, 5, 6]]]], "int32"))  # two rows
+
+def test_gather_block_float(chip):
+  # gather reads a block float's rows, like a KV cache's in bfp8 or bfp4, each run of 16 with its exponent byte as it
+  # is, from tables of a few tile rows and of many, of one matrix and of a batch. The rows are one, which fills its
+  # tile with copies, 32 with repeats, 40 over two result tile rows, and the table's last, whose row count isn't a
+  # multiple of 32. The rows' scales differ, so their runs' exponents do. Each result tile has the table's bytes.
+  rt, rng = Runtime(chip), np.random.default_rng(29)
+  def runs(t):  # the exponent and values of each row's runs, from the raw tiles: [batch, tile rows * 32, cols / 16, ...]
+    rt.wait()
+    tb, n, tr, tc = tensix.tile_bytes(t.dtype), tensix.BFP[t.dtype] // 64, -(-t.rows // 32), -(-t.cols // 32)
+    tiles = np.frombuffer(b"".join(chip.read(*bh.DRAM[i % 8], t.addr + i // 8 * tb, tb) for i in range(t.tiles)), np.uint8)
+    tiles = tiles.reshape(t.batch, tr, tc, tb)
+    order = [(r // 16 * 2 + f) * 16 + r % 16 for r in range(32) for f in (0, 1)]  # row r's run in face f
+    out = np.concatenate([tiles[..., order, None], tiles[..., 64:].reshape(t.batch, tr, tc, 64, n)[..., order, :]], -1)
+    return out.reshape(t.batch, tr, tc, 32, 2, 1 + n).transpose(0, 1, 3, 2, 4, 5).reshape(t.batch, tr * 32, 2 * tc, 1 + n)
+  for fmt in ("bfp8", "bfp4"):
+    for batch, rows in ((1, 70), (3, 70), (1, 200), (2, 200)):
+      x = rng.normal(0, 1, (batch, rows, 96)) * 10.0 ** rng.integers(-4, 4, (batch, rows, 1))
+      table = Tensor.of(rt, x.tolist()).cast(fmt).realize()
+      have = runs(table)
+      for ids in ([rows // 2], [int(i) for i in rng.integers(0, rows, 30)] + [5, 5], list(range(rows - 40, rows)), [rows - 1]):
+        got = runs(table.gather(ids))
+        assert np.array_equal(got[:, :len(ids)], have[:, ids]), (fmt, batch, rows, ids)
+        assert not got[:, len(ids):].any() if len(ids) > 1 else (got == got[:, :1]).all(), (fmt, batch, rows, ids)
 
 def test_block_float_from_integers_and_numbers(chip):
   # An int32 tensor casts to a block float through fp32, which the block float packs from, and a block float with a
@@ -2018,7 +2040,7 @@ def test_autograd(chip):
     (lambda a: a[:, 3:17, ::-1], lambda a: a[:, 3:17, ::-1], [ew]), (lambda a: a[1], lambda a: a[1:2], [ew]),
     (lambda a: a.split(2), lambda a: a.reshape(1, 20, 2, 32).transpose(2, 1, 3, 0).reshape(2, 20, 32), [((1, 20, 64), (-1, 1))]),
     (lambda a: a.merge(), lambda a: a.transpose(1, 0, 2).reshape(1, 20, 128), [((2, 20, 64), (-1, 1))]),
-    (lambda a: a.gather([3, 0, 7, 3]), lambda a: a[:, [3, 0, 7, 3]], [((1, 9, 40), (-1, 1))]),
+    (lambda a: a.gather([3, 0, 7, 3]), lambda a: a[:, [3, 0, 7, 3]], [((2, 9, 40), (-1, 1))]),
     (lambda a, b: a.cat(b, axis=2), lambda a, b: np.concatenate([a, b], 2), [ew, ((2, 20, 13), (-1, 1))]),
     (lambda a, b: b.cat(a, a, axis=0), lambda a, b: np.concatenate([b, a, a], 0), [ew, ((1, 20, 40), (-1, 1))]),
     (Tensor.silu, lambda a: a / (1 + np.exp(-a)), [ew]),
