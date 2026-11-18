@@ -5,7 +5,7 @@ from baretile import bh, pci, tensix, tensor, viz
 from baretile.kernels import grid_parts
 from baretile.tensor import Tensor
 from baretile.runtime import TIMES, Runtime, compile_kernel
-from conftest import bf16, hold, value
+from conftest import bf16, hold, scheduled, value
 
 def kernels(rt, since):  # counts launches after launch `since`, leaving out the transfers of tobytes and frombytes
   return sum(rt.sent[n % TIMES][0] not in ("readback", "upload") for n in range(since + 1, rt.launches + 1))
@@ -1191,22 +1191,10 @@ def test_matmul_fusion(chip):
 def test_sfpu_scheduling():
   # An SFPMAD's result takes two cycles, as do SFPMUL's and SFPADD's. Blackhole's stall logic holds back most readers of
   # it, but not SFPSHFT2's rotations, SFPSWAP's compares, or SFPSHFT and SFPIADD reading vd (ISA SFPMAD.md, "Instruction
-  # scheduling"). So no SFPU program may follow one of these products with such a read of it. A body runs again and
-  # again, so it's checked across its wrap too.
-  names = {op: name for name, (op, _) in bh.TENSIX_OPS.items()}
-  def get(w, f):
-    first, width = bh.TENSIX_OPS[names[w >> 24]][1][f]
-    return w >> first & ((1 << width) - 1)
-  def unseen(w):  # the LRegs that w reads where the stall logic doesn't look
-    name = names.get(w >> 24)
-    if name == "SFPSHFT2" and get(w, "mod1") == 3 or name == "SFPSWAP" and get(w, "mod1"): return {get(w, "vc"), get(w, "vd")}
-    return {get(w, "vd")} if name in ("SFPSHFT", "SFPIADD") else set()
+  # scheduling"). So no SFPU program may follow one of these products with such a read of it (conftest.scheduled). A
+  # body runs again and again, so it's checked across its wrap too. test_models checks the models' own programs.
   programs = [setup + body + body for setup, body in tensix.SFPU.values()] + [body + body for body in tensix.COMBINE.values()]
-  programs += [tensix.ACROSS[ax](kind) for kind, ax in tensix.FOLDS.items()]
-  for program in programs:
-    words = [w for w in program if isinstance(w, int)]
-    for a, b in zip(words, words[1:]):
-      assert not (names.get(a >> 24) in ("SFPMAD", "SFPMUL", "SFPADD") and get(a, "vd") in unseen(b)), (f"{a:#x}", f"{b:#x}")
+  for program in programs + [tensix.ACROSS[ax](kind) for kind, ax in tensix.FOLDS.items()]: scheduled(program)
 
 def test_replay_keeps_pushes_small():
   # The TRISCs push one Tensix instruction a cycle, or four when they come in a row, so words pushed per tile cost

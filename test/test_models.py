@@ -2,10 +2,10 @@
 import collections, gc, html, importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
-from baretile import bh, pci, tensor
+from baretile import bh, pci, tensix, tensor
 from baretile.tensor import Tensor
 from baretile.runtime import Bound, Runtime
-from conftest import bf16, value
+from conftest import bf16, scheduled, value
 import benchmark, train, train_reference
 from baretile.models import cost, gpt2, llama, qwen, serve
 from baretile.models import train as gpt2_train  # test/train.py is train
@@ -1334,6 +1334,60 @@ def test_rms_kernel(chip):
       want = sb / np.sqrt((sb * sb).mean(-1, keepdims=True) + 1e-6) * (w + 1 if centered else w)
       assert got.dtype == "bf16" and np.abs(value(got) - want).max() <= 2**-7 * np.abs(want).max()
   assert llama.rms_launch(Tensor.of(rt, x.tolist()), Tensor.of(rt, w.tolist()), c) is None  # bf16
+  assert llama.rms_launch(tx, Tensor.of(rt, w.tolist()).requires_grad_(), c) is None  # a weight that trains
+
+def test_rope_kernel(chip):
+  # Qwen3's q and k norm and RoPE of qkv's heads take one launch (llama.rope_kernel), within a bf16 step of numpy: with
+  # one row, 32 and two tile rows, a quarter of each head turning or all of it, centered and not, tables of one row for
+  # rows at one position, heads that qk_on leaves as they are, and on one worker, which takes all the units in turn.
+  # Past the turning dimensions it has the tensor ops' bits. In them, it adds the two products exactly, where the
+  # tensor ops' FPU add aligns the smaller to the larger's 10 bits first: a bf16 step apart at most. The result's
+  # padding rows are 0, as a matmul over them needs: with eps 0, qkv's zero padding would norm to inf. A bf16
+  # qkv, a norm weight that trains, and turning dimensions that aren't whole tiles in each half take the tensor ops.
+  rng = np.random.default_rng(14)
+  for rows, hd, partial, centered, one, alone in ((32, 256, 0.25, True, False, False), (1, 128, None, False, False, False),
+                                                  (40, 64, None, True, False, True), (6, 256, 0.25, True, True, False)):
+    rt = Runtime(chip, end=chip.tensix[1]) if alone else Runtime(chip)
+    c = llama.custom(dim=128, heads=4, kv=2, head_dim=hd, partial=partial, gated=centered, centered=centered, theta=1e6,
+                     eps=0.0 if alone else 1e-6)
+    nh, rd, (cos, sin, turn) = 8 + 4 * centered, llama.turning(c), llama.rotary(c, 64)
+    at = np.full(rows, 9) if one else rng.choice(64, rows, replace=False)
+    cos, sin, x = cos[at], sin[at], rng.normal(0, 2, (rows, nh * hd)).astype(np.float32)
+    w, on = bf16(rng.normal(0, 0.5, (nh, 1, hd))), np.float32(np.arange(nh) < 6).reshape(nh, 1, 1)  # v's and the gates' 0
+    p = {k: Tensor.of(rt, a.tolist(), "fp32") for k, a in (("qk_norm", w), ("qk_on", on))}  # fp32, as upload makes them
+    rotary = [Tensor.of(rt, a.tolist()) for a in (cos[:1 if one else rows], sin[:1 if one else rows], turn)]
+    heads = Tensor.frombytes(rt, rows, nh * hd, x.tobytes(), 1, "fp32").split(nh)
+    before, got = rt.launches, llama.rope_launch(heads, p, c, rotary)
+    assert rt.launches == before + 1
+    split, h = lambda a: a.reshape(rows, nh, hd).transpose(1, 0, 2), x.reshape(rows, nh, hd).transpose(1, 0, 2).astype(np.float64)
+    r = 1 / np.sqrt((h * h).mean(-1, keepdims=True) + c.eps)
+    n = np.where(on, h * (r * w + r if centered else r * w), h)
+    want = llama.rope(n, split(cos), split(sin), turn).transpose(1, 0, 2).reshape(rows, nh * hd)
+    assert got.dtype == "bf16" and np.abs(value(got) - want).max() <= 2**-7 * np.abs(want).max()
+    assert rows == 1 or not value(got._view(-(-rows // 32) * 32, nh * hd, 1, 0))[..., rows:, :].any()  # the tiles' padding
+    f = llama.fns(heads)
+    r = f.rsqrt(f.mean(heads * heads) + c.eps)
+    n = f.bf16(f.where(p["qk_on"], heads * (r * p["qk_norm"] + r if centered else r * p["qk_norm"]), heads))
+    ops = f.merge(llama.rope(n, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))
+    a, b = (np.frombuffer(t.tobytes(), np.uint16).reshape(rows, nh, hd).astype(np.int32) for t in (got, ops))
+    assert np.array_equal(a[..., rd:], b[..., rd:]) and np.abs(a - b).max() <= 1, np.abs(a - b).max()
+  assert llama.rope_launch(heads.bfloat16(), p, c, rotary) is None
+  assert llama.rope_launch(heads, p, llama.custom(**vars(c) | {"partial": 0.125}), rotary) is None  # 16 in each half turn
+  assert llama.rope_launch(heads, p | {"qk_norm": p["qk_norm"].requires_grad_()}, c, rotary) is None
+
+def test_model_sfpu_scheduling(monkeypatch):
+  # The models' kernels' own SFPU programs, which they hand to qwen.helpers, follow test_kernels' scheduling rule
+  # (conftest.scheduled) in each Dst half, across a body's wrap too.
+  handed, helpers = [], qwen.helpers
+  monkeypatch.setattr(qwen, "helpers", lambda ps, setups={}: handed.append((ps, setups)) or helpers(ps, setups))
+  for m in (llama, qwen): monkeypatch.setattr(m, "compile_kernel", lambda *programs: None)
+  for terms in (1, 2): llama.rms_kernel((list(range(1, 13)), list(range(2, 11))), 128, 4096, 1e-6, terms)
+  llama.rope_kernel(8, 2, 256, 1e-6, True), llama.rope_kernel(4, 4, 128, 1e-6, False), qwen.conv_kernel(4)
+  qwen.rule_kernel(1, 4, 4, 2, False, 128, (1e-6, 128)), qwen.rule_kernel(2, 4, 4, 2, True), qwen.carry_kernel(1, 4, 4, 2, 1)
+  assert len(handed) == 8
+  for ps, setups in handed:
+    for n, p in ps.items():
+      for r in (0, tensix.DST_HALF): scheduled(setups.get(n, []) + p(r) + p(r))
 
 def test_kv_cache(chip):
   # A two-block Llama decodes 5 tokens after a 5-token prompt, against numpy. Positions are data, not shapes, so the

@@ -4,7 +4,7 @@
 # they open the first Blackhole through tt-kmd, or as root through sysfs without it (see docs/bring-up.md).
 import functools, gc, json, os, pathlib, random, statistics, pytest
 import numpy as np
-from baretile import pci
+from baretile import bh, pci
 from baretile.chip import Chip
 from baretile.runtime import DATA, compile_kernel
 
@@ -13,6 +13,21 @@ def bf16(a, packer=False):  # rounds to bf16 and back: to nearest even like our 
   return ((b + (0x8000 if packer else 0x7FFF + (b >> 16 & 1))) >> 16 << 16).view(np.float32).astype(np.float64)
 
 def value(t): return np.array(t.tolist()).reshape(t.shape)  # t as a numpy array of its shape
+
+def scheduled(program):
+  """Asserts that no SFPMAD, SFPMUL or SFPADD in program is followed by a read of its result that the stall logic
+  doesn't see: an SFPSHFT2 rotation, an SFPSWAP compare, or SFPSHFT and SFPIADD reading vd (test_sfpu_scheduling)."""
+  names = {op: name for name, (op, _) in bh.TENSIX_OPS.items()}
+  def get(w, f):
+    first, width = bh.TENSIX_OPS[names[w >> 24]][1][f]
+    return w >> first & ((1 << width) - 1)
+  def unseen(w):  # the LRegs that w reads where the stall logic doesn't look
+    name = names.get(w >> 24)
+    if name == "SFPSHFT2" and get(w, "mod1") == 3 or name == "SFPSWAP" and get(w, "mod1"): return {get(w, "vc"), get(w, "vd")}
+    return {get(w, "vd")} if name in ("SFPSHFT", "SFPIADD") else set()
+  words = [w for w in program if isinstance(w, int)]
+  for a, b in zip(words, words[1:]):
+    assert not (names.get(a >> 24) in ("SFPMAD", "SFPMUL", "SFPADD") and get(a, "vd") in unseen(b)), (f"{a:#x}", f"{b:#x}")
 
 HELD = 'void kmain(volatile unsigned *a) { while (*(volatile unsigned *)L1_DATA != a[2]) asm volatile("fence" ::: "memory"); }'
 @functools.cache

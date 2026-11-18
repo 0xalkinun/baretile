@@ -229,8 +229,8 @@ jobs:
       # each part's log once all are done, under its result
       - run: |
           tests=(test/test_device.py test/test_kernels.py test/test_models.py::test_delta_step test/test_models.py::test_delta_pieces
-                 test/test_models.py::test_delta_tree test/test_models.py::test_rms_kernel test/test_models.py::test_moe
-                 'test/test_models.py::test_ramp[4_kernel.py]')
+                 test/test_models.py::test_delta_tree test/test_models.py::test_rms_kernel test/test_models.py::test_rope_kernel
+                 test/test_models.py::test_moe 'test/test_models.py::test_ramp[4_kernel.py]')
           n=$(nproc)
           for i in $(seq $n); do
             PART=$i/$n timeout 15m python -m pytest -s -o faulthandler_timeout=600 "${tests[@]}" \

@@ -15,7 +15,8 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   one launch; `qwen.predict` runs a prediction layer on its own ([models](docs/models.md#experts-and-gated-deltanet)).
 - `Tensor.attend` takes a tree's places, `serve.frontier` picks a step of a draft tree on the chip, and
   `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows at once,
-  and adds a block's output onto the residual stream as it does.
+  and adds a block's output onto the residual stream as it does. `llama.rope_kernel` norms a Qwen3-family layer's q
+  and k heads and turns them by RoPE in one launch.
 - Training in `precision=bf16`, from several shards, saved and resumed, and `test/train_reference.py`
   ([training](docs/training.md)). The server enforces JSON schemas' `pattern`. `test/workload.py` times the first
   workload and runs its HTTP gate.
