@@ -23,7 +23,7 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 
 ### Changed
 
-- baretile needs tt-kmd 2.5 or later. The core's line budget is 4,650, from 4,500.
+- baretile needs tt-kmd 2.5 or later. The core's line budget is 4,677, from 4,500.
 - `Tensor.put` into a block float takes rows in its dtype and copies each run with its exponent, where it took bf16
   and rounded on BRISC. Cast the rows first, or for bfp8 have the matmul that makes them pack it, as
   `a.matmul(cache, "bfp8")` does.
@@ -31,9 +31,10 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 - `llama.layer(x, y, ...)` takes the residual stream and the last block's output, and returns the same pair: the
   next norm adds them. Pass `None` for y to the first block, and finish with `x, h = llama.rms(x, w["norm"], c, y)`.
   `llama.rms` with y returns the sum and its norm.
-- Faster kernels: attention for a few rows reads each key and value tile once for a key head's query heads, and takes
-  p from `exp16`; the SFPU works on a matrix's live rows alone; `gather`, `put`, `topk` and a single row's upload read
-  or spread less; `assign` moves straight into a new destination; the bfp4 cast rounds a matrix's live rows alone.
+- Faster kernels: attention for a few rows reads each key and value tile once for a key head's query heads, takes
+  p from `exp16` and merges its parts in its own launch, so `Tensor.attend`'s `parts` stop at one unit a worker; the
+  SFPU works on a matrix's live rows alone; `gather`, `put`, `topk` and a single row's upload read or spread less;
+  `assign` moves straight into a new destination; the bfp4 cast rounds a matrix's live rows alone.
 
 ### Fixed
 

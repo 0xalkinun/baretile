@@ -777,6 +777,7 @@ B8_SLOTS = bh.BFP_FIRST_DATUM // 1024
 #   PACKED: results that the pack thread has packed, written by TRISC2. RING says where they go, in four [slot, tile]
 #     entries.
 #   SENT: packed results that BRISC has written to DRAM
+#   FINISHED: units whose outputs are all in L1, written by TRISC2 (attention's parts, which read each other's)
 SYNC_WORDS = f"""
 enum {{ {", ".join(name.upper() for name in SYNC_NAMES)}, RING = 8 }};
 #define SYNC ((volatile unsigned *){SYNC:#x})

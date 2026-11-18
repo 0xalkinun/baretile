@@ -16,16 +16,14 @@ from baretile.models import llama, train
 
 BYTES = {d: tile_bytes(d) / 1024 for d in ("bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
 # Launches in a decode step, counted on ttsim at Qwen3.6's shapes with eight slots:
-#   attention  the norms, projections, RoPE, the cache put, attention in parts and their sum, the output and its gate
+#   attention  the norms, projections, RoPE, the cache put, attention, whose parts merge in its launch, and its division,
+#              the output and its gate
 #   experts    the extra launches of a mixture of experts
 #   deltanet   the projections, the delta kernel, and the output's norm and gate
 #   rest       the embedding gather, the position columns, the final norm, the output layer and sampling's heads
 # The verify entries are the same for a speculative step, and draft is the call to the multi-token prediction layer.
-# The fp32 residual stream added 1 to attention, 2 to deltanet, 3 to experts, 2 to rest and 7 to draft: the casts
-# before the norms, and the adds and experts' sums that no longer fuse into a matmul. Those are counted on one decode
-# step of the tests' small Qwen3.5-MoE (test_models.qwen35), against the same step with a bf16 stream.
-LAUNCHES = {"attention": 21, "experts": 18, "deltanet": 7, "rest": 14, "attention verify": 21, "deltanet verify": 7, "rest verify": 23,
-            "draft": 58}
+LAUNCHES = {"attention": 18, "experts": 18, "deltanet": 7, "rest": 14, "attention verify": 18, "deltanet verify": 7, "rest verify": 23,
+            "draft": 55}
 # Bytes a decode step reads beyond the weights, experts, states and attention's rows, at Qwen3.6's shapes. The first is
 # a block's activations in 32-row tiles. The second is the rest's, the logits that sampling reads, for each tile row of
 # tokens. outputs, in step, counts the outputs of the picked experts separately: the gate and up, their GLU and the
