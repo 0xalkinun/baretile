@@ -66,13 +66,15 @@ We haven't measured Qwen3.6 token accuracy with all matrix weights in bfp8 or
 with a bfp4 KV cache.
 
 In every mode, the Llama families keep the residual stream between blocks in
-fp32. Each half of a block adds its last matmul's fp32 sum to it, and each norm
-reads it rounded to bf16. In bf16, a large activation that a later block cancels
-would lose the low bits of what's left: SmolLM-135M has one of about 31,000,
-which a bf16 copy holds only to within 128. GPT-2's stream is still bf16. With a
-few rows, as in a decode or verify step, a norm is one launch,
-`llama.rms_kernel`: each row of the grid takes a tile row of the stream, and its
-workers send each other their sums of squares over NoC 1.
+fp32. The norm after each half of a block adds the half's output, its last
+matmul's fp32 sum, to the stream and reads the sum rounded to bf16. In bf16, a
+large activation that a later block cancels would lose the low bits of what's
+left: SmolLM-135M has one of about 31,000, which a bf16 copy holds only to
+within 128. GPT-2's stream is still bf16. With a few rows, as in a decode or
+verify step, the add and the norm are one launch, `llama.rms_kernel`: each row
+of the grid takes a tile row of the stream, and its workers send each other
+their sums of squares over NoC 1. The grid's other workers add the tiles, write
+the sum out and send each tile to the worker that norms it.
 
 Qwen3 and Qwen3.5 RMS-norm each head of q and k before RoPE. The norm reads the
 qkv matmul's fp32 sum, runs in fp32 and rounds once to bf16 for RoPE. In bf16,

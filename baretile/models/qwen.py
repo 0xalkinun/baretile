@@ -1280,5 +1280,5 @@ def predict(ids, h, w, c, cache, rows, rotary, mask, prefill, live=None, slots=N
   e, h = llama.rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), llama.rms(h, w["mtp.pre_fc_norm_hidden"], c)
   eh = np.concatenate([e, h], -1) if isinstance(h, np.ndarray) else e.cat(h, axis=-1)  # side by side, one matmul's A
   x = f.mm(eh, w["mtp.fc"], llama.precision_of(c, "fc")[1], "fp32")
-  x = llama.layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, cache, rows, l, prefill, live, slots=slots)
-  return llama.rms(x, w["mtp.norm"], c)
+  x, y = llama.layer(x, None, gpt2.block(w, f"layers.{l}."), c, rotary, mask, cache, rows, l, prefill, live, slots=slots)
+  return llama.rms(x, w["mtp.norm"], c, y)[1]

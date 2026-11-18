@@ -105,48 +105,85 @@ def precision_of(c, op, block=None): return (c.precision or {}).get((op, block),
 def cache_format(c): return precision_of(c, "kv")[0] or "bf16"  # the KV cache's format
 
 # RMSNorm scaled by w. Qwen3.5 scales by 1 + w as n w + n, which stays exact where 1 + w would round in bf16. It reads
-# the fp32 residual stream rounded to bf16, so the norm runs on the FPU, where fp32 would run it all on the SFPU. A few
-# long fp32 rows, as a decode or verify step's, go through rms_kernel in one launch.
-def rms(x, w, c):
-  if isinstance(x, Tensor) and (out := rms_launch(x, w, c)) is not None: return out
+# the fp32 residual stream rounded to bf16, so the norm runs on the FPU, where fp32 would run it all on the SFPU. With
+# y, it norms the stream x + y and returns (x + y, the norm), the sum realized. A few long fp32 rows, as a decode or
+# verify step's, go through rms_kernel in one launch, which also adds y.
+def rms(x, w, c, y=None):
+  if isinstance(x, Tensor) and (out := rms_launch(x, w, c, y)) is not None: return out
   f = fns(x)
+  if y is not None: return (x := f.now(x + y)), rms(x, w, c)
   x = f.bf16(x)
   n = x * f.rsqrt(f.mean(x * x) + c.eps)
   return n * w + n if c.centered else n * w
 
-def rms_kernel(grid, ct, n, eps):
-  """The kernel for rms_launch: RMSNorm of an fp32 x's rows, rounded to bf16 as they're read, by its fp32 scale, in
-  one launch. A tile row of x goes to a row of the grid, and worker j of it takes its share of the row's ct tiles.
+def rms_kernel(grid, ct, n, eps, terms=1):
+  """The kernel for rms_launch: RMSNorm of an fp32 x's rows, or with 2 terms of x + y's, rounded to bf16 as they're
+  read, by its fp32 scale, in one launch. A tile row of x goes to a row of the grid, and worker j of it takes its share
+  of the row's ct tiles.
 
   Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile stride,
-  row tile stride, tile offset): the result in bf16, x, and the scale, a row (w, or 1 + w), both in fp32.
+  row tile stride, tile offset): the result in bf16, x, and the scale, a row (w, or 1 + w), then with 2 terms y and the
+  sum x + y, all in fp32, the first helper's unit and the number of helpers.
 
   BRISC reads the worker's tiles of x and the scale. Math sums their squares along the rows (across_rows), and pack
   writes the sums to the worker's slot j of the row's sums in L1, which BRISC then sends to the same slot of the row's
   other workers over NoC 1, flagged j. Once every flag is in, math adds the row's sums and takes rsqrt(sum / n + eps)
   once, then scales each of its tiles by it, which pack writes out as bf16. A unit a worker, so units are the grid's
-  workers in order, and a row of them is a rectangle."""
+  workers in order, and a row of them is a rectangle.
+
+  With 2 terms, the units past the tile rows' are helpers, which take the tiles of x + y in turn, two at most. A helper
+  reads its tiles of x and y, adds them, writes each sum out, and sends it over NoC 1 to the worker that norms it, into
+  its slot for that tile of x, flagged 16 + the tile's place in the worker's share. That worker reads no x and waits
+  for its flags instead."""
   (xs, ys), g = grid, len(grid[0])
   share = lambda j: (f"{j} * {ct} / {g}", f"({j} + 1) * {ct} / {g}")
-  most = -(-ct // g)  # the most tiles a worker takes
+  most, added = -(-ct // g), terms == 2  # the most tiles a worker takes
   OUT, X = 1, 3  # the output slots for each Dst half, then x's tiles, the scale's and the row's sums
   W, SUMS = X + most, X + 2 * most
+  HX, HS = SUMS + g, SUMS + g + 4  # a helper's tiles of x and y in turn, then their sums
   R2, R3 = 2 * DST_HALF, 3 * DST_HALF
   head = f"unsigned i = a[0] / {g}, j = a[0] % {g}, t0 = {share('j')[0]}, nt = {share('j')[1]} - t0;"
+  # A helper's n-th tile, tile t of x's row r, at place q in the share of row r's worker o. The helpers take the
+  # workers' first places first, so each worker can start on its tiles as they come.
+  tiles = (f"for (unsigned p = a[0] - a[22], n = 0; p < a[22] * {most}; p += a[23]) {{ unsigned r = p / {most * g}, "
+           f"q = p / {g} % {most}, o = p % {g}, t = {share('o')[0]} + q; if (t >= {share('o')[1]}) continue;")
+  # a helper's part of a program, before the rest of it
+  helping = lambda before, body, after, rest: (f"  if (a[0] >= a[22]) {{\n{before}    {tiles}\n{body}    }}\n{after}"
+                                               f"  }}{rest}\n" if added else "")
   rects = table("rect", [bh.noc_rect((xs[0], y), (xs[-1], y)) for y in ys]) + "\n"
-  brisc = (f"  {head}\n"
-           f"  for (unsigned t = 0; t < nt; t++) {{ get(a[6], {tile_of(6, 0, 'i', 't0 + t')}, {X} + t); "
-           f"get(a[10], {tile_of(10, 0, 0, 't0 + t')}, {W} + t); }}\n"
-           "  ready();  // math sums the squares\n"
+  rects += table("peer", [bh.noc_xy(x, y) for y in ys for x in xs]) + "\n" if added else ""
+  flag = "(unsigned)&FLAGS[16 + q]"
+  brisc = (f"  {head}\n" + helping(
+           "    unsigned acks = NOC(1, WR_ACKS);\n",
+           f"      get(a[6], {tile_of(6, 0, 'r', 't')}, {HX} + 2 * n); "
+           f"get(a[14], {tile_of(14, 0, 'r', 't')}, {HX} + 2 * n + 1); n++;\n",
+           "    ready();\n"
+           f"    {tiles}\n"
+           "      while (peek(7) <= n) {}  // pack has written x + y to slot HS + n\n"
+           f"      unsigned s = {tile_of(18, 0, 'r', 't')}, to = peer[r * {g} + o];\n"
+           f"      FLAGS[16 + q] = 1; l1_settle({flag});  // the flag goes after the sum, both on static VC class 0\n"
+           f"      noc_issue_on(1, SLOT({HS} + n), noc_me(), SLOT({X} + q), to, WRITE | STATIC, 4096);\n"
+           f"      noc_issue_on(1, {flag}, noc_me(), {flag}, to, WRITE | STATIC, 4); acks += 2;\n"
+           f"      noc_put(SLOT({HS} + n), BANK(s), AT(a[18], s, 4096), 4096); n++;\n"
+           "    }\n    while (NOC(1, WR_ACKS) != acks) {}\n", " else {") +
+           "  for (unsigned t = 0; t < nt; t++) { " +
+           ("" if added else f"get(a[6], {tile_of(6, 0, 'i', 't0 + t')}, {X} + t); ") +
+           f"get(a[10], {tile_of(10, 0, 0, 't0 + t')}, {W} + t); }}\n" +
+           ("  for (unsigned t = 0; t < nt; t++) { await(16 + t, 1, 1); SYNC[FETCHED] = ++fetched; }  // x + y's, "
+            "from the helpers\n" if added else "  ready();  // math sums the squares\n") +
            "  while (!peek(7)) send();  // pack has written them to slot j\n"
            f"  share(SLOT({SUMS} + j), 4096, rect[i], {g - 1}, j, 1);\n"
            f"  await(0, {g}, 1);\n"
-           "  ready();  // math takes the row's\n")
+           "  ready();  // math takes the row's\n" + ("  }\n" if added else ""))
   free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
   fills = lambda *pairs: tt(free + [w for slot, row in pairs for w in fill(slot, row)] + FILLED)
   lib = lambda name: f"{tt(aim(R2))} p_{name}(); {tt(aim(0))}"  # an SFPU library program, on the tile at R2
-  math = (f"  {head}\n  fetched(); {tt([DST_FREE])}\n"
-          f"  for (unsigned t = 0; t < nt; t++) {{ {fills((f'{X} + t', R2))} if (t) p_sqacc(h); else p_sq(h); }}\n"
+  math = (f"  {head}\n" + helping("    fetched();\n", f"      {tt([DST_FREE])} "
+                                  f"{fills((f'{HX} + 2 * n', 'h'), (f'{HX} + 2 * n + 1', R3))} p_fadd(h); "
+                                  f"{tt(MATH_END)} h ^= {DST_HALF}; n++;\n", "    return;\n", "") +
+          f"  {'' if added else 'fetched(); '}{tt([DST_FREE])}\n"
+          f"  for (unsigned t = 0; t < nt; t++) {{ {'fetched(); ' if added else ''}{fills((f'{X} + t', R2))} "
+          "if (t) p_sqacc(h); else p_sq(h); }\n"
           f"  {tt(aim('h') + ACROSS[2]('sum2') + aim(0) + MATH_END)} h ^= {DST_HALF}; {tt(REPORT)}\n"
           f"  fetched(); {fills((SUMS, R2))}\n"
           f"  for (unsigned k = 1; k < {g}; k++) {{ {fills((f'{SUMS} + k', R3))} p_add(0); }}\n"
@@ -154,7 +191,9 @@ def rms_kernel(grid, ct, n, eps):
           f"  for (unsigned t = 0; t < nt; t++) {{ {tt([DST_FREE])} {fills((f'{X} + t', 'h'), (f'{W} + t', R3))} "
           f"p_norm(h); {tt(MATH_END)} h ^= {DST_HALF}; }}\n  {tt(REPORT)}\n")
   cfg, sums = kernel_config("fp32", "bf16"), kernel_config("fp32", "fp32")
-  packer = (f"  {head}\n  {tt(repack(cfg, sums) + pack('h', f'{SUMS} + j') + repack(sums, cfg))} h ^= {DST_HALF};\n"
+  packer = (f"  {head}\n" + helping(f"    {tt(repack(cfg, sums))}\n", f"      {tt(pack('h', f'{HS} + n'))} "
+                                    f"h ^= {DST_HALF}; tensix_idle(); SYNC[7] = ++n;\n", "    return;\n", "") +
+            f"  {tt(repack(cfg, sums) + pack('h', f'{SUMS} + j') + repack(sums, cfg))} h ^= {DST_HALF};\n"
             "  tensix_idle(); SYNC[7] = 1;  // the sums are in L1, for BRISC\n"
             f"  for (unsigned t = 0; t < nt; t++) {{ output(h / {DST_HALF}, {OUT} + h / {DST_HALF}, "
             f"{tile_of(2, 0, 'i', 't0 + t')}); {tt(pack('h', f'{OUT} + h / {DST_HALF}', SEM_PACKED))} "
@@ -168,30 +207,41 @@ def rms_kernel(grid, ct, n, eps):
               "mean": lambda r: [sfp_load(0, R2), mad(1, 0, 6, 7), sfp_store(1, R2)],
               "norm": lambda r: rounded(0, r) + [sfp_load(1, R2), mul(2, 0, 1), sfp_load(3, R3), mul(4, 2, 3),
                                                  sfp_store(4, r)]}
+  if added: programs["fadd"] = lambda r: [sfp_load(0, r), sfp_load(1, R3), mad(0, 0, ONE, 1), sfp_store(0, r)]  # x + y
   setups = {"sq": half, "sqacc": half, "norm": half, "mean": sfp_const(6, 1 / n) + sfp_const(7, eps)}
   library = "".join(f"__attribute__((noinline)) static void p_{p}(void) {{ {tt(sfpu([p], {}))} }}\n"
                     for p in ("sqrt", "frecip"))
-  return compile_kernel(brisc_program("nt", brisc, "fp32", "bf16", rects, f"unflag({g}, 0);"),
-                        unpack_program("  fetched(); fetched();", cfg),
+  return compile_kernel(brisc_program("(a[0] < a[22] ? nt : 0)" if added else "nt", brisc, "fp32", "bf16", rects,
+                                      f"unflag({g}, {most if added else 0});"),
+                        unpack_program("  if (a[0] < a[22]) { fetched(); fetched(); }" if added else
+                                       "  fetched(); fetched();", cfg),
                         math_program({}, math, True, qwen.helpers(programs, setups) + library),
                         pack_program(packer))
 
-def rms_launch(x, w, c):
-  """RMSNorm of x by rms_kernel, or None where it doesn't apply: x an fp32 matrix of at most a tile row for each row of
-  the grid, at least two tiles a worker wide."""
+def rms_launch(x, w, c, y=None):
+  """RMSNorm of x, or with y (x + y, its norm), by rms_kernel, or None where it doesn't apply: x an fp32 matrix of at
+  most a tile row for each row of the grid, at least two tiles a worker wide. With y, an fp32 matrix like x, a worker's
+  share of a row is at most 16 tiles, and the grid's other rows have helpers enough for two tiles each at most."""
   (xs, ys), rows, cols = x.rt.grid, x.rows, x.cols
   tr, ct = -(-rows // 32), -(-cols // 32)
+  most, helpers = -(-ct // len(xs)), (len(ys) - tr) * len(xs)
   if not (x.dtype == "fp32" and x.batch == 1 and w.shape[-2:] == (1, cols) and tr <= len(ys) and ct >= 2 * len(xs)
-          and not x.requires_grad):
+          and not x.requires_grad and (y is None or (y.dtype, y.batch, y.rows, y.cols) == ("fp32", 1, rows, cols)
+                                       and not y.requires_grad and most <= 16 and tr * most * len(xs) <= 2 * helpers)):
     return None
   # the weight's fp32 scale, w or 1 + w, made once and kept with it
   scales = w.__dict__.setdefault("rms_scales", {})
   if (scale := scales.get(bool(c.centered))) is None:
     scale = scales[bool(c.centered)] = ((w.float() + 1) if c.centered else w.float()).realize()
-  out = Tensor(x.rt, rows, cols, dtype="bf16")
+  out, terms = Tensor(x.rt, rows, cols, dtype="bf16"), 1 if y is None else 2
   out.lead = x.lead
-  return out.run(("rms", x.rt.grid, ct, cols, c.eps), lambda: rms_kernel(x.rt.grid, ct, cols, c.eps), out, x, scale,
-                 units=tr * len(xs), name="rms")
+  run = lambda *more, units=tr * len(xs): out.run(("rms", x.rt.grid, ct, cols, c.eps, terms),
+                                                  lambda: rms_kernel(x.rt.grid, ct, cols, c.eps, terms), out, x,
+                                                  scale, *more, units=units, name="rms")
+  if y is None: return run()
+  total = Tensor(x.rt, rows, cols, dtype="fp32")
+  total.lead = x.lead
+  return total, run(y, total, tr * len(xs), helpers, units=len(xs) * len(ys))
 
 def head(c): return c.head_dim or c.dim // c.heads  # the width of a head. Qwen3's config gives it, a Llama's is dim / heads
 
@@ -202,10 +252,12 @@ def attends(c, w):  # whether Tensor.attend can run attention. It needs heads 64
 def rope(x, cos, sin, turn):
   return x * cos + (x @ turn) * sin
 
-def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None, rule=None):
+def layer(x, y, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None, rule=None):
   """Block l: attention, then a SwiGLU MLP, each after an RMSNorm and added back. A block whose weights have a conv
   runs Gated DeltaNet in place of attention (qwen.deltanet). With a router, it runs a mixture of experts (qwen.moe).
+  Returns (x, y) for the next block: the stream after attention, and the MLP's output, which the next norm adds.
 
+    x, y     the residual stream, and the last block's output to add onto it, or None
     p        the block's weights, transposed for x @ w, with q, k and v side by side and gate and up side by side.
              Other families add Qwen2's qkv_bias, Qwen3's qk_norm and qk_on, and gpt-oss's sinks and o_proj.bias
     c        the config. Its precision, if set, gives each matmul's fidelity phases
@@ -217,17 +269,16 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, acc
     prefill  a prompt's tokens, not a decode step
     live     from around. A free slot's token picks no expert and leaves its Gated DeltaNet states as they were
   accept and rule go to qwen.deltanet, and slots comes from forward."""
-  f, phases = fns(x), lambda op, block=l: precision_of(c, op, block)[1]  # None means tensor.FIDELITY
-  h = rms(x, p["input_layernorm"], c)
+  phases = lambda op, block=l: precision_of(c, op, block)[1]  # None means tensor.FIDELITY
   # The residual stream is fp32, and each half's output is the fp32 sum of its last matmul (the output's, the down's
-  # or the experts'). In bf16, a large value that a later block cancels would lose the low bits of what's left. Each
-  # half adds onto the stream in its own kernel, and f.now realizes the stream there, so later norms don't add up the
-  # blocks' outputs again.
+  # or the experts'). In bf16, a large value that a later block cancels would lose the low bits of what's left. The
+  # norm after each half adds it onto the stream and realizes the sum (rms), so later norms don't add up the blocks'
+  # outputs again.
+  x, h = (x, rms(x, p["input_layernorm"], c)) if y is None else rms(x, p["input_layernorm"], c, y)
   mixed = (qwen.deltanet(h, p, c, cache, phases, live, accept, rule) if "conv" in p
            else attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots))
-  x = f.now(x + mixed)
-  h = rms(x, p["post_attention_layernorm"], c)
-  return f.now(x + (qwen.moe(h, p, c, phases, live) if "router" in p else mlp(h, p, phases)))
+  x, h = rms(x, p["post_attention_layernorm"], c, mixed)
+  return x, qwen.moe(h, p, c, phases, live) if "router" in p else mlp(h, p, phases)
 
 def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   """Compute attention over this block's cache. RoPE has already scaled q by 1/sqrt(head width).
@@ -455,13 +506,13 @@ def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hid
   if capacity is not None and (type(capacity) is not int or not 0 < capacity <= table or size is not None and size != capacity * (slots or 1)):
     raise ValueError("forward capacity must fit RoPE tables and match attention cache rows per sequence")
   size = size if size is not None else (capacity or table) * (slots or 1)
-  x = f.float(f.rows(w["embed"], ids))  # the residual stream, in fp32 (layer)
+  x, y = f.float(f.rows(w["embed"], ids)), None  # the residual stream, in fp32, and the output to add onto it (layer)
   rows, rotary, mask, window, live = around(w, c, places, size, slots, length)
   prefill = slots is None and (prompt or x.shape[-2] > 1)
   for l in range(c.layers):
     seen = window if window is not None and windowed(c, l) else mask
-    x = layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, seen, caches[l], rows, l, prefill, live, accept, slots)
-  h = rms(x, w["norm"], c)
+    x, y = layer(x, y, gpt2.block(w, f"layers.{l}."), c, rotary, seen, caches[l], rows, l, prefill, live, accept, slots)
+  x, h = rms(x, w["norm"], c, y)
   logits = f.mm(h if slots or every else f.rows(h, [x.shape[-2] - 1]), w["embed.T"], precision_of(c, "head")[1], "fp32")  # as the matmul sums them
   return (logits, h) if hidden else logits
 
