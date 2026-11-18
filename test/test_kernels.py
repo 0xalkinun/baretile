@@ -1395,6 +1395,45 @@ def test_attend(chip):
     if lo == 200:
       assert read == 2 * (1 + 2 + 16 + 16) + 8, read
 
+def test_attend_tree(chip):
+  # A tree's 32 tokens after a cache, as Steed's verify runs them: each sees the cache and its ancestors among the tree's
+  # keys, which places give as a base (the tree's first key) and 16 bits a column, b for the key base + b. With 4 query
+  # heads a key head they share its tiles, and over a long cache its keys go in parts. Then a draft pass's rows after
+  # 90 earlier drafts, in six columns of bits. q is as RoPE scales it, by 1 / sqrt(256). Within a percent of NumPy.
+  rt, rng = Runtime(chip), np.random.default_rng(83)
+  row = lambda place, base, bits, n: [place, base] + [bits >> 16 * h & 0xFFFF for h in range(n)]
+  for length in (100, 1500):
+    parents = [-1] + [int(rng.integers(0, i)) for i in range(1, 32)]
+    seen = np.zeros((32, 32), bool)
+    for i in range(32):
+      j = i
+      while j >= 0: seen[i, j], j = True, parents[j]
+    keys = length + 32
+    places = [row(length + i, length, sum(1 << t for t in range(32) if seen[i, t]), 2) for i in range(32)]
+    q, k, v = (bf16(rng.normal(0, sd, shape)) for sd, shape in ((1 / 16, (8, 32, 256)), (1, (2, keys, 256)), (1, (2, keys, 256))))
+    tq, tk, tv = Tensor.of(rt, q.tolist()), *(Tensor.of(rt, x.tolist()).cast("bfp8").realize() for x in (k, v))
+    k, v = value(tk), value(tv)
+    got = value(tq.attend(tk.repeat_interleave(4), tv.repeat_interleave(4), Tensor.of(rt, places, "int32")))
+    j = np.arange(keys)
+    see = (j[None] < length) | ((j[None] - length < 32) & seen[:, np.clip(j - length, 0, 31)] & (j[None] >= length))
+    s = q @ np.repeat(k, 4, 0).transpose(0, 2, 1) + np.where(see, np.float32(0), np.float32(-1e9))
+    p = np.exp(s - s.max(-1, keepdims=True))
+    close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, 4, 0), 0.011)
+  # A draft pass's 6 rows after 90 earlier drafts, each seeing the cache, a few of them and itself
+  length, back = 200, 90
+  q, k, v = (bf16(rng.normal(0, sd, shape)) for sd, shape in ((1 / 16, (8, 6, 256)), (1, (2, length + back + 6, 256)),
+                                                              (1, (2, length + back + 6, 256))))
+  see = np.zeros((6, length + back + 6), bool)
+  see[:, :length] = True
+  for r in range(6): see[r, length + rng.choice(back, 8, replace=False)], see[r, length + back + r] = True, True
+  places = [row(length + back + r, length, sum(1 << b for b in range(back + 6) if see[r, length + b]), 6) for r in range(6)]
+  tq, tk, tv = Tensor.of(rt, q.tolist()), *(Tensor.of(rt, x.tolist()).cast("bfp8").realize() for x in (k, v))
+  k, v = value(tk), value(tv)
+  got = value(tq.attend(tk.repeat_interleave(4), tv.repeat_interleave(4), Tensor.of(rt, places, "int32")))
+  s = q @ np.repeat(k, 4, 0).transpose(0, 2, 1) + np.where(see, np.float32(0), np.float32(-1e9))
+  p = np.exp(s - s.max(-1, keepdims=True))
+  close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, 4, 0), 0.011)
+
 def test_attention_unit_rows(chip, monkeypatch):
   # With one worker, a unit takes up to 8 tile rows of queries, which share each key and value tile it reads. The
   # rows' largest scores share Dst's two accumulator tiles, a quarter of a tile each. The cases cover 8 rows, a last

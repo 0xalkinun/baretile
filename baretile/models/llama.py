@@ -210,7 +210,8 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, acc
     rotary   (cos, sin, turn), with the table rows for this call's positions
     cache    the key heads, then the value heads, with a row per position. This call writes at rows. A Gated
              DeltaNet block has its states here instead
-    mask     -1e9 where a token must not look (gpt2.mask). On the chip, around's comes with its positions and window
+    mask     -1e9 where a token must not look (gpt2.mask). On the chip, around's comes with its positions and window,
+             as (mask, places, window), and with places as Tensor.attend takes them the mask may be None
     prefill  a prompt's tokens, not a decode step
     live     from around. A free slot's token picks no expert and leaves its Gated DeltaNet states as they were
   accept and rule go to qwen.deltanet, and slots comes from forward."""
@@ -254,17 +255,18 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   sinks = p.get("sinks")  # gpt-oss: each head has a sink, a logit that counts in the softmax but has no value
   # A decode step's or a draft's few rows: a key head's query heads as the rows of one tile row, which reads each key and
   # value tile once for them all. Verify's 32 rows would take 4 tile rows a unit, which is slower than a unit a head.
-  grouped = not slots and places is not None and attends(c, p) and n * rep <= 32 and places.shape == (1, n, 1)
+  grouped = not slots and places is not None and attends(c, p) and n * rep <= 32 and places.shape[:2] == (1, n)
   if grouped:
     q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv, n * rep, hd)
     by_head = places.__dict__.setdefault("by_head", {})  # each row's place, made once for a call's layers
-    if rep not in by_head: by_head[rep] = f.expand(places, (1, n, rep)).reshape(1, n * rep, 1).realize()
+    if rep not in by_head:  # with its tree's columns, if any
+      by_head[rep] = f.expand(places.reshape(n, 1, w := places.shape[-1]), (n, rep, w)).reshape(1, n * rep, w).realize()
     places = by_head[rep]
   if slots:  # a batch entry for each key head and sequence, with its query heads' rows side by side
     k, v, t = f.parts(k, slots), f.parts(v, slots), n // slots
     q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv * slots, t * rep, hd)
     if sinks is not None: sinks = f.expand(sinks.reshape(c.kv, 1, rep), (c.kv, n, rep)).reshape(c.kv * slots, t * rep, 1)
-  if (m := mask.shape[-1]) < k.shape[-2]: k, v = k[:, :m, :], v[:, :m, :]  # views of the first m rows
+  if mask is not None and (m := mask.shape[-1]) < k.shape[-2]: k, v = k[:, :m, :], v[:, :m, :]  # the first m rows
   if not slots and not grouped: k, v = f.repeat(k, rep), f.repeat(v, rep)  # a key head for each query head, in place
   if places is not None and attends(c, p):  # one kernel, which keeps the scores on the chip
     o = q.attend(k, v, places, window, attention)
