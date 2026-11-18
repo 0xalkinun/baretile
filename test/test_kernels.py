@@ -80,15 +80,15 @@ def test_bytes(chip):
   # On a card or ttsim-chaos, where the NIUs count read data, Runtime.profile has the bytes that each launch read, in
   # 64-byte flits. An add reads the tiles of its two inputs. A token's bfp4 matmul reads A's row once, shared by
   # multicast, and each tile of B in two reads, exponents and values. For each result tile, a gather from a long table
-  # reads the tile of its ids, the zero tile, and two runs for each row, in 64-byte blocks. Its copy of the zero tile is
-  # a read within L1.
+  # reads its ids, row 0 of their tile in two 64-byte runs, the zero tile, and two runs for each row, in 64-byte blocks.
+  # Its copy of the zero tile is a read within L1.
   if not chip.pci.counts: pytest.skip("needs ttsim-chaos's libttsim.so: released ttsim doesn't count read data")
   rt, rng = Runtime(chip), np.random.default_rng(0)
   x, y = (Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()) for _ in range(2))
   a, b = Tensor.of(rt, rng.normal(0, 1, (32, 128)).tolist()), Tensor.of(rt, rng.normal(0, 1, (128, 64)).tolist()).cast("bfp4").realize()
   table, ids = Tensor.of(rt, rng.normal(0, 1, (160, 64)).tolist()), Tensor.of(rt, [[3, 140, 7]], "int32")
   for run, want in ((lambda: (x + y).realize(), 8 * 2048), (lambda: (a @ b).realize(), 4 * 2048 + 8 * (64 + 512)),
-                    (lambda: table.gather(ids), 2 * (4096 + 2048 + 3 * 2 * 64))):
+                    (lambda: table.gather(ids), 2 * (128 + 2048 + 3 * 2 * 64))):
     run(), rt.wait()  # compile it first
     since = rt.launches
     run()
@@ -108,8 +108,8 @@ def test_gather_shared_indices(chip):
   profile = rt.profile(since)
   assert np.array_equal(value(gathered)[0], rows[selected])
   if chip.pci.counts:
-    # Two index tiles, zero padding for three partial output tiles, and the table's 3 tiles for each of the 6.
-    assert [r[3] for r in profile] == [2 * 4096 + 3 * 2048 + 6 * 3 * 2048]
+    # Two index tiles' row 0, zero padding for three partial output tiles, and the table's 3 tiles for each of the 6.
+    assert [r[3] for r in profile] == [2 * 128 + 3 * 2048 + 6 * 3 * 2048]
   long = np.concatenate([rows, rows[::-1]] * 2)  # 260 rows, 9 tile rows
   for dtype in ("bf16", "fp32"):
     for table in (rows, long):

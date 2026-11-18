@@ -1111,12 +1111,13 @@ def gather_kernel(dtype, short=0):
   args: [first unit, units, out, input address, input tile stride, input tile offset,
   result tile columns, result rows, index address, index tile offset]. Indices form an int32 row.
 
-  Each unit writes one result tile. A worker keeps its current index tile, then reads two runs of 16 values per selected
-  row, one from each face. DRAM reads must preserve the low six address bits, so each run is fetched
-  as the containing 64-byte block. Read all blocks for a tile together, then copy the values into place.
-  A table of a few tile rows reads its whole column of tiles instead, a few large reads in place of 64 small ones,
-  which bound the time, and a 4-byte run, a whole aligned 64-byte block there, goes into place by a NoC copy within
-  L1. A single-row result repeats that row throughout its tile using NoC copies within L1."""
+  Each unit writes one result tile. A worker keeps its current index tile, of which it reads only row 0, its two runs
+  of 16 at 0 and 1024 bytes, since every worker of a wide result reads that tile from one bank. Then it reads two runs
+  of 16 values per selected row, one from each face. DRAM reads must preserve the low six address bits, so each run is
+  fetched as the containing 64-byte block. Read all blocks for a tile together, then copy the values into place. A
+  table of a few tile rows reads its whole column of tiles instead, a few large reads in place of 64 small ones, which
+  bound the time, and a 4-byte run, a whole aligned 64-byte block there, goes into place by a NoC copy within L1. A
+  single-row result repeats that row throughout its tile using NoC copies within L1."""
   tb, item = tile_bytes(dtype), ITEMSIZE[dtype]
   if short:  # the table's column of tiles into SRC, then each row's runs from there
     fetch = (f"for (unsigned q = 0; q < {short}; q++) {{ unsigned from = q * a[4] + j + a[5]; "
@@ -1144,7 +1145,8 @@ void kmain(volatile unsigned *a) {{
   for (unsigned u = 0, held = ~0u; u < a[1]; u++) {{
     // it: the indices' tile
     unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] - i * 32 < 32 ? a[7] - i * 32 : 32, it = a[9] + i;
-    if (it != held) noc_get(BANK(it), AT(a[8], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")}), held = it;
+    if (it != held) for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(it), AT(a[8], it, 4096) + o, IDS + o, 64);
+    held = it;
     if (rows < 32) copy({ZEROS:#x}, SLOT, {tb});  // full tiles overwrite every row; partial tiles keep zero padding
     noc_wait();
     {fetch}
