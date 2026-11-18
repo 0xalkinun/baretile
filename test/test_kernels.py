@@ -1403,7 +1403,7 @@ def test_attend(chip):
       assert read == 2 * (1 + 2 + 16 + 16) + 8, read
 
 def test_attend_tree(chip):
-  # A tree's 32 tokens after a cache, as Steed's verify runs them: each sees the cache and its ancestors among the tree's
+  # A tree's 32 tokens after a cache, as a tree's verify runs them: each sees the cache and its ancestors among the tree's
   # keys, which places give as a base (the tree's first key) and 16 bits a column, b for the key base + b. With 4 query
   # heads a key head they share its tiles, and over a long cache its keys go in parts. Then a draft pass's rows after
   # 90 earlier drafts, in six columns of bits. q is as RoPE scales it, by 1 / sqrt(256). Within a percent of NumPy.

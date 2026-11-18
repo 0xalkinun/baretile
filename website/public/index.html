@@ -21,8 +21,8 @@ The code in <code>baretile/</code> uses only the Python standard library.
 The driver runs in userspace and loads our firmware onto the workers.
 We use Tenstorrent's board firmware for ARC and Ethernet, with no dependency on tt-metal, tt-umd or LLK.</p>
 
-<p>We develop on Tenstorrent's ttsim simulator.
-A P150a has run bring-up through its probe stage, and SmolLM-135M matches NumPy on it. A few kernel and model tests still fail there.
+<p>baretile is pre-alpha. The whole test suite runs on Tenstorrent's ttsim simulator for every change, and CI runs the device, kernel and model tests on a P150a too, with SmolLM-135M's checkpoint against NumPy.
+The <a href="https://github.com/0xalkinun/baretile/blob/main/README.md#status">README</a> says what hasn't run on a card yet.
 Simulator timings don't predict card performance.
 The <a href="https://github.com/users/0xalkinun/projects/1">roadmap</a> says what we're building first.</p>
 
@@ -92,24 +92,21 @@ python3 -m baretile.models.serve HuggingFaceTB/SmolLM-135M 8000</code></pre>
   -d '{"prompt": "The meaning of life is", "max_tokens": 4, "temperature": 0}'</code></pre>
 
 <p>The server speaks OpenAI's completions and chat completions API.
-On ttsim, a token takes about half a minute, since the simulator runs every core of the chip.
-The <a href="https://github.com/0xalkinun/baretile/blob/main/docs/models.md">model docs</a> list the models baretile runs, and cover training and the tinygrad device.
+On ttsim, the answer takes about two minutes, since the simulator runs every core of the chip.
+The <a href="https://github.com/0xalkinun/baretile/blob/main/docs/models.md">model docs</a> list the models baretile runs, and the docs also cover <a href="https://github.com/0xalkinun/baretile/blob/main/docs/training.md">training</a> and the <a href="https://github.com/0xalkinun/baretile/blob/main/docs/adapters.md">tinygrad device</a>.
 We check the models against NumPy and transformers, and training against PyTorch.</p>
 
 <h2>Learning it</h2>
 
 <p>The <a href="https://github.com/0xalkinun/baretile/tree/main/ramps">ramps</a> teach baretile from the top down.
 Each one is a script that explains its steps and checks its results.
-They're in the repository:</p>
+They're in the repository. Start with the first:</p>
 
 <pre tabindex="0" aria-label="Tutorial commands"><code>git clone https://github.com/0xalkinun/baretile
 <span class="k">cd</span> baretile
-python3 ramps/1_tensors.py   <span class="c"># tensor operations, fusion, formats, gradients and jit</span>
-python3 ramps/2_runtime.py   <span class="c"># C kernels on the workers, DRAM and the NoC</span>
-python3 ramps/3_tensix.py    <span class="c"># unpack, math and pack programs written by hand</span>
-python3 ramps/4_kernel.py    <span class="c"># a tensor operation of your own</span></code></pre>
+python3 ramps/1_tensors.py   <span class="c"># tensor operations, fusion, formats, gradients and jit</span></code></pre>
 
-<p>The <a href="https://github.com/0xalkinun/baretile/blob/main/docs/README.md">documentation</a> explains the runtime, the compiler, the models and the hardware.</p>
+<p>The <a href="https://github.com/0xalkinun/baretile/blob/main/docs/README.md#learning-baretile">documentation</a> lists the others, and explains the runtime, the compiler, the models and the hardware.</p>
 
 <h2>From the blog</h2>
 

@@ -185,7 +185,7 @@ groups of columns and reads A again for each group.
 A single tile row, as in token decoding, uses a different path. Workers take
 output columns, share A, and stream B from DRAM. With column storage, workers
 read through their assigned bank ports in requests of up to 16 KiB. The default
-`CHUNKS` and `DEPTH` are both four. We'll need a card to tune them.
+`CHUNKS` and `DEPTH` are both four, untuned.
 
 For a mixture of experts, matmul reads the expert indices from a tensor on the
 chip. It uses those indices to select matrices from B. An index past the last
@@ -244,7 +244,8 @@ keys from the base each row sees, so each token sees the cache before the tree
 and its own ancestors in it.
 
 The kernel sweeps keys twice: first to find row maxima, then to compute
-exponentials and weighted values. Values are read on the second sweep. Keys
+exponentials and weighted values, with `tensix.exp16`, e^x to bf16's precision
+in about half the SFPU steps of `exp`. Values are read on the second sweep. Keys
 stay in L1 between sweeps when they fit. Scores stay local instead of being
 written as a full attention matrix in DRAM.
 
@@ -265,7 +266,6 @@ splits the keys into up to 16 parts, one unit for each worker, and combines
 their maxima, sums and weighted outputs afterwards in 4 launches, as reductions
 over the parts. With a few rows, as a decode step's or a draft's, the Llama
 model code puts a key head's query heads in the rows of one tile row, so each
-key and value tile is read once for all of them: a Qwen3.5-9B draft pass's 6
-rows over 8k bf16 keys take 159 µs on the card where a unit for each head took
-595. The Llama model code uses ordinary tensor attention for heads narrower
-than 64 and for gpt-oss sinks.
+key and value tile is read once for all of them; `python3 -m baretile.models.bench`
+times a draft pass's 6 rows this way on a card. The Llama model code uses
+ordinary tensor attention for heads narrower than 64 and for gpt-oss sinks.

@@ -12,22 +12,11 @@ labeled `good first issue` are small and a good way into the code.
 
 ## Setting up
 
-Follow [Try it](README.md#try-it) to set up clang, lld and ttsim, then install
-the test dependencies:
-
-```sh
-python3 -m pip install numpy pytest ruff
-python3 -m pytest -s test
-ruff check
-```
-
-With pytest-xdist installed, `-n auto` runs the tests in a process for each CPU,
-as CI does. On four CPUs, that halves the time. CI also splits the suite across
-jobs by each test's time, as [testing](docs/testing.md#ttsim-chaos) describes.
-
-[Testing and debugging](docs/testing.md) lists the optional checks that need
-model files, PyTorch, transformers, tiktoken, safetensors or a tinygrad
-checkout, and explains what to do when a launch hangs.
+Follow [Try it](README.md#try-it) to set up clang, lld and ttsim, then
+[running the tests](docs/testing.md#running-the-tests) to install the test
+dependencies and run the suite and `ruff check`. [Testing and
+debugging](docs/testing.md) also lists the optional checks and explains what to
+do when a launch hangs.
 
 ## What a change needs
 
@@ -50,8 +39,10 @@ checkout, and explains what to do when a launch hangs.
   Their names hash the source, so they change with any edit to the C text.
 - Docs that stay true. If your change alters how something works, update the
   page in [docs/](docs) that describes it. The tests run the README's Python
-  examples and check the docs' links. A pull request that changes only Markdown
-  runs just these doc checks and the package checks in CI, not the suite.
+  examples and check the docs' links. Each page has a line budget, which
+  `test_doc_size` checks: to add to a full page, cut something first. A pull
+  request that changes only Markdown runs just these doc checks and the package
+  checks in CI, not the suite.
 - A pull request that says what you ran and what it printed.
 
 You're responsible for every line you send, however you wrote it. We close
@@ -61,14 +52,8 @@ small ones. Before you start on something large, say so in its issue.
 ## How the code is organized
 
 The code has five layers. Each module imports only the layers below it, and
-`test_layers` checks this.
-
-- Layer 0 is the device (`bh.py`, `pci.py`, `chip.py`) and layer 1 is the
-  runtime (`runtime.py`).
-- Layer 2 is Tensix codegen (`tensix.py`) and layer 3 is the kernels and
-  `Tensor` (`kernels.py`, `tensor.py`).
-- Layer 4 is the models and the server (`baretile/models/`) and the adapters
-  (`baretile/adapters/`).
+`test_layers` checks this. [The map of the code](docs/README.md#where-the-code-is)
+lists each layer's files.
 
 If only one workload uses a kernel, that kernel lives in layer 4 next to the
 workload. It moves down when a second workload needs it. No file uses another
@@ -84,10 +69,10 @@ their own repositories and use baretile through the public API. A change belongs
 in baretile when people beyond one application would use it, so say why in
 those terms and test it that way. Otherwise it stays with the application.
 
-Layers 0 to 3 stay under 4,500 lines of code at 120 columns, not counting
-comments and docstrings, and `test_size` checks it. A line counts once for each
-120 characters it takes, so a longer line doesn't make the count smaller, and
-no line in them, the C in their strings included, is longer than 120.
+Layers 0 to 3 stay under the line budget that [the README](README.md) states,
+and `test_size` checks it. A line counts once for each 120 characters it takes,
+so a longer line doesn't make the count smaller, and no line in them, the C in
+their strings included, is longer than 120.
 
 ## Style
 
@@ -113,9 +98,8 @@ include numbers only with the command that reproduces them. Simulator cycle
 counts, cost estimates and measurements from a card are different things, so
 say which one a number is.
 
-We use the same terms everywhere. A worker is a Tensix tile running a kernel,
-and BRISC and the TRISCs are its RISC-V cores. A tensor tile holds 32 by 32
-values. "Tile column" refers to `Tensor.columns`.
+We use the same terms everywhere, as [the docs](docs/README.md#terms) define
+them.
 
 Use one short commit subject under 70 characters and no body, for example
 "matmul: read B by columns" or "adapter: fix JIT input ownership". Put any

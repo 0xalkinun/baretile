@@ -19,6 +19,8 @@ A kernel has four programs that run together on each worker:
 - TRISC1 feeds the math unit: the FPU and the SFPU, which compute into Dst.
 - TRISC2 feeds the packer, which moves Dst back into L1.
 
+The tile's fifth core, NCRISC, stays in reset.
+
 `compile_kernel(brisc, unpacks, maths, packs)` builds the four into one image,
 cached by its source. `Runtime.launch(kernel, args, units)` divides the units
 between the workers, and each worker gets `[first unit, units, *args]`. Here a

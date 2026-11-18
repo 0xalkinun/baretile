@@ -153,7 +153,9 @@ is storage that the recording's own results overwrite, or when f only reads it
 and it shares storage with an input or captured tensor that f writes; a written
 copy goes back to the caller's tensor afterwards. Keep two written inputs in
 distinct storage, and keep written inputs separate from captured tensors f only
-reads. Those aliases are not supported by replay. A tensor by columns can't be
+reads. Those aliases are not supported by replay. The same tensor can be passed
+twice, and a returned view of an input is on that call's input, or on jit's
+copy of it. A tensor by columns can't be
 copied, so it must keep the recorded layout. If kernels have been evicted, the
 recording reloads them and rebuilds its commands.
 

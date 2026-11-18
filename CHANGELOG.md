@@ -1,8 +1,39 @@
 # Changelog
 
-baretile is pre-alpha. Everything below is tested on Tenstorrent's ttsim
-simulator. A P150a has run the first bring-up stages, preflight, chip and
-transfers; nothing else is tested on a card yet.
+baretile is pre-alpha. [The README](README.md#status) says what runs on the simulator and on a card.
+
+## Unreleased
+
+The release that runs on a P150a: what failed on the card is fixed, and CI's `card` job runs bring-up there, through
+the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-the-card)).
+
+### Added
+
+- `python3 -m baretile.models.bench` times a decode or verify step's launches, each against what the card could do.
+- Gated DeltaNet for tokens in an order of their own, such as a tree's: `qwen.rule` runs a piece in one kernel, which
+  can make the gates and the output norm itself; `qwen.conv` with `last`, `qwen.conv_state` and `qwen.carry` each take
+  one launch; `qwen.predict` runs a prediction layer on its own ([models](docs/models.md#experts-and-gated-deltanet)).
+- `Tensor.attend` takes a tree's places, `serve.frontier` picks a step of a draft tree on the chip, and
+  `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows at once.
+- Training in `precision=bf16`, from several shards, saved and resumed, and `test/train_reference.py`
+  ([training](docs/training.md)). The server enforces JSON schemas' `pattern`. `test/workload.py` times the first
+  workload and runs its HTTP gate.
+
+### Changed
+
+- baretile needs tt-kmd 2.5 or later. The core's line budget is 4,650, from 4,500.
+- Multicasts go on NoC 1, as linked transactions, so a token's matmul shares A's row while B streams on NoC 0.
+- Faster kernels: attention for a few rows reads each key and value tile once for a key head's query heads, and takes
+  p from `exp16`; the SFPU works on a matrix's live rows alone; `gather`, `put`, `topk` and a single row's upload read
+  or spread less; `assign` moves straight into a new destination.
+
+### Fixed
+
+- On a card: no core has more than 255 NoC requests in flight; `noc_wait` waits for the initiators first; packed
+  results stay within the packer's 256 KiB reach; one worker shares a row where multicasts into one rectangle queued
+  up; `Chip` refuses the Tensix config bank and reads back a write forwarded to host memory; a runtime zeroes a tile's
+  NoC counts before its firmware starts; tt-kmd's file stays open at exit until the runtimes stop.
+- A prompt's tokens take prefill's precision even one at a time, so a cached prompt gives the same tokens.
 
 ## 0.0.7
 
@@ -150,7 +181,7 @@ python3 -m baretile.models.train train.bin val.bin layers=2 dim=64 heads=2 ctx=3
   later, and 2.11 for an explicit `Chip.arc_msg`.
 - `python3 -m baretile.models.train` trains GPT-2 from scratch on GPT-2 tokens in llm.c's `.bin` shards, such as
   FineWeb's. By default that's GPT-2 124M with nanoGPT's recipe: AdamW, a warmup and cosine schedule, and clipping.
-  [Training](docs/models.md#training) shows how to get the tokens.
+  [Training](docs/training.md) shows how to get the tokens.
 - `BARETILE_DUMP=folder` writes the C programs of each kernel a runtime launches, one file for each core, and
   `baretile.viz` shows them beside the kernel's launches.
 
