@@ -210,10 +210,13 @@ about 2^-11 of its largest terms, against bf16's 2^-8.
 
 fp32 elementwise operations use the SFPU, a 32-lane vector unit working on Dst.
 It implements arithmetic and the polynomial approximations used for functions
-such as exp and log. `rounded("fp16")` rounds fp32 values to fp16's precision,
-to nearest even, as integer arithmetic on their bits, and keeps them in fp32.
-Packing a bf16 result rounds half up, while host uploads use
-round-to-nearest-even. The two can differ by one bf16 step on the same input.
+such as exp and log. For a matrix of 2 to 16 rows, fused kernels run the SFPU on
+those rows alone, their count from the kernel's row argument; a one-row matrix's
+tile holds copies of its row, which broadcasting reads, so it runs whole.
+`rounded("fp16")` rounds fp32 values to fp16's precision, to nearest even, as
+integer arithmetic on their bits, and keeps them in fp32. Packing a bf16 result
+rounds half up, while host uploads use round-to-nearest-even. The two can differ
+by one bf16 step on the same input.
 
 Integer comparisons, minimum and maximum cover the full int32 range, including
 `-2**31`. Integer addition and subtraction wrap; conversion to fp32 rounds to
@@ -235,7 +238,10 @@ integer turn count and pi to keep large-argument subtraction accurate.
 `Tensor.attend` computes the scores and weighted values in an attention kernel,
 then divides by the softmax sums in another launch. BRISC reads the token
 positions and sliding-window bounds to build the masks. A new position changes
-the mask without changing the recorded launches.
+the mask without changing the recorded launches. For a tree of tokens, places
+also carry a base key and up to six columns of 16 bits that say which of the
+keys from the base each row sees, so each token sees the cache before the tree
+and its own ancestors in it.
 
 The kernel sweeps keys twice: first to find row maxima, then to compute
 exponentials and weighted values. Values are read on the second sweep. Keys
