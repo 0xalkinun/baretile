@@ -2287,7 +2287,7 @@ def test_put_aliases_and_singleton(chip):
     assert np.array_equal(value(x)[0], want)
     for dtype in ("bf16", "fp32", "int32", "bfp8", "bfp4"):
       x = Tensor.zeros(rt, 1, 2, dtype=dtype)
-      x.put(Tensor.of(rt, [[0]], "int32"), Tensor.of(rt, [[2, 3]], "bf16" if dtype in ("bfp8", "bfp4") else dtype))
+      x.put(Tensor.of(rt, [[0]], "int32"), Tensor.of(rt, [[2, 3]], "bf16" if dtype in ("bfp8", "bfp4") else dtype).cast(dtype))
       if dtype in ("bfp8", "bfp4"):
         rt.wait()
         raw = chip.read(*bh.DRAM[0], x.addr, tensix.tile_bytes(dtype))
@@ -2296,21 +2296,30 @@ def test_put_aliases_and_singleton(chip):
       else: assert (x + Tensor.zeros(rt, 2, 2, dtype=dtype)).tolist() == [[2, 3], [2, 3]], dtype
 
 def test_block_float_cache(chip):
-  # This tests a KV cache in bfp8, the format Tenstorrent's models use, and in bfp4. put writes bf16 rows into a
-  # block-float tensor and rounds each run of 16 the way cast does, bit for bit. The puts are one row, rows in two
-  # tiles, a prompt filling a tile, and the edges. Attention reads the cache in place, with each key and value head
-  # serving two query heads. Keys are read transposed, which needs unpacker 0 to transpose faces of block floats. The
-  # matmuls and attention in one kernel are bit for bit the bf16 ones on the same values. Last, assign copies a view of
-  # the cache as it is into a separate tensor, and from there into another view of the cache.
+  # This tests a KV cache in bfp8, the format Tenstorrent's models use, and in bfp4. put writes rows cast to the block
+  # float into it, each run of 16 with its exponent as it is, and a -0 or a value too small for its run a 0, which the
+  # unpacker would read as -inf with its sign. The puts are one row, rows in two tiles, a prompt filling a tile, and the
+  # edges. Then rows move within the cache, read by a one-hot matmul that packs the block float, so each run's exponent
+  # moves to another run and another tile. Attention reads the cache in place, with each key and value head serving two
+  # query heads. Keys are read transposed, which needs unpacker 0 to transpose faces of block floats. The matmuls and
+  # attention in one kernel are bit for bit the bf16 ones on the same values. Last, assign copies a view of the cache
+  # as it is into a separate tensor, and from there into another view of the cache.
   rt, rng = Runtime(chip), np.random.default_rng(16)
   for fmt in ("bfp8", "bfp4"):
     cache = Tensor.of(rt, np.zeros((4, 96, 64)).tolist()).cast(fmt).realize()  # 2 key heads, then 2 value heads
     want = np.zeros((4, 96, 64))
     for places in ([5], [33, 34, 70], list(range(32, 64)), [0, 95]):
       x = bf16(rng.normal(0, 2, (4, len(places), 64)) * 10.0 ** rng.integers(-3, 3, (4, len(places), 1)))
-      cache.put(Tensor.of(rt, [places], "int32"), Tensor.of(rt, x.tolist()))
+      x[0, 0, :2] = -0.0, -1e-30
+      cache.put(Tensor.of(rt, [places], "int32"), Tensor.of(rt, x.tolist()).cast(fmt))
       want[:, places] = value(Tensor.of(rt, x.tolist()).cast(fmt))
-      assert np.array_equal(value(cache), want), (fmt, places)
+      assert np.array_equal(value(cache), want) and np.isfinite(want).all(), (fmt, places)
+    src, to = [5, 33, 34, 95, 0], [60, 61, 2, 94, 63]
+    pick = np.zeros((len(src), 96))
+    pick[range(len(src)), src] = 1
+    cache.put(Tensor.of(rt, [to], "int32"), Tensor.of(rt, pick.tolist()).matmul(cache, fmt))
+    want[:, to] = want[:, src]
+    assert np.array_equal(value(cache), want), fmt
     same = Tensor.of(rt, want.tolist())  # the same values in bf16
     q, s = (Tensor.of(rt, bf16(rng.normal(0, 1, shape)).tolist()) for shape in ((4, 5, 64), (4, 5, 96)))
     for c in (cache, same): c.keys, c.values = c[0:2, :, :].repeat_interleave(2), c[2:4, :, :].repeat_interleave(2)

@@ -542,7 +542,7 @@ class Engine:
       if llama.linear(self.c, l):
         for x, v in zip(s[:2], d or (None, None)): x.assign(Tensor.zeros(self.rt, x.rows, x.cols, x.batch, "fp32") if v is None else v)
       elif isinstance(p, Tensor): s[:, :rows, :].assign(p)
-      elif p is not None: s.put(at, d)  # rows from the host are bf16, which put converts to a block-float cache
+      elif p is not None: s.put(at, d.cast(s.dtype))  # rows from the host are bf16, cast to the cache's dtype
     self.held[u], self.taken[u], self.coherent[u] = list(key), 1.0, True
     return True
 

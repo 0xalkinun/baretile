@@ -228,13 +228,14 @@ class Tensor:
   @_matrices
   def put(self, ids, x):
     """Write x into rows selected by ids, in place. Models use this to update KV caches without changing the
-    shape of a decode step. For a block-float destination, x is bf16 and is rounded as in cast."""
+    shape of a decode step. x has the tensor's dtype: cast rows to a block float first, or pack bfp8 in the matmul
+    that makes them."""
     self._same_runtime(ids, x)
     if not (ids.dtype == "int32" and (ids.batch, ids.rows) == (1, 1) and ids.cols == x.rows):
       raise ValueError("put needs ids as an int32 row, with one position for each row of x")
-    if not ((x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype)):
-      raise ValueError(f"put needs rows of the cache's batch and width, "
-                       f"bf16 for a block float: {x.shape} {x.dtype} into {self.shape} {self.dtype}")
+    if (x.batch, x.cols, x.dtype) != (self.batch, self.cols, self.dtype):
+      raise ValueError(f"put needs rows of the cache's batch, width and dtype: {x.shape} {x.dtype} into "
+                       f"{self.shape} {self.dtype}")
     if self.rep != 1: raise ValueError("put requires a tensor with rep=1")
     x, ids, tc, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
     if 2 * x.rows + tr > 2**17: raise ValueError("put has too many rows to track in a worker's L1")
@@ -629,7 +630,7 @@ class Tensor:
     x, tc = _plain(self.cast("bf16").realize()), -(-self.cols // 32)
     out = _lead(Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), self.lead)
     return out.run(("bfp4",), bfp4_kernel, out.addr, *x._where(), tc,
-                   -(-self.rows // 32) * tc, name="bfp4")._track("cast", (self,))
+                   -(-self.rows // 32) * tc, self.rows, name="bfp4")._track("cast", (self,))
   @_matrices
   def columns(self):
     """Store each tile column of B together so matmul can read several tiles along K per request.

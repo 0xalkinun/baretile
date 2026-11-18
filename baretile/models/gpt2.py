@@ -64,7 +64,8 @@ def fns(x):  # adapt NumPy and baretile operations to the same model code
                            layernorm=lambda a: F.layer_norm(a, a.shape[-1:]), t=lambda a: a.transpose(-1, -2),
                            gelu=lambda a: F.gelu(a, approximate="tanh"))
   return SimpleNamespace(rows=Tensor.gather, split=Tensor.split, softmax=Tensor.softmax,
-                         layernorm=Tensor.layernorm, merge=Tensor.merge, t=lambda a: a.T, gelu=Tensor.gelu, put=Tensor.put)
+                         layernorm=Tensor.layernorm, merge=Tensor.merge, t=lambda a: a.T, gelu=Tensor.gelu,
+                         put=lambda a, places, b: a.put(places, b.cast(a.dtype)))  # cast as NumPy's assignment does
 
 def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 

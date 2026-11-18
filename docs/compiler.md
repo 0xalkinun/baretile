@@ -112,7 +112,8 @@ quantizer as an identity, while matmul's input gradient uses the stored,
 quantized weights.
 
 `gather` reads rows by index, and `put` writes them. The models use these for
-embeddings and KV caches. `put` can also update bfp8 and bfp4 caches. It copies
+embeddings and KV caches. `put` takes rows in its destination's dtype: cast them
+to a block-float cache's, or pack bfp8 in the matmul that makes them. It copies
 source rows and indices that overlap its destination before writing, and keeps
 singleton rows replicated across their tiles for later broadcasting. `assign`
 copies its source first when source and destination overlap with different
