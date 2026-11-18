@@ -513,9 +513,10 @@ def conv_kernel(n):
   past the table's rows p reads last's row (p - rows) as conv takes it.
 
   For each unit, BRISC reads its picks once a tile row, then the taps' tiles (a 1-row tensor repeats its row down its
-  tiles), and each tap's picked rows: from the table's tiles that they reach, through a cache of 4, by NoC copies within
-  L1, since a row's run of 16 values in a face is a whole 64-byte block. The math thread sums the products on the SFPU. Frames take
-  turns, so BRISC reads one unit while math works on the last. The result's padding rows stay 0, as SiLU(0) is."""
+  tiles), and each tap's picked rows: from the table's tiles that they reach, or last's rows alone, through a cache of
+  4, by NoC copies within L1, a run of rows in order at a time, since a row's run of 16 values in a face is a whole
+  64-byte block. The math thread sums the products on the SFPU. Frames take turns, so BRISC reads one unit while math
+  works on the last. The result's padding rows stay 0, as SiLU(0) is."""
   OUT, F0, R2, R3 = 1, 3, 2 * DST_HALF, 3 * DST_HALF  # output slots for each Dst half, then a frame of 2n tiles each
   IDS, CACHE = F0 + 4 * n, F0 + 5 * n  # the picks' tiles, then the table's
   if CACHE + 4 > UNPACKABLE: raise ValueError("conv_kernel: too many taps for L1")
@@ -531,18 +532,25 @@ def conv_kernel(n):
     }}
     noc_wait();
     for (unsigned c = 0; c < 4; c++) tag[c] = ~0u;  // the cache holds tiles of this unit's column
-    for (unsigned k = 0; k < {n}; k++) for (unsigned r = 0; r < rows; r++) {{
-      unsigned p = ((volatile unsigned *)SLOT({IDS} + k))[at(0, r)], L = p >= a[24], b = L ? (p - a[24]) / a[25] : 0;
-      unsigned w = L ? (p - a[24]) % a[25] : p, q = w / 32 | b << 16 | L << 31, c = 0;  // the row, in the table or last
+    for (unsigned k = 0, run; k < {n}; k++) for (unsigned r = 0; r < rows; r += run) {{
+      volatile unsigned *picks = (volatile unsigned *)SLOT({IDS} + k);
+      unsigned p = picks[at(0, r)], L = p >= a[24], b = L ? (p - a[24]) / a[25] : 0;
+      // the row, in the table or last, and what the cache holds it in: the table's tile, or last's row alone
+      unsigned w = L ? (p - a[24]) % a[25] : p, q = (L ? w : w / 32) | b << 16 | L << 31, c = 0;
       while (c < 4 && tag[c] != q) c++;
       if (c == 4) {{  // a miss takes the next place, once the copies from it are done
         c = next++ % 4, tag[c] = q;
         noc_wait();
-        if (L) get(a[20], {tile_of(20, 'b', 'w / 32', 'j')}, {CACHE} + c);
+        if (L) for (unsigned f = 0, t = {tile_of(20, 'b', 'w / 32', 'j')}, o; f < 2; f++)
+          o = at(w % 32, 16 * f) * 4, noc_get(BANK(t), AT(a[20], t, 4096) + o, SLOT({CACHE} + c) + o, 64);
         else get(a[6], {tile_of(6, 0, 'w / 32', 'j')}, {CACHE} + c);
         noc_wait();
       }}
-      for (unsigned f = 0; f < 2; f++) copy(SLOT({CACHE} + c) + at(w % 32, 16 * f) * 4, SLOT(F + k) + at(r, 16 * f) * 4, 64);
+      // a run of the table's rows in order goes in one copy a face, within a face's 16 rows on both sides
+      for (run = 1; !L && r + run < rows && (r + run) % 16 && (w + run) % 16 && p + run < a[24] &&
+                    picks[at(0, r + run)] == p + run;) run++;
+      for (unsigned f = 0; f < 2; f++)
+        copy(SLOT({CACHE} + c) + at(w % 32, 16 * f) * 4, SLOT(F + k) + at(r, 16 * f) * 4, 64 * run);
     }}
     noc_wait(); ready(); frame_done[u & 1] = ++events;""")
   free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
