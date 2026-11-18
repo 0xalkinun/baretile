@@ -1704,7 +1704,7 @@ def test_delta_solve(chip):
 def test_delta_tree(chip):
   # qwen.rule in one kernel, for tokens in a tree's order (seen holds each token's ancestors) and for a prompt piece
   # with its state, both with key heads that serve two value heads each: within 1% of NumPy, as TF32 products give.
-  # Then qwen.carry along a path of the tree, likewise.
+  # Then qwen.carry along a path of the tree, likewise, and the tree with the gates made in the kernel.
   rng = np.random.default_rng(71)
   rt = Runtime(chip)
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
@@ -1727,7 +1727,15 @@ def test_delta_tree(chip):
       after = qwen.rule(*(a[:, path, :] for a in (q, k, v, beta, g)), S, state=True)[3]
       assert rel(qwen.carry(S.copy(), k, *want[1:], end, on), after) < 1e-5
       assert rel(value(qwen.carry(up(S), up(k), *got[1:], up(end), up(on))), after) < 0.01
-  qwen.rule_kernel(1, 4, 4, 2, False, 128)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
+      # and with beta and g made in the kernel, from b and a as deltanet has them (a column a value head), dt_bias
+      # and decay: beta = sigmoid(b), g = decay softplus(a + dt_bias)
+      raw = rng.normal(0, 2, (m, 4)), rng.normal(0, 2, (m, 4)), rng.normal(0, 1, (1, 4)), -rng.uniform(0, 1, (1, 4))
+      x = raw[1] + raw[2]
+      beta, g = (1 / (1 + np.exp(-raw[0]))).T[:, :, None], (raw[3] * np.logaddexp(x, 0)).T[:, :, None]
+      want = qwen.rule(q, k, v, beta, g, S, seen)
+      got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), raw=tuple(up(a[None]) for a in raw))
+      assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
+  qwen.rule_kernel(1, 4, 4, 2, False, 128, True)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
 
 def test_conv_last(chip):
   # qwen.conv reads each token's inputs from the table, or past its rows from the conv state where it lies (last): as
@@ -1759,7 +1767,7 @@ def test_delta_rule(chip):
   def causal(rows, last, taps, gates, S):  # the prompt's recurrence as a rule: the conv in order, then the rule from S
     f, m = llama.fns(rows), rows.shape[-2]
     rows = f.cat(f.swap(last), rows.reshape(1, m, rows.shape[-1]))  # the last inputs, then this call's
-    q, k, v, b, g = gates(f.silu(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))))
+    q, k, v, b, g, _ = gates(f.silu(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))))
     q, k = f.repeat(qwen.unit(q, c.kd ** -0.5), c.vh // c.kh), f.repeat(qwen.unit(k), c.vh // c.kh)
     cum, decay, u, w = qwen.corrected(k, v, f.sigmoid(b), g)
     return (q * f.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ (u - w @ S)
