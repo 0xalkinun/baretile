@@ -246,7 +246,7 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   qkv = f.split(qkv + p["qkv_bias"] if "qkv_bias" in p else qkv, nh)  # Qwen2's bias
   if normed:
     r = f.rsqrt(f.mean(qkv * qkv) + c.eps)
-    qkv = f.bf16(qkv * f.where(p["qk_on"], r * p["qk_norm"] + r if c.centered else r * p["qk_norm"], 1))
+    qkv = f.bf16(f.where(p["qk_on"], qkv * (r * p["qk_norm"] + r if c.centered else r * p["qk_norm"]), qkv))
   qkv = f.merge(rope(qkv, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))  # a token's heads side by side again
   heads = f.split(qkv, nh)
   kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values together. RoPE left v's heads as they were
