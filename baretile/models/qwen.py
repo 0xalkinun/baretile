@@ -35,10 +35,10 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   rule, a recurrence of the caller's, takes the place of the conv and the gated delta rule, for tokens in
   an order of its own, and the states stay as they were. rule(rows, last, taps, gates, S) gets this call's conv
   inputs (rows of x, each sequence's in turn), the last c.conv - 1 of each sequence as the conv state holds them (as
-  conv takes them), the conv taps, gates,
-  which takes the conv's output (with its SiLU, as conv gives it) to q, k, v, b (before its sigmoid) and g with a
-  batch entry for each head of each sequence, and S. It returns the outputs as chunk does, a batch entry for each
-  value head of each sequence.
+  conv takes them), the conv taps, gates, which takes the conv's output (with its SiLU, as conv gives it) to q, k, v,
+  b (before its sigmoid) and g with a batch entry for each head of each sequence, and what b and g come from (b's and
+  a's columns of x, dt_bias and decay, as rule's raw), and S. It returns the outputs as chunk does, a batch entry for
+  each value head of each sequence.
 
   p contains qkv_proj (q, k, v, z, b and a concatenated), conv taps, decay (-exp(A_log)), dt_bias,
   norm and o_proj."""
@@ -53,12 +53,14 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   def each(t, d):  # a batch entry for each head of each sequence
     heads = f.split(t, t.shape[-1] // d) if d > 1 else f.heads(t)
     return heads if seqs == 1 else f.swap(heads.reshape(heads.shape[0], seqs, m * d)).reshape(seqs * heads.shape[0], m, d)
-  def gates(y):  # from the conv's output: q and k of each key head (rule takes them to length 1), v of each value head, b and g
+  def gates(y):  # from the conv's output: q and k of each key head (rule takes them to length 1), v of each value head,
+    # b and g, and what they come from (rule's raw)
     y = y.reshape(n, width)
     q, k = each(y[:, :qk], c.kd), each(y[:, qk:2 * qk], c.kd)
     b, a = x[:, width + vw:width + vw + c.vh], x[:, width + vw + c.vh:] + p["dt_bias"]
     g = each(p["decay"] * (f.maximum(a, 0) + f.log(1 + f.exp(-f.maximum(a, -a)))), 1)  # softplus: the log decay of each head
-    return q, k, each(y[:, 2 * qk:], c.vd), each(b, 1), g
+    raw = b, x[:, width + vw + c.vh:], p["dt_bias"], p["decay"]
+    return q, k, each(y[:, 2 * qk:], c.vd), each(b, 1), g, raw
   if rule is not None:  # the caller's recurrence, from the conv inputs: this call's, and the last ones where they lie
     o = rule(x[:, :width], past, taps, gates, S)
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
@@ -75,7 +77,7 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))
     y = conv(rows.reshape(seqs * (m + c.conv - 1), width), shifted(h, seqs, m, c.conv), taps)  # each token after its last inputs
     f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
-    q, k, v, b, g = gates(y)
+    q, k, v, b, g, _ = gates(y)
     o, S2 = chunk(q, k, v, f.sigmoid(b), g, S)
     o = f.now(o)  # o reads the state, so realize it before the state is written over
     f.assign(state[1], big(state[1], S2))
@@ -615,10 +617,18 @@ class Tiles:
               "min0": lambda r: [sfp_load(0, r), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=0, vc=1, mod1=1),
                                  sfp_store(0, r)],
               "square": lambda r: [sfp_load(0, r), mul(1, 0, 0), sfp_store(1, r)],
-              "eps": lambda r: [sfp_load(0, r), *sfp_const(5, 1e-6), mad(1, 0, ONE, 5), sfp_store(1, r)]}  # + 1e-6
+              "eps": lambda r: [sfp_load(0, r), *sfp_const(5, 1e-6), mad(1, 0, ONE, 5), sfp_store(1, r)],  # + 1e-6
+              # for the gates: r + R2, 1 + r, -|r| and r + max(R2, 0)
+              "add": lambda r: [sfp_load(0, r), sfp_load(1, R2), mad(2, 0, ONE, 1), sfp_store(2, r)],
+              "inc": lambda r: [sfp_load(0, r), mad(1, 0, ONE, ONE), sfp_store(1, r)],
+              "nabs": lambda r: [sfp_load(0, r), ins("SFPABS", vd=1, vc=0, mod1=1), mul(2, 1, MINUS_ONE),
+                                 sfp_store(2, r)],
+              "addmax0": lambda r: [sfp_load(0, R2), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1),
+                                    sfp_load(2, r), mad(3, 2, ONE, 0), sfp_store(3, r)]}
 
   library = {"fexp": sfpu(["fexp"], {}), "sqrt": sfpu(["sqrt"], {}), "frecip": sfpu(["frecip"], {}),
-             "sum2": ACROSS[FOLDS["sum2"]]("sum2")}  # on the tile at h: fp32 e^x, sqrt and 1 / x, and each row's sum
+             "log": sfpu(["log"], {}), "sum2": ACROSS[FOLDS["sum2"]]("sum2"), "col0": mask_columns("sum", 1)}
+  # on the tile at h: fp32 e^x, sqrt, 1 / x and log, each row's sum filling it, and column 0 alone
 
   def __init__(self):
     self.used, self.ops, self.made, self.drained, self.keeps, self.replays = 1, [], {}, 0, {}, allocate({"mm", "mmT"})
@@ -700,7 +710,7 @@ class Tiles:
                                        wide=True),
                           pack_program(units(" ".join(c for _, c in self.ops)), 2 + len(self.keeps)))
 
-def rule_kernel(st, kt, vt, rep, state, kd=None):
+def rule_kernel(st, kt, vt, rep, state, kd=None, gated=False):
   """The kernel for rule: a piece's gated delta rule after the decays, one value head a unit, in Tiles' ops. The
   inputs come rounded to TF32 by rule, except the state, which goes on in fp32 and is rounded here for the FPU.
 
@@ -710,7 +720,8 @@ def rule_kernel(st, kt, vt, rep, state, kd=None):
   - q and k, for each key head; a unit reads those of its value head's (e / rep)
   - kb = beta k, kbe = beta k e^cum, qe = q e^cum and vb = beta v, for each value head, then decay: the decay from
     token j to token i where i follows j (or is it), else 0. With kd, v, beta as tiles of each row's value, g and
-    seen (corrected's) in their place
+    seen (corrected's) in their place, or with gated, v, then b, a, dt_bias and decay as deltanet has them (rule's
+    raw) in place of beta and g, and seen
   - S, the state before the piece
   - consts: the identity, the pairs masks of spans 1, 2, 4, 8 and 16 (llama.pairs), ones in row 0, ones in column 0
   - with state, e^G, where G is cum at the last token, in every place of a tile, and kl = (k e^(G - cum))^T
@@ -719,7 +730,10 @@ def rule_kernel(st, kt, vt, rep, state, kd=None):
   come as the conv gives them, and the kernel takes them to length 1 (q then times kd^-1/2, as qwen.unit), and makes
   cum, which goes out after v_new, its tiles filled, the decays, and the rounded q, k, kb, kbe, qe and vb, each
   rounded once. cum = seen g, and cum's column filling its tiles, or turned for cum_i - cum_j, come from the FPU, from two
-  TF32 parts of each value: 22 bits of it, where the tensor ops' fp32 matmul has bf16's two parts, 16.
+  TF32 parts of each value: 22 bits of it, where the tensor ops' fp32 matmul has bf16's two parts, 16. With gated, it
+  makes beta = sigmoid(b) and g = decay softplus(a + dt_bias) too, for one sequence: BRISC copies the unit's column
+  of each into column 0, and the SFPU spreads each row's value along its row. a + dt_bias and g go in slots of the
+  inverse's, which it makes later.
 
   The ops follow corrected and chunk: L = (kb k^T) decay, then the inverse of I + L in blocks, w = inv kbe (kept
   negated), v_new = inv vb - w S, the outputs qe S + ((q k^T) decay) v_new, and the state e^G S + kl v_new. L's diagonal
@@ -732,8 +746,13 @@ def rule_kernel(st, kt, vt, rep, state, kd=None):
   if scaled:  # made here, so within the packer's reach: the scaled rows, g and cum in two TF32 parts, cum filling
     (Q, K, KB, KBE, QE), VB = scaled_rows()  # its tiles, e^cum and the decays
     GP, CP, CU, EE, DC = t.take(2 * st, 2), t.take(2 * st, 2), t.take(st), t.take(st), t.take(st * st, st)
+    if gated: BE, TM, GI = t.take(st), X(0, 0), LP(0, 0)
   OUT = t.outs()
-  if scaled: QR, KR, VR, BE, GI, SN = t.take(st * kt, kt), t.take(st * kt, kt), t.take(st * vt, vt), t.take(st), t.take(st), t.take(st * st, st)
+  if scaled:
+    QR, KR, VR = t.take(st * kt, kt), t.take(st * kt, kt), t.take(st * vt, vt)
+    if gated: BR = t.take(4)  # the unit's tile of b, a, dt_bias and decay, its column first
+    else: BE, GI = t.take(st), t.take(st)
+    SN = t.take(st * st, st)
   else:
     (Q, K, KB, KBE, QE), VB = scaled_rows()
     DC = t.take(st * st, st)
@@ -742,6 +761,12 @@ def rule_kernel(st, kt, vt, rep, state, kd=None):
   EG, KL = (t.take(1), t.take(kt * st, st)) if state else (None, None)
   op, lower = t.op, [(i, j) for i in range(st) for j in range(i + 1)]
   spread = lambda i: [(CP(i, p), E0, False) for p in range(2)]  # cum's column filling its tiles
+  row = [("col0", ()), ("sum2", ())]  # each row's value in column 0, filling its row
+  if gated:  # beta = sigmoid(b), and g = decay softplus(a + dt_bias) = decay (log(1 + e^-|x|) + max(x, 0))
+    op(BE, start=BR, posts=[*row, ("neg", ()), ("fexp", ()), ("inc", ()), ("frecip", ())], exact=True)
+    op(TM, start=BR + 1, posts=[("add", (BR + 2,)), *row], exact=True)
+    softplus = [("nabs", ()), ("fexp", ()), ("inc", ()), ("log", ()), ("addmax0", (TM,))]
+    op(GI, start=TM, posts=[*softplus, ("mul", (BR + 3,)), *row], exact=True)
   if scaled:  # cum = seen g, then filling its tiles (its column times ones in row 0), e^cum, and the decays:
     for i in range(st):  # exp(min(cum_i - cum_j, 0)) where i sees j, cum_j's tile turned by ones in column 0
       t.parts(GP, i, start=GI + i)
@@ -793,13 +818,19 @@ def rule_kernel(st, kt, vt, rep, state, kd=None):
     for c in range(kt):
       for j in range(vt):  # kl v_new + e^G S, with S as it came
         op(OUT, [(KL(c, l), VN(l, j), False) for l in range(st)], posts=[("fma", (SS(c, j), EG))], home=(2 * st + c, j))
-  names = ["q", "k", *(["v", "beta", "g", "seen"] if scaled else ["kb", "kbe", "qe", "vb", "decay"]), "S", "consts",
+  gates = ["b", "a", "dt", "decay"] if gated else ["beta", "g"]
+  names = ["q", "k", *(["v", *gates, "seen"] if scaled else ["kb", "kbe", "qe", "vb", "decay"]), "S", "consts",
            *(["eg", "kl"] if state else [])]
   arg, get = {name: 6 + 4 * i for i, name in enumerate(names)}, t.get  # each input's four words, after the result's
   rows = ((QR, KR, VR) if scaled else (Q, K, VB))
+  raw = ""
+  if gated:  # the gates' tiles, each with the unit's column copied into column 0 (a 1-row tensor repeats its row)
+    raw = "".join(f"get(a[{arg[n]}], {tile_of(arg[n], 0, 0, 'e / 32')}, {BR + j});" for j, n in enumerate(gates))
+    raw += (f"noc_wait(); for (unsigned s = 0; s < 4; s++) {{ volatile unsigned *x = (volatile unsigned *)"
+            f"SLOT({BR} + s); for (unsigned r = 0; r < 32; r++) x[at(r, 0)] = x[at(r, e % 32)]; }}")
   fetch = (get(arg["q"], rows[0](0, 0), st, kt, f"e / {rep}") + get(arg["k"], rows[1](0, 0), st, kt, f"e / {rep}") +
-           (get(arg["v"], VR(0, 0), st, vt) + get(arg["beta"], BE, st, 1) + get(arg["g"], GI, st, 1) +
-            get(arg["seen"], SN(0, 0), st, st) if scaled else
+           (get(arg["v"], VR(0, 0), st, vt) + (raw or get(arg["beta"], BE, st, 1) + get(arg["g"], GI, st, 1))
+            + get(arg["seen"], SN(0, 0), st, st) if scaled else
             "".join(get(arg[n], m(0, 0), st, kt) for n, m in (("kb", KB), ("kbe", KBE), ("qe", QE))) +
             get(arg["vb"], VB(0, 0), st, vt) + get(arg["decay"], DC(0, 0), st, st)) + get(arg["S"], SS(0, 0), kt, vt) +
            f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);" +
@@ -810,13 +841,14 @@ def unit(t, scale=1.0):  # t's rows to length scale, as transformers' l2norm of 
   f = llama.fns(t)
   return t * f.rsqrt(f.mean(t * t) * t.shape[-1] + 1e-6) * scale
 
-def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False):
+def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False, raw=None):
   """A piece's gated delta rule, from state S: each token's output and its v_new, cum (corrected's), and with state,
   the state after the piece. q and k have a matrix for each key head, which serves the value heads that follow it, as
   the conv gives them: rule takes them to length 1, q then times kd^-1/2 (unit), as transformers'
   use_qk_l2norm_in_kernel, unless they come normed. seen is as corrected takes it. On the chip it's rule_kernel's one
   launch, for a piece of one tile without state, from q and k as the conv gives them; with more, cum, the decays and
-  the scaled rows come from tensor ops in fp32 before it."""
+  the scaled rows come from tensor ops in fp32 before it. raw, what beta and g come from (deltanet's gates), lets that
+  launch make them itself for one sequence, so beta and g aren't read."""
   f, s, rep = llama.fns(q), q.shape[-2], v.shape[0] // q.shape[0]
   # on the chip for a piece of one tile, the kernel takes q and k to length 1 and makes cum, the decays and the rows
   scaled = isinstance(q, Tensor) and s <= 32 and not (state or normed)
@@ -840,11 +872,12 @@ def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False):
     decay = f.exp(f.minimum(cum - f.t(cum), 0)) * seen
   extra = (f.exp(G := cum[:, s - 1:s, :]) * ones(q.rt), near(f.t(kr * f.exp(G - cum)))) if state else ()
   out = Tensor(q.rt, 64 * st + 32 * (kt * state + scaled), vd, batch=h, dtype="fp32")  # its padding stays 0, as the inputs' does
-  if scaled: rows = (q, k, v, beta * ones_row(q.rt), g, seen)  # beta filling its tiles
+  gated = scaled and raw is not None and raw[0].cols == h  # one sequence's value heads
+  if scaled: rows = (q, k, v, *(raw if gated else (beta * ones_row(q.rt), g)), seen)  # beta filling its tiles
   else:
     e, beta = f.now(f.exp(cum)), f.now(beta)  # columns, made once: the scaled rows would each work them out again
     rows = (*map(near, (q, k, kb := kr * beta, kb * e, qr * e, v * beta)), decay)
-  key = ("rule", st, kt, vt, rep, state, q.shape[-1] if scaled else None)
+  key = ("rule", st, kt, vt, rep, state, q.shape[-1] if scaled else None, gated)
   out.run(key, lambda: rule_kernel(*key[1:]), out, *rows, S, constants(q.rt), *extra, units=h, name="rule")
   o, vnew = out[:, :s, :], out[:, 32 * st:32 * st + s, :]
   if scaled: cum = out[:, 64 * st:64 * st + s, :1]  # a copy of its tiles' first column
