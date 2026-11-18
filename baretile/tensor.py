@@ -849,7 +849,8 @@ class Tensor:
     key per query row. With window, the first visible key is window - 1 positions earlier. Read only keys
     within these bounds. With a tree, places also has a base key, then up to 6 columns of 16 bits that say which
     keys from the base on each row sees, bit b % 16 of column 2 + b / 16 for the key base + b, as a tree's tokens see
-    the cache before it and their ancestors in it. parts divides keys between workers when decode has too few units.
+    the cache before it and their ancestors in it. parts divides keys between workers when decode has too few units,
+    up to one unit a worker.
     Key length and query row count are kernel arguments, so one compiled kernel handles several lengths."""
     self._same_runtime(k, v, places)
     fidelity = FIDELITY if fidelity is None else operator.index(fidelity)
@@ -878,22 +879,16 @@ class Tensor:
     share = share and units * P <= len(xs) * len(ys)
     q, places = (_plain(t.realize()) for t in (self, places))
     k, v = k.realize(), v.realize()
-    out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
-    # the exact row count is an argument, so the key rounds it up to tiles
-    key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0 and not share, self.rt.grid if share else None,
-           max(places.cols - 2, 0))
+    out = Tensor(self.rt, self.rows, self.cols + 1, batch=self.batch, dtype="fp32")
+    # the exact row count is an argument, so the key rounds it up to tiles. Shares and parts reach other workers
+    key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0 and not share, share, max(places.cols - 2, 0),
+           tuple(self.rt.cores) if share or P > 1 else ())
     out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(),
             *places._where(), kt,
             self.rows, units=units * P, name="attention")
-    # n matrices of t, each its cols from tile at. Each sum fills its tile's 32 columns, a valid 1-column view
-    view = lambda t, n, at, cols: t._view(t.rows, cols, n, at, t.bstride)
-    if P == 1: return (view(out, self.batch, 0, self.cols) / view(out, self.batch, ht, 1)).cast("bf16")
-    # The parts as a leading axis of views (column slices of a reshape would be moved): the max of their largest scores,
-    # then one sum over them of each part's p v and sums, weighted by e^(its largest - the max), in 4 kernels
-    largest, both = (view(out, self.batch * P, at, cols)._relabel((self.batch, P)) for at, cols in
-                     ((ht + 1, 1), (0, 32 * ht + 32)))
-    t = ((largest - largest.max(1)).exp() * both).sum(1).realize()._relabel((self.batch,))
-    return (view(t, self.batch, 0, self.cols) / view(t, self.batch, ht, 1)).cast("bf16")
+    # p v over the sums, each sum filling its tile's 32 columns, a valid 1-column view
+    view = lambda at, cols: out._view(out.rows, cols, self.batch, at, out.bstride)
+    return (view(0, self.cols) / view(ht, 1)).cast("bf16")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above so autograd works on them
   @_matrices

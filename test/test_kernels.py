@@ -4,7 +4,7 @@ import numpy as np
 from baretile import bh, pci, tensix, tensor, viz
 from baretile.kernels import grid_parts
 from baretile.tensor import Tensor
-from baretile.runtime import TIMES, Runtime, compile_kernel
+from baretile.runtime import FLAGS, TIMES, Runtime, compile_kernel
 from conftest import bf16, hold, scheduled, value
 
 def kernels(rt, since):  # counts launches after launch `since`, leaving out the transfers of tobytes and frombytes
@@ -1352,10 +1352,11 @@ def test_attend(chip):
   # read in place. They cover 256-wide heads that share their positions, a KV cache in bfp8, and keys that end partway
   # through a tile, with three tile rows of queries. Then come a sliding window, and ten tile rows in units of two.
   # After those, the keys of each unit are shared out among parts, like a decode step does. Its rows share a position,
-  # and a 1,024-key bfp8 cache goes in four parts of 8 key tiles, the fewest that attention_parts gives a part. Some
-  # rows see none of a part's keys, and with positions below 32, some parts have no keys at all.
-  # The same kernels serve other lengths and row counts in the same tiles. Without parts it's two launches, the
-  # attention and the division, and it reads only what the positions reach. Rows at positions 200 to 255 of 256 read
+  # and a 1,024-key bfp8 cache goes in four parts of 8 key tiles, the fewest that attention_parts gives a part. So does
+  # a bf16 cache whose key head's two query heads share its tiles, which still go out to each other while the parts
+  # merge. Some rows see none of a part's keys, and with positions below 32, some parts have no keys at all.
+  # The same kernels serve other lengths and row counts in the same tiles. It's two launches, the attention, which
+  # merges any parts, and the division, and it reads only what the positions reach. Rows at positions 200 to 255 of 256 read
   # the positions tile of each unit, its query tiles, and its 8 tiles of keys and of values once, keeping the keys in
   # L1 between sweeps.
   rt, rng = Runtime(chip), np.random.default_rng(43)
@@ -1365,6 +1366,7 @@ def test_attend(chip):
       (4, 8, 64, 64, 2, "bfp8", False, 0, 0, 64, 1), (3, 70, 64, 40, 1, "bf16", True, 0, 0, 40, 1),
       (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 1), (2, 8, 64, 256, 1, "bf16", False, 0, 200, 256, 1),
       (2, 300, 64, 320, 2, "bf16", True, 0, 0, 320, 1), (4, 8, 64, 1024, 2, "bfp8", False, 0, 0, 1024, None),
+      (4, 8, 128, 1024, 2, "bf16", True, 0, 0, 1024, None),
       (2, 40, 128, 200, 1, "bf16", False, 50, 60, 200, 3), (4, 8, 64, 256, 1, "bf16", False, 0, 0, 30, 8),
       (2, 40, 64, 160, 1, "bf16", False, 0, 100, 160, 1), (2, 50, 64, 72, 1, "bf16", False, 0, 30, 72, 1)):
     q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
@@ -1384,11 +1386,13 @@ def test_attend(chip):
     s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.011)
-    assert parts != 1 or kernels(rt, launches) == 2
+    assert kernels(rt, launches) == 2
     # 2 units of 1 + 2 + 8 x 2 + 8 x 2 tiles. Then the division has 4 result tiles, each reading a tile of p v and
     # one of the sums.
     if lo == 200:
       assert read == 2 * (1 + 2 + 16 + 16) + 8, read
+  # Parts tell each other they're done in FLAGS, which every worker leaves zero for the next kernel
+  assert not any(chip.read32(x, y, FLAGS + 4 * i) for x, y in rt.cores for i in range(32))
 
 def test_attend_tree(chip):
   # A tree's 32 tokens after a cache, as a tree's verify runs them: each sees the cache and its ancestors among the tree's
@@ -1432,8 +1436,8 @@ def test_attend_tree(chip):
 def test_attention_unit_rows(chip, monkeypatch):
   # With one worker, a unit takes up to 8 tile rows of queries, which share each key and value tile it reads. The
   # rows' largest scores share Dst's two accumulator tiles, a quarter of a tile each. The cases cover 8 rows, a last
-  # unit of 3, a sliding window over a bfp8 cache, a repeat, a unit of 3 rows in parts, and scores whose maximum
-  # bf16 can't hold.
+  # unit of 3, a sliding window over a bfp8 cache, a repeat, a unit of 3 rows asked for in parts, and scores whose
+  # maximum bf16 can't hold. Parts stop at one unit a worker, since they merge at the end, so one worker takes no parts.
   rt, rng, used, cached = Runtime(chip, end=chip.tensix[1]), np.random.default_rng(44), [], tensor._cached
   monkeypatch.setattr(tensor, "_cached", lambda key, make: used.append(key) or cached(key, make))  # the kernels each case asks for
   for e, rows, hd, keys, rep, fmt, window, parts, R in ((1, 256, 64, 256, 1, "bf16", 0, None, 8), (2, 330, 64, 320, 2, "bf16", 0, None, 8),
@@ -1449,7 +1453,7 @@ def test_attention_unit_rows(chip, monkeypatch):
     s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.011)
-    assert any(key[:4] == ("attend", hd // 32, -(-rows // 32), R) for key in used), "a unit of R tile rows"
+    assert any(key[:4] == ("attend", hd // 32, -(-rows // 32), R) and key[8] == 1 for key in used), "a unit of R tile rows"
   q = Tensor.of(rt, [[10000] * 64] * 256)
   k = Tensor.of(rt, [[10000] * 64] * 64)
   v = Tensor.of(rt, [[1] * 64] * 32 + [[5] * 64] * 32)

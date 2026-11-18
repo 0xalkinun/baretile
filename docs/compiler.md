@@ -164,6 +164,7 @@ BRISC can't read the Tensix semaphores. TRISC0 and TRISC2 relay progress into
 | `READY` | TRISC0 | Configuration is complete |
 | `PACKED` | TRISC2 | Output is ready to send |
 | `SENT` | BRISC | Output transfers have finished |
+| `FINISHED` | TRISC2 | A unit's outputs are all in L1 |
 
 Semaphores hold at most fifteen reports. A thread must relay reports before
 posting a sixteenth. A core still has work to do while it waits. BRISC sends
@@ -266,10 +267,11 @@ L1 raise `ValueError` before allocation or launch. A supported frame with no
 space to retain keys streams them again for the second sweep.
 
 Decoding often has too few heads to occupy the workers. The implementation
-splits the keys into up to 16 parts, one unit for each worker, and combines
-their maxima, sums and weighted outputs afterwards in 4 launches, as reductions
-over the parts. With a few rows, as a decode step's or a draft's, the Llama
-model code puts a key head's query heads in the rows of one tile row, so each
-key and value tile is read once for all of them; `python3 -m baretile.models.bench`
-times a draft pass's 6 rows this way on a card. The Llama model code uses
-ordinary tensor attention for heads narrower than 64 and for gpt-oss sinks.
+splits the keys into up to 16 parts, one unit for each worker. The parts merge
+their maxima, sums and weighted outputs at the end of the same launch, reading
+each other's L1 over the NoC, so nothing partial goes to DRAM. With a few rows,
+as a decode step's, the Llama model code puts a key head's query heads in the
+rows of one tile row, so each key and value tile is read once for all of them;
+`python3 -m baretile.models.bench` times 6 rows this way on a card. The Llama
+model code uses ordinary tensor attention for heads narrower than 64 and for
+gpt-oss sinks.
