@@ -12,9 +12,10 @@ from types import SimpleNamespace
 import numpy as np
 from baretile import bh
 from baretile.runtime import compile_kernel
-from baretile.tensix import (ACROSS, DST_FREE, DST_HALF, FILLED, MATH_END, ONE, REPORT, SEM_PACKED, aim, brisc_program,
-                             fill, ins, kernel_config, mad, math_program, mul, pack, pack_program, repack, sfp_bits,
-                             sfp_const, sfp_load, sfp_store, sfpu, table, tile_of, tt, unpack_program)
+from baretile.tensix import (ACROSS, DST_FREE, DST_HALF, FILLED, MATH_END, ONE, REPORT, SEM_PACKED, UNPACKABLE, aim,
+                             brisc_program, fill, ins, kernel_config, mad, mask_rows_at, math_program, mul, pack,
+                             pack_program, repack, sfp_bits, sfp_const, sfp_load, sfp_store, sfpu, slot_base, table,
+                             tile_of, tt, unpack_program, widen)
 from baretile.tensor import Tensor, jit
 from baretile.models import gpt2, qwen
 
@@ -116,6 +117,11 @@ def rms(x, w, c, y=None):
   n = x * f.rsqrt(f.mean(x * x) + c.eps)
   return n * w + n if c.centered else n * w
 
+# The SFPU's rounding of fp32 LReg d to bf16 as the packer rounds, half up (ftob), with its constants in LRegs 6 and 7,
+# which HALF_UP loads
+def bf16_up(d): return [ins("SFPIADD", vd=d, vc=6, mod1=4), ins("SFPAND", vd=d, vc=7)]
+HALF_UP = [ins("SFPLOADI", vd=6, mod0=2, imm16=0x8000), *sfp_bits(7, 0xFFFF0000)]
+
 def rms_kernel(grid, ct, n, eps, terms=1):
   """The kernel for rms_launch: RMSNorm of an fp32 x's rows, or with 2 terms of x + y's, rounded to bf16 as they're
   read, by its fp32 scale, in one launch. A tile row of x goes to a row of the grid, and worker j of it takes its share
@@ -198,9 +204,7 @@ def rms_kernel(grid, ct, n, eps, terms=1):
             f"  for (unsigned t = 0; t < nt; t++) {{ output(h / {DST_HALF}, {OUT} + h / {DST_HALF}, "
             f"{tile_of(2, 0, 'i', 't0 + t')}); {tt(pack('h', f'{OUT} + h / {DST_HALF}', SEM_PACKED))} "
             f"h ^= {DST_HALF}; }}\n")
-  # x rounded to bf16 as the packer rounds it (ftob), with its constants in LRegs 6 and 7
-  rounded = lambda d, at: [sfp_load(d, at), ins("SFPIADD", vd=d, vc=6, mod1=4), ins("SFPAND", vd=d, vc=7)]
-  half = [ins("SFPLOADI", vd=6, mod0=2, imm16=0x8000), *sfp_bits(7, 0xFFFF0000)]
+  rounded = lambda d, at: [sfp_load(d, at), *bf16_up(d)]  # x rounded to bf16
   programs = {"sq": lambda r: rounded(0, R2) + [mul(1, 0, 0), sfp_store(1, r)],
               "sqacc": lambda r: rounded(0, R2) + [sfp_load(1, r), mad(2, 0, 0, 1), sfp_store(2, r)],
               "add": lambda r: [sfp_load(0, R2), sfp_load(1, R3), mad(2, 1, ONE, 0), sfp_store(2, R2)],
@@ -208,7 +212,7 @@ def rms_kernel(grid, ct, n, eps, terms=1):
               "norm": lambda r: rounded(0, r) + [sfp_load(1, R2), mul(2, 0, 1), sfp_load(3, R3), mul(4, 2, 3),
                                                  sfp_store(4, r)]}
   if added: programs["fadd"] = lambda r: [sfp_load(0, r), sfp_load(1, R3), mad(0, 0, ONE, 1), sfp_store(0, r)]  # x + y
-  setups = {"sq": half, "sqacc": half, "norm": half, "mean": sfp_const(6, 1 / n) + sfp_const(7, eps)}
+  setups = {"sq": HALF_UP, "sqacc": HALF_UP, "norm": HALF_UP, "mean": sfp_const(6, 1 / n) + sfp_const(7, eps)}
   library = "".join(f"__attribute__((noinline)) static void p_{p}(void) {{ {tt(sfpu([p], {}))} }}\n"
                     for p in ("sqrt", "frecip"))
   return compile_kernel(brisc_program("(a[0] < a[22] ? nt : 0)" if added else "nt", brisc, "fp32", "bf16", rects,
@@ -226,7 +230,7 @@ def rms_launch(x, w, c, y=None):
   tr, ct = -(-rows // 32), -(-cols // 32)
   most, helpers = -(-ct // len(xs)), (len(ys) - tr) * len(xs)
   if not (x.dtype == "fp32" and x.batch == 1 and w.shape[-2:] == (1, cols) and tr <= len(ys) and ct >= 2 * len(xs)
-          and not x.requires_grad and (y is None or (y.dtype, y.batch, y.rows, y.cols) == ("fp32", 1, rows, cols)
+          and not (x.requires_grad or w.requires_grad) and (y is None or (y.dtype, y.batch, y.rows, y.cols) == ("fp32", 1, rows, cols)
                                        and not y.requires_grad and most <= 16 and tr * most * len(xs) <= 2 * helpers)):
     return None
   # the weight's fp32 scale, w or 1 + w, made once and kept with it
@@ -251,6 +255,95 @@ def attends(c, w):  # whether Tensor.attend can run attention. It needs heads 64
 # Hugging Face's RoPE: x cos + (-x2, x1) sin, where x1 and x2 are the two halves of a head. x @ turn gives (-x2, x1).
 def rope(x, cos, sin, turn):
   return x * cos + (x @ turn) * sin
+
+def rope_kernel(ct, rt, n, eps, centered):
+  """The kernel for rope_launch: Qwen3's RMSNorm of each head of an fp32 qkv where qk_on says, rounded to bf16, then
+  RoPE, a head of a tile row a unit, in one launch. ct is a head's tiles, rt those that turn, and n the head's width.
+
+  Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile stride,
+  row tile stride, tile offset): the result's heads in bf16, then qkv's heads, the norm's weight (a row for each head)
+  and qk_on (a value for each head) in fp32, cos and sin in bf16 (a matrix for each head, or for at most a tile row of
+  qkv a row that all its rows take, which its tiles hold copies of), then the number of heads, the rows in the last
+  tile row (0 for 32, or for one row) and the tile rows. The result's padding rows are 0.
+
+  BRISC reads the unit's tiles of qkv, then the rest. Math sums their squares, each rounded, tile by tile and then along
+  the rows, for rsqrt(mean + eps). Then each tile is x times rsqrt(mean + eps) w (+ 1 centered), or x where qk_on is 0,
+  rounded, times cos, rounded, each op as the tensor ops round it. In the rt tiles that turn, x @ turn is the other
+  half's tile, negated in the first half: it's normed the same way, times sin and rounded, and the two products' exact
+  sum is rounded, where the FPU's add in the tensor ops aligns the smaller to the larger's 10 bits first. Past them, sin
+  isn't read, since turn is 0 there."""
+  X, half = 1, rt // 2  # slots: qkv's tiles, then the weight's, cos's, sin's and qk_on's
+  W, C = X + ct, X + 2 * ct
+  S, ON = C + ct, C + ct + rt
+  R2, R3, RC, RXP, RWP, RS = (k * DST_HALF for k in range(2, 8))  # Dst rows: the rsqrt, then a tile's operands
+  units = lambda body: (f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned t = a[0] + u, i = t / a[26], e = t % a[26];\n"
+                        f"{body}\n}}")
+  get16 = ("static void get16(unsigned base, unsigned t, unsigned slot) "
+           "{ noc_get(BANK(t), AT(base, t, 2048), SLOT(slot), 2048); }\n")  # a bf16 tile into an fp32 slot
+  brisc = units(f"  reached(frame_done[0]); for (unsigned c = 0; c < {ct}; c++) get(a[6], {tile_of(6, 'e', 'i', 'c')}, "
+                f"{X} + c); ready();\n  get(a[14], {tile_of(14, 'e', 0, 0)}, {ON});\n"
+                f"  for (unsigned c = 0; c < {ct}; c++) {{ get(a[10], {tile_of(10, 'e', 0, 'c')}, {W} + c); "
+                f"get16(a[18], {tile_of(18, 'e', 'i', 'c')}, {C} + c); }}\n"
+                f"  for (unsigned c = 0; c < {rt}; c++) get16(a[22], {tile_of(22, 'e', 'i', 'c')}, {S} + c);\n"
+                "  ready(); frame_done[0] = ++events;")
+  free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
+  fills = lambda *pairs: tt(free + [w for slot, row in pairs for w in fill(slot, row)] + FILLED)
+  wide = lambda *pairs: tt([w for slot, row in pairs for w in widen({}, slot, row)])
+  lib = lambda name: f"{tt(aim(R2))} p_{name}(); {tt(aim(0))}"  # an SFPU library program, on the tile at R2
+  calls = lambda on: f"if (c < {half}) p_o{on}1(h); else if (c < {rt}) p_o{on}2(h); else p_o{on}0(h);"
+  math = units(f"  fetched();\n  for (unsigned c = 0; c < {ct}; c++) {{ {fills((f'{X} + c', R3))} "
+               "if (c) p_sqacc(0); else p_sq(0); }\n"
+               f"  {tt(aim(R2) + ACROSS[2]('sum2') + aim(0))} p_mean(0); {lib('sqrt')} {lib('frecip')}\n"
+               f"  fetched(); unsigned on = *(volatile unsigned *){slot_base('fp32') + ON * 4096:#x} << 1;  // qk_on\n"
+               f"  for (unsigned c = 0; c < {ct}; c++) {{\n"
+               f"    unsigned q = c < {half} ? c + {half} : c - {half};  // the tile that x @ turn takes\n"
+               f"    {tt([DST_FREE])} {fills((f'{X} + c', 'h'), (f'{W} + c', R3))} {wide((f'{C} + c', RC))}\n"
+               f"    if (c < {rt}) {{ {fills((f'{X} + q', RXP), (f'{W} + q', RWP))} {wide((f'{S} + c', RS))} }}\n"
+               f"    if (on) {{ {calls(1)} }} else {{ {calls(0)} }}\n"
+               f"    if (i == a[28] - 1 && a[27]) {{ {tt(aim('h'))} {mask_rows_at('a[27]')} {tt(aim(0))} }}\n"
+               f"    {tt(MATH_END)} h ^= {DST_HALF};\n  }}\n  {tt(REPORT)}")
+  packer = units(f"  for (unsigned c = 0; c < {ct}; c++) {{ output(h / {DST_HALF}, h / {DST_HALF}, "
+                 f"{tile_of(2, 'e', 'i', 'c')}); {tt(pack('h', f'h / {DST_HALF}', SEM_PACKED))} h ^= {DST_HALF}; }}")
+  # An SFPMAD's result takes two cycles, and the stall logic doesn't see that SFPIADD reads it, so an SFPNOP goes
+  # between them (ISA SFPMAD.md, "Instruction scheduling")
+  made = lambda d: [ins("SFPNOP"), *bf16_up(d)]  # LReg d, just made, rounded to bf16
+  def normed(on, d, x, w):  # LReg d: x norm, with rsqrt(mean + eps) in LReg 0, or x, rounded
+    scale = [sfp_load(5, w), mul(5, 0, 5), *[mad(5, 5, ONE, 0)] * bool(centered), sfp_load(d, x), mul(d, d, 5)]
+    return scale + made(d) if on else [sfp_load(d, x), *bf16_up(d)]
+  def out(on, kind, r):  # kind 0: x cos. 1 and 2: minus and plus the other half's tile times sin
+    turned = [*normed(on, 3, RXP, RWP), sfp_load(4, RS), mul(3, 3, 4), *made(3), mad(1, 3, ONE, 1, neg=kind == 1), *made(1)]
+    return ([sfp_load(0, R2)] * on + normed(on, 1, r, R3) + [sfp_load(2, RC), mul(1, 1, 2), *made(1)] +
+            turned * bool(kind) + [sfp_store(1, r)])
+  programs = {"sq": lambda r: [sfp_load(0, R3), mul(1, 0, 0), sfp_store(1, R2)],
+              "sqacc": lambda r: [sfp_load(0, R3), mul(1, 0, 0), sfp_load(2, R2), mad(2, 1, ONE, 2), sfp_store(2, R2)],
+              "mean": lambda r: [sfp_load(0, R2), mul(0, 0, 6), mad(0, 0, ONE, 7), sfp_store(0, R2)]}
+  programs |= {f"o{on}{kind}": functools.partial(out, on, kind) for on in (0, 1) for kind in range(3)}
+  setups = {"mean": sfp_const(6, 1 / n) + sfp_const(7, eps)} | {p: HALF_UP for p in programs if p[0] == "o"}
+  library = "".join(f"__attribute__((noinline)) static void p_{p}(void) {{ {tt(sfpu([p], {}))} }}\n"
+                    for p in ("sqrt", "frecip"))
+  return compile_kernel(brisc_program(f"a[1] * {ct}", brisc, "fp32", "bf16", get16),
+                        unpack_program(units("fetched();"), kernel_config("fp32", "bf16", wide=True)),
+                        math_program({}, math, True, qwen.helpers(programs, setups) + library, wide=True),
+                        pack_program(packer))
+
+def rope_launch(qkv, p, c, rotary):
+  """Qwen3's q and k norm and then RoPE of qkv's heads, an fp32 batch, as attention does them, by rope_kernel: the heads
+  side by side in bf16, or None where it doesn't apply. It needs heads a whole number of tiles wide, whose turning
+  dimensions are whole tiles in each half, the norm's weight and qk_on as fuse makes them, in fp32, and bf16 tables of
+  qkv's rows, or of one row that all of at most a tile row of qkv take. rotary's turn isn't read: it's taken to be the
+  one rotary makes. Training takes the tensor ops."""
+  (cos, sin, _), w, on, (nh, rows, hd), rd = rotary, p["qk_norm"], p["qk_on"], (qkv.batch, qkv.rows, qkv.cols), turning(c)
+  ct, rt = hd // 32, rd // 32
+  if not (qkv.dtype == w.dtype == on.dtype == "fp32" and not (qkv.requires_grad or w.requires_grad) and hd % 32 == 0
+          and rd % 64 == 0 and rd and 2 * (3 * ct + rt + 2) <= UNPACKABLE and (w.batch, w.rows, w.cols) == (nh, 1, hd)
+          and (on.batch, on.rows, on.cols) == (nh, 1, 1) and
+          all(isinstance(t, Tensor) and (t.dtype, t.batch, t.cols) == ("bf16", 1, nh * hd) and
+              (t.rows == rows or t.rows == 1 and rows <= 32) for t in (cos, sin))):
+    return None
+  out, tr = Tensor(qkv.rt, rows, nh * hd, dtype="bf16"), -(-rows // 32)
+  key = ("rope", ct, rt, hd, c.eps, bool(c.centered))
+  return out.run(key, lambda: rope_kernel(*key[1:]), out.split(nh), qkv, w, on, cos.split(nh), sin.split(nh), nh,
+                 rows % 32 if rows > 1 else 0, tr, units=tr * nh, name="rope")
 
 def layer(x, y, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None, rule=None):
   """Block l: attention, then a SwiGLU MLP, each after an RMSNorm and added back. A block whose weights have a conv
@@ -291,14 +384,17 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   nh = c.heads + 2 * c.kv + (c.heads if gated else 0)  # Qwen3.5's output gate adds a head for each query head, after v's
   # Qwen3 RMS-norms each head of q and k before RoPE. It runs in fp32 from the matmul's fp32 sum and rounds once for
   # RoPE: in bf16, its scale would round once for a whole head, off by up to 2^-8, and at Qwen3-0.6B's scores near 48,
-  # 2^-8 is 0.19. v's heads and the gates' go through the same kernel, and qk_on leaves them as they are.
+  # 2^-8 is 0.19. v's heads and the gates' go through the same kernel, and qk_on leaves them as they are. On the chip,
+  # rope_launch does the norm and RoPE in one launch.
   normed = "qk_norm" in p
   qkv = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32" if normed else None)
   qkv = f.split(qkv + p["qkv_bias"] if "qkv_bias" in p else qkv, nh)  # Qwen2's bias
-  if normed:
-    r = f.rsqrt(f.mean(qkv * qkv) + c.eps)
-    qkv = f.bf16(f.where(p["qk_on"], qkv * (r * p["qk_norm"] + r if c.centered else r * p["qk_norm"]), qkv))
-  qkv = f.merge(rope(qkv, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))  # a token's heads side by side again
+  if normed and isinstance(qkv, Tensor) and (turned := rope_launch(qkv, p, c, rotary)) is not None: qkv = turned
+  else:
+    if normed:
+      r = f.rsqrt(f.mean(qkv * qkv) + c.eps)
+      qkv = f.bf16(f.where(p["qk_on"], qkv * (r * p["qk_norm"] + r if c.centered else r * p["qk_norm"]), qkv))
+    qkv = f.merge(rope(qkv, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))  # a token's heads side by side again
   heads = f.split(qkv, nh)
   kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values together. RoPE left v's heads as they were
   rounded = isinstance(kv, np.ndarray) and cache_format(c) != "bf16"  # numpy rounds them like a block-float cache

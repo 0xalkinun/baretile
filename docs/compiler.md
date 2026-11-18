@@ -213,7 +213,10 @@ fp32 elementwise operations use the SFPU, a 32-lane vector unit working on Dst.
 It implements arithmetic and the polynomial approximations used for functions
 such as exp and log. For a matrix of 2 to 16 rows, fused kernels run the SFPU on
 those rows alone, their count from the kernel's row argument; a one-row matrix's
-tile holds copies of its row, which broadcasting reads, so it runs whole.
+tile holds copies of its row, which broadcasting reads, so it runs whole. A
+product's result takes two cycles, and the stall logic doesn't hold back an
+SFPIADD, SFPSHFT, SFPSHFT2 or SFPSWAP that reads it next, so an SFPNOP goes
+between them, as `test_sfpu_scheduling` checks.
 `rounded("fp16")` rounds fp32 values to fp16's precision, to nearest even, as
 integer arithmetic on their bits, and keeps them in fp32. Packing a bf16 result
 rounds half up, while host uploads use round-to-nearest-even. The two can differ
