@@ -14,7 +14,8 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   can make the gates and the output norm itself; `qwen.conv` with `last`, `qwen.conv_state` and `qwen.carry` each take
   one launch; `qwen.predict` runs a prediction layer on its own ([models](docs/models.md#experts-and-gated-deltanet)).
 - `Tensor.attend` takes a tree's places, `serve.frontier` picks a step of a draft tree on the chip, and
-  `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows at once.
+  `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows at once,
+  and adds a block's output onto the residual stream as it does.
 - Training in `precision=bf16`, from several shards, saved and resumed, and `test/train_reference.py`
   ([training](docs/training.md)). The server enforces JSON schemas' `pattern`. `test/workload.py` times the first
   workload and runs its HTTP gate.
@@ -26,6 +27,9 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   and rounded on BRISC. Cast the rows first, or for bfp8 have the matmul that makes them pack it, as
   `a.matmul(cache, "bfp8")` does.
 - Multicasts go on NoC 1, as linked transactions, so a token's matmul shares A's row while B streams on NoC 0.
+- `llama.layer(x, y, ...)` takes the residual stream and the last block's output, and returns the same pair: the
+  next norm adds them. Pass `None` for y to the first block, and finish with `x, h = llama.rms(x, w["norm"], c, y)`.
+  `llama.rms` with y returns the sum and its norm.
 - Faster kernels: attention for a few rows reads each key and value tile once for a key head's query heads, and takes
   p from `exp16`; the SFPU works on a matrix's live rows alone; `gather`, `put`, `topk` and a single row's upload read
   or spread less; `assign` moves straight into a new destination; the bfp4 cast rounds a matrix's live rows alone.

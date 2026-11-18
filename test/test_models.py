@@ -1305,26 +1305,34 @@ def test_llama_layer(chip, n):
   on = lambda a: Tensor.of(rt, a.tolist())
   cache, np_cache = on(np.zeros((6, n, 64))), np.zeros((6, n, 64))
   places = Tensor.of(rt, [list(range(n))], "int32")
-  got = llama.layer(on(x), {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn)), (on(mask), places.reshape(1, n, 1), 0), cache, places)
-  want = llama.layer(x, p, c, (np.float64(cos), np.float64(sin), turn), np.float64(mask), np_cache, range(n))
+  got = llama.layer(on(x), None, {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn)),
+                    (on(mask), places.reshape(1, n, 1), 0), cache, places)
+  want = llama.layer(x, None, p, c, (np.float64(cos), np.float64(sin), turn), np.float64(mask), np_cache, range(n))
+  got, want = got[0] + got[1], want[0] + want[1]  # the stream after the block
   change = np.abs(want - x).max()
   assert change > 0.5 and np.abs(np.array(got.tolist()) - want).max() < 0.03 * change, (np.abs(np.array(got.tolist()) - want).max(), change)
 
 def test_rms_kernel(chip):
   # A few long fp32 rows, a verify's or a draft's, take RMSNorm in one launch (llama.rms_kernel): x rounded to bf16, its
   # rows' sums exchanged by the workers of a grid row, scaled by w or 1 + w. Within a bf16 step of the same in numpy,
-  # also with rows past the last tile's and columns that don't split evenly, and a bf16 x takes the expressions.
+  # also with one row, rows past the last tile's and columns that don't split evenly, and a bf16 x takes the
+  # expressions. With y, the same launch norms x + y, and the sum it writes is fp32's to the bit. 96 rows are more than
+  # the grid's other rows can add, so there the add is a launch of its own.
   rt, rng = Runtime(chip), np.random.default_rng(13)
-  for rows, cols, centered in ((32, 4096, True), (6, 1056, False), (40, 1000, True)):
-    x, w = rng.normal(0, 3, (rows, cols)).astype(np.float32), bf16(rng.normal(0, 0.5, (1, cols)))
-    xb, c = bf16(x).astype(np.float64), SimpleNamespace(eps=1e-6, centered=centered)
-    want = xb / np.sqrt((xb * xb).mean(-1, keepdims=True) + 1e-6) * (w + 1 if centered else w)
-    tx, tw = Tensor.frombytes(rt, rows, cols, x.tobytes(), 1, "fp32"), Tensor.of(rt, w.tolist())
+  for rows, cols, centered in ((32, 4096, True), (1, 4096, False), (6, 1056, False), (40, 1000, True), (96, 4096, True)):
+    (x, y), w = (rng.normal(0, 3, (rows, cols)).astype(np.float32) for _ in range(2)), bf16(rng.normal(0, 0.5, (1, cols)))
+    fp32, c = lambda a: Tensor.frombytes(rt, rows, cols, a.tobytes(), 1, "fp32"), SimpleNamespace(eps=1e-6, centered=centered)
+    tx, ty, tw = fp32(x), fp32(y), Tensor.of(rt, w.tolist())
     llama.rms(tx, tw, c)  # makes w's scale, kept with it
-    before = rt.launches
-    got = llama.rms(tx, tw, c)
-    assert got.dtype == "bf16" and rt.launches == before + 1
-    assert np.abs(value(got) - want).max() <= 2**-7 * np.abs(want).max()
+    for s, got in ((x, lambda: llama.rms(tx, tw, c)), (x + y, lambda: llama.rms(tx, tw, c, ty))):
+      before, got = rt.launches, got()
+      assert rt.launches == before + 1 + (s is not x and rows == 96)
+      if s is not x:
+        total, got = got
+        assert total.dtype == "fp32" and total.tobytes() == s.tobytes()
+      sb = bf16(s).astype(np.float64)
+      want = sb / np.sqrt((sb * sb).mean(-1, keepdims=True) + 1e-6) * (w + 1 if centered else w)
+      assert got.dtype == "bf16" and np.abs(value(got) - want).max() <= 2**-7 * np.abs(want).max()
   assert llama.rms_launch(Tensor.of(rt, x.tolist()), Tensor.of(rt, w.tolist()), c) is None  # bf16
 
 def test_kv_cache(chip):
@@ -1950,12 +1958,13 @@ caches = [llama.kv_cache(c, 32, llama.zeros(rt)) for rt in rts]
 f = llama.fns(up[0]["norm"])
 x = f.rows(up[0]["embed"], Tensor.of(rts[0], [ids], "int32"))
 ch, (_, back) = next(iter(links_a.items()))
+y = None
 for l, n in ((0, 0), (1, 1)):
-  if x.rt is not rts[n]: x = x.to(rts[n], ch, back)  # the hidden state crosses the link
+  if x.rt is not rts[n]: x, y = (x + y).realize().to(rts[n], ch, back), None  # the hidden state crosses the link
   rotary = (f.rows(up[n]["cos"], places[n]), f.rows(up[n]["sin"], places[n]), up[n]["turn"])
   p = gpt2.block(up[n], f"layers.{l}.")
-  x = llama.layer(x, p, c, rotary, gpt2.mask(places[n], 32), caches[n][l], places[n], l, True)
-got = llama.logits(f.mm(f.rows(llama.rms(x, up[1]["norm"], c), [4]), up[1]["embed.T"], None))
+  x, y = llama.layer(x, y, p, c, rotary, gpt2.mask(places[n], 32), caches[n][l], places[n], l, True)
+got = llama.logits(f.mm(f.rows(llama.rms(x, up[1]["norm"], c, y)[1], [4]), up[1]["embed.T"], None))
 assert np.abs(got - want).max() < 0.02 * np.ptp(want) and got.argmax() == want.argmax(), (np.abs(got - want).max(), np.ptp(want))
 print("ok")
 """
