@@ -952,7 +952,7 @@ def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False, raw=None):
   key = ("rule", st, kt, vt, rep, state, q.shape[-1] if scaled else None, gated)
   out.run(key, lambda: rule_kernel(*key[1:]), out, *rows, S, constants(q.rt), *extra, units=h, name="rule")
   o, vnew = out[:, :s, :] if gated else norm(out[:, :s, :]), out[:, 32 * st:32 * st + s, :]
-  if scaled: cum = out[:, 64 * st:64 * st + s, :1]  # a copy of its tiles' first column
+  if scaled: cum = out[:, 64 * st:, :].filled(0, s)  # the kernel fills cum's tiles
   return (o, vnew, cum, out[:, 64 * st:64 * st + kd, :]) if state else (o, vnew, cum)
 
 def carry_kernel(st, kt, vt, rep, per):

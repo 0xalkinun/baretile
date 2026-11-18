@@ -1817,7 +1817,11 @@ def test_delta_tree(chip):
       o, vnew, cum = qwen.rule(q, k, v, beta, g, S, seen)
       z = raw[4].reshape(m, 4, 32).transpose(1, 0, 2)
       want = o * ((o * o).mean(-1, keepdims=True) + 1e-6) ** -0.5 * raw[5] * z / (1 + np.exp(-z)), vnew, cum
-      got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), raw=(*(up(a[None]) for a in raw), 1e-6))
+      ins = [up(a) for a in (q, k, v, beta, g, S, seen, *(a[None] for a in raw))]
+      since, got = rt.launches, qwen.rule(*ins[:7], raw=(*ins[7:], 1e-6))
+      for t in got: t.realize()
+      # the rule's launch, then a copy each of o's and v_new's 20 rows from its output, of which cum is a view
+      assert rt.launches - since == 3, rt.launches - since
       assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
   # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree, with deltanet's raw
   qwen.rule_kernel(1, 4, 4, 2, False, 128, (1e-6, 128))
