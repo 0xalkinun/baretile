@@ -1290,7 +1290,8 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False, scan=None):
   row, tile offset and rows, then the labels' address, tile strides and offset].
 
   BRISC does it alone. A unit is a row of a tile row in a part of x, so a decode step's few rows spread over as many
-  workers. With up to 8 rows in x, units read their row's runs. With more, a worker reads the part's tile row once for
+  workers. A worker with up to 8 units, or with up to 8 rows in x, reads its units' rows' runs: many workers reading
+  one tile row whole would all read its tiles from the same banks. Otherwise a worker reads the part's tile row once for
   all its units in it. BRISC scans the row run by run and keeps the k best so far in a heap, with the worst at the
   root. Of equal values, the later column counts as worse. A better value replaces the root. Values compare by a key,
   which is the bf16 or fp32 bits as an unsigned integer, with negatives flipped and -0 as 0. Once the worst kept value
@@ -1320,9 +1321,9 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False, scan=None):
     raise ValueError("with parts, k and cols must be multiples of 32")
   if ct > topk_room(dtype, k): raise ValueError("a part's tile row doesn't fit in L1")
   value = "unkey(top[{0}])" if scan else "x[col[{0}] / 32 * 1024 + at(s, col[{0}] % 32)]"
-  scan = scan or f"""if (t != held || rows <= 8) {{  // up to 8 rows read their runs, more the tile row once a worker
+  scan = scan or f"""if (t != held || few) {{  // few: each unit its row's runs (a[1] units), else the tile row once
         for (unsigned j = 0; j < {ct}; j++)
-          if (rows <= 8) for (unsigned f = 0; f < 2; f++) {{
+          if (few) for (unsigned f = 0; f < 2; f++) {{
             unsigned o = at(s, 16 * f) * {item};
             noc_get(BANK(first + j), AT(a[4], first + j, {tb}) + o, X + j * {tb} + o, {16 * item});
           }}
@@ -1389,7 +1390,7 @@ void kmain(volatile unsigned *a) {{
   volatile unsigned *ids = (volatile unsigned *)IDS;
   // the k best so far. last is the key of the worst kept. While that value has no sign bit, raw holds its bits, and a
   // later value beats it if it's bigger as a signed integer. This costs one compare where the key costs four.
-  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, top[{k}], col[{k}], kept, last;
+  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, top[{k}], col[{k}], kept, last, few = rows <= 8 || a[1] <= 8;
   int raw;
   for (unsigned u = 0; u < a[1]; u++) {{
     // row r of tile row i of x, in part p of matrix b. first is the part's first tile
