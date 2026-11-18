@@ -40,7 +40,7 @@ def test_layers():
     theirs = {name for q in trees if q != p for name in defined[q] if private(name)} - defined[p]
     assert not used[p] & theirs, f"{p.name} uses another file's private {sorted(used[p] & theirs)}"
 
-CORE, BUDGET, WIDTH = ("bh", "pci", "chip", "runtime", "tensix", "kernels", "tensor"), 4677, 120  # layers 0 to 3
+CORE, BUDGET, WIDTH = ("bh", "pci", "chip", "runtime", "tensix", "kernels", "tensor"), 4684, 120  # layers 0 to 3
 
 def code_lines(text, width=WIDTH):
   """Count the lines of code in Python source: not its comments, blank lines or docstrings. A line counts once for

@@ -111,11 +111,13 @@ Block-float casts take a straight-through gradient in bf16: backward treats the
 quantizer as an identity, while matmul's input gradient uses the stored,
 quantized weights.
 
-`gather` reads rows by index, and `put` writes them. The models use these for
-embeddings and KV caches. `put` takes rows in its destination's dtype: cast them
-to a block-float cache's, or pack bfp8 in the matmul that makes them. It copies
-source rows and indices that overlap its destination before writing, and keeps
-singleton rows replicated across their tiles for later broadcasting. `assign`
+`gather` reads rows by index, the same rows of each matrix, and `put` writes
+them. The models use these for embeddings and KV caches. Both copy a block
+float's runs of 16 with their exponents, so a row keeps its bits. `put` takes
+rows in its destination's dtype: cast them to a block-float cache's, or pack
+bfp8 in the matmul that makes them. It copies source rows and indices that
+overlap its destination before writing, and keeps singleton rows replicated
+across their tiles for later broadcasting. `assign`
 copies its source first when source and destination overlap with different
 layouts, and `realize(into=...)` computes into a temporary when its destination
 overlaps a matmul input or an input laid out differently.

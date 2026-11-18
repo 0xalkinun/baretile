@@ -52,7 +52,7 @@ def fns(x):  # adapt NumPy and baretile operations to the same model code
     split = lambda a, n: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2)
     softmax = lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True)
     layernorm = lambda a: (a - a.mean(-1, keepdims=True)) / np.sqrt(a.var(-1, keepdims=True) + 1e-5)
-    return SimpleNamespace(rows=lambda a, ids: a[list(ids)], split=split, softmax=softmax, layernorm=layernorm,
+    return SimpleNamespace(rows=lambda a, ids: a[..., list(ids), :], split=split, softmax=softmax, layernorm=layernorm,
                            merge=lambda a: a.transpose(1, 0, 2).reshape(a.shape[1], -1), t=lambda a: a.swapaxes(-1, -2),
                            gelu=lambda a: 0.5 * a * (1 + np.tanh(math.sqrt(2 / math.pi) * (a + 0.044715 * a**3))),
                            put=lambda a, places, b: a.__setitem__((slice(None), list(places)), b))

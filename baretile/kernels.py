@@ -1174,56 +1174,69 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
 GATHER_SHORT = 4  # the most tile rows of a table that gather_kernel reads whole
 
 def gather_kernel(dtype, short=0):
-  """Copy selected tensor rows into a new tensor using BRISC.
+  """Copy selected rows of each matrix of a tensor into a new tensor using BRISC.
 
-  args: [first unit, units, out, input address, input tile stride, input tile offset,
-  result tile columns, result rows, index address, index tile offset]. Indices form an int32 row.
+  args: [first unit, units, out, the input's address, tile strides for batch and row, and tile offset, result tile
+  columns, result rows, index address, index tile offset]. Indices form an int32 row, the same for every matrix.
 
   Each unit writes one result tile. A worker keeps its current index tile, of which it reads only row 0, its two runs
   of 16 at 0 and 1024 bytes, since every worker of a wide result reads that tile from one bank. Then it reads two runs
   of 16 values per selected row, one from each face. DRAM reads must preserve the low six address bits, so each run is
   fetched as the containing 64-byte block. Read all blocks for a tile together, then copy the values into place. A
   table of a few tile rows reads its whole column of tiles instead, a few large reads in place of 64 small ones, which
-  bound the time, and a 4-byte run, a whole aligned 64-byte block there, goes into place by a NoC copy within L1. A
-  single-row result repeats that row throughout its tile using NoC copies within L1."""
-  tb, item = tile_bytes(dtype), ITEMSIZE[dtype]
+  bound the time, and a 64-byte run, a whole aligned block there, goes into place by a NoC copy within L1. A
+  single-row result repeats that row throughout its tile using NoC copies within L1.
+
+  From a block float, like a KV cache in bfp8 or bfp4, each run of 16 comes with its exponent as it is, so a row keeps
+  the bits it has. A long table's row also reads its tile's first 64 bytes, the exponents. BRISC copies a single row
+  down its tile itself, since an exponent is a byte. A row whose id repeats the one before reads nothing more."""
+  tb = tile_bytes(dtype)
+  run, head = (BFP[dtype] // 64, 64) if dtype in BFP else (16 * ITEMSIZE[dtype], 0)  # a run's bytes, after exponents
   if short:  # the table's column of tiles into SRC, then each row's runs from there
-    fetch = (f"for (unsigned q = 0; q < {short}; q++) {{ unsigned from = q * a[4] + j + a[5]; "
+    fetch = (f"for (unsigned q = 0; q < {short}; q++) {{ unsigned from = q * a[5] + col; "
              f"noc_get(BANK(from), AT(a[3], from, {tb}), SRC + q * {tb}, {tb}); }}")
-    run = f"SRC + id(r) / 32 * {tb} + run_of(id(r), f)"
-  else:  # row r's run in face f, through block 2 r + f of BLOCKS
-    fetch = (f"for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{ unsigned n = id(r), "
-             f"from = n / 32 * a[4] + j + a[5]; "
-             f"noc_get(BANK(from), AT(a[3], from, {tb}) + run_of(n, f) / 64 * 64, BLOCKS + (2 * r + f) * 64, 64); }}")
-    run = "BLOCKS + (2 * r + f) * 64 + run_of(id(r), f) % 64"
-  place = (f"copy({run}, SLOT + run_of(r, f), 64);" if short and item == 4 else
-           f"volatile unsigned *to = (volatile unsigned *)(SLOT + run_of(r, f)), *by = (volatile unsigned *)({run}); "
-           f"for (unsigned k = 0; k < {4 * item}; k++) to[k] = by[k];")
+    value, exponent = f"SRC + id(s) / 32 * {tb} + start(id(s), f)", f"SRC + id(s) / 32 * {tb} + run_of(id(s), f)"
+  else:  # row r's run in face f, through block 2 r + f of BLOCKS, and a block float's exponents through block r of EXPS
+    fetch = (f"for (unsigned r = 0; r < rows; r++) {{ unsigned n = id(r), from = n / 32 * a[5] + col; "
+             f"if (r && n == id(r - 1)) continue; "
+             f"for (unsigned f = 0; f < 2; f++) noc_get(BANK(from), AT(a[3], from, {tb}) + start(n, f) / 64 * 64, "
+             f"BLOCKS + (2 * r + f) * 64, 64); "
+             + (f"noc_get(BANK(from), AT(a[3], from, {tb}), EXPS + r * 64, 64); " if head else "") + "}")
+    value, exponent = "BLOCKS + (2 * s + f) * 64 + start(id(s), f) % 64", "EXPS + s * 64 + run_of(id(s), f)"
+  byte = f"((volatile unsigned char *)SLOT)[run_of(r, f)] = *(volatile unsigned char *)({exponent}); " if head else ""
+  place = (f"copy({value}, SLOT + start(r, f), 64);" if short and run == 64 else
+           byte + f"volatile unsigned *to = (volatile unsigned *)(SLOT + start(r, f)), *by = (volatile unsigned *)"
+           f"({value}); for (unsigned k = 0; k < {run // 4}; k++) to[k] = by[k];")
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
 #define IDS {DATA + tb:#x}
 #define BLOCKS {DATA + tb + 4096:#x}
-#define SRC {DATA + tb + 2 * 4096:#x}
+#define EXPS {DATA + tb + 2 * 4096:#x}
+#define SRC {DATA + tb + 2 * 4096 + 2048:#x}
 {ROWS}
 // index r of this tile's 32, in row 0
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}
-// row n's run in face f, in its tile, in bytes
-static unsigned run_of(unsigned n, unsigned f) {{ return at(n % 32, 16 * f) * {item}; }}
+// which of a tile's 64 runs is row n's in face f, and where its values start in the tile, in bytes
+static unsigned run_of(unsigned n, unsigned f) {{ return at(n % 32, 16 * f) / 16; }}
+static unsigned start(unsigned n, unsigned f) {{ return {head} + run_of(n, f) * {run}; }}
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0, held = ~0u; u < a[1]; u++) {{
-    // it: the indices' tile
-    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] - i * 32 < 32 ? a[7] - i * 32 : 32, it = a[9] + i;
-    if (it != held) for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(it), AT(a[8], it, 4096) + o, IDS + o, 64);
+    // the result tile's matrix b, tile row i and column j. it: the indices' tile. col: the input's tile in row 0
+    unsigned t = a[0] + u, tr = (a[8] + 31) / 32, b = t / (tr * a[7]), i = t / a[7] % tr, j = t % a[7];
+    unsigned rows = a[8] - i * 32 < 32 ? a[8] - i * 32 : 32, it = a[10] + i, col = b * a[4] + j + a[6];
+    if (it != held) for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(it), AT(a[9], it, 4096) + o, IDS + o, 64);
     held = it;
-    if (rows < 32) copy({ZEROS:#x}, SLOT, {tb});  // full tiles overwrite every row; partial tiles keep zero padding
+    if (rows < 32{' && a[8] > 1' if head else ''}) copy({ZEROS:#x}, SLOT, {tb});  // zero padding, for rows left unset
     noc_wait();
     {fetch}
     noc_wait();
-    for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{
-      {place}
+    // s: the row whose runs go to row r, the first of a run of equal ids. A block float's single row goes to all 32
+    for (unsigned r = 0, s = 0; r < {"(a[8] == 1 ? 32 : rows)" if head else "rows"}; r++) {{
+      if (r && r < rows && id(r) != id(r - 1)) s = r;
+      for (unsigned f = 0; f < 2; f++) {{ {place} }}
     }}
     noc_wait();
-    if (a[7] == 1) row_down(SLOT, {ITEMSIZE[dtype]});
+    {"" if head else f"if (a[8] == 1) row_down(SLOT, {run // 16});"}
     noc_write(SLOT, BANK(t), AT(a[2], t, {tb}), {tb});
     noc_wait();
   }}
