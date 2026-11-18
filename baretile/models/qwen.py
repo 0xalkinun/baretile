@@ -596,6 +596,49 @@ def conv(table, picks, taps, last=None):
   return out.run(("conv", picks.batch), lambda: conv_kernel(picks.batch), out, table, picks, taps, -(-width // 32),
                  m, *((table, 0xFFFFFFFF, 1) if last is None else (last, table.rows, last.rows)), units=out.tiles, name="conv")
 
+def conv_state_kernel():
+  """The kernel for conv_state, BRISC's alone, a unit a tile column. Arguments: the first unit and the number of
+  units, then four words each for last and the table (DRAM address, batch tile stride, row tile stride, tile offset)
+  and the picks, then the table's rows, last's rows and its batch. A unit reads each new row's two runs of 16 into
+  L1, from the table or from last as it was, before it writes any, then writes the runs into their rows of last, as
+  delta_kernel writes the conv state."""
+  get = "noc_get(BANK(from), AT(a[L ? 2 : 6], from, 4096) + at(r, 16 * f) * 4, RUNS + (2 * i + f) * 64, 64)"
+  put = "noc_put(RUNS + (2 * i + f) * 64, BANK(to), AT(a[2], to, 4096) + at(i % a[15], 16 * f) * 4, 64)"
+  return compile_kernel(f"""
+#define IDS {DATA:#x}
+#define RUNS {DATA + 4096:#x}
+{BANKS}
+void kmain(volatile unsigned *a) {{
+  for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(a[13]), AT(a[10], a[13], 4096) + o, IDS + o, 64);
+  noc_wait();
+  for (unsigned u = 0, n = a[15] * a[16]; u < a[1]; u++) {{
+    unsigned j = a[0] + u;
+    for (unsigned i = 0; i < n; i++) {{  // input i / sequences of sequence i % sequences, from the table or last
+      unsigned p = ((volatile unsigned *)IDS)[at(0, i)], L = p >= a[14], q = p - a[14], r = L ? q % a[15] : p % 32;
+      unsigned from = L ? {tile_of(2, 'q / a[15]', 0, 'j')} : {tile_of(6, 0, 'p / 32', 'j')};
+      for (unsigned f = 0; f < 2; f++) {get};
+    }}
+    noc_wait();
+    for (unsigned i = 0, to; i < n; i++) for (unsigned f = 0; f < 2; f++) to = {tile_of(2, 'i / a[15]', 0, 'j')}, {put};
+    noc_wait();
+  }}
+}}""")
+
+def conv_state(last, table, picks):
+  """Write into the conv state last (conv - 1, sequences, width, as deltanet keeps it), in place, the rows that picks
+  names, as conv's do: sequence b's input j is pick j sequences + b, a row of table or, past its rows, of last as it
+  was. picks is an int32 row, its indices unchecked, as conv's. On the chip, conv_state_kernel's one launch: commit's
+  conv state after a path, from verify's rows and the state before it."""
+  if isinstance(last, np.ndarray):
+    rows = np.concatenate([table.reshape(-1, table.shape[-1]), last.reshape(-1, last.shape[-1])])[np.ravel(picks)]
+    last[...] = rows.reshape(last.shape)
+    return last
+  if not (table.batch == 1 and table.dtype == last.dtype == "fp32" and table.cols == last.cols and
+          picks.dtype == "int32" and picks.shape[-2:] == (1, last.batch * last.rows) and picks.cols <= 32):
+    raise ValueError("conv_state needs fp32 rows of the state's width, and an int32 row of 32 picks or fewer")
+  return last.run(("conv_state",), conv_state_kernel, last, table, picks, table.rows, last.rows, last.batch,
+                  units=-(-last.cols // 32), name="conv_state")
+
 R2, R3 = 2 * DST_HALF, 3 * DST_HALF  # where an op fills tiles for the SFPU beside its result, as Dst rows for half 0
 
 class Tiles:

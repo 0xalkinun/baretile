@@ -1760,6 +1760,18 @@ def test_conv_last(chip):
   got = value(qwen.conv(up(table), up(picks).cast("int32"), up(taps), up(last)))
   assert np.abs(got - want).max() / np.abs(want).max() < 1e-5
 
+def test_conv_state(chip):
+  # qwen.conv_state writes into the conv state the rows its picks name, from the table or from the state as it was,
+  # the rows it overwrites included, exactly.
+  rng, rt = np.random.default_rng(79), Runtime(chip)
+  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], a.tobytes(), int(np.prod(a.shape[:-2])), "fp32")
+  for seqs in (1, 2):
+    table, last = np.float32(rng.normal(0, 1, (40, 96))), np.float32(rng.normal(0, 1, (3, seqs, 96)))
+    picks = np.int32([[39, 40 + 2 * seqs, 3][j] + b for j in range(3) for b in range(seqs)])[None]  # the state's last
+    want = qwen.conv_state(last.copy(), table, picks)                                               # row moves first
+    got = qwen.conv_state(up(last), up(table), Tensor.of(rt, picks.tolist(), "int32"))
+    assert np.array_equal(value(got), want)
+
 def test_delta_rule(chip):
   # deltanet's rule takes the place of the conv and the gated delta rule, for tokens in an order of the caller's, and
   # leaves the states as they were. A rule that runs a prompt's own recurrence, from the conv inputs and gates it's
