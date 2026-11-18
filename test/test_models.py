@@ -1731,11 +1731,16 @@ def test_delta_tree(chip):
 
 def test_conv_last(chip):
   # qwen.conv reads each token's inputs from the table, or past its rows from the conv state where it lies (last): as
-  # conv over the table with last's rows after it, exactly in NumPy and within 1e-5 on the chip (the SiLU's e^x).
+  # conv over the table with last's rows after it, exactly in NumPy and within 1e-5 on the chip (the SiLU's e^x), for
+  # picks at random
   rng, rt = np.random.default_rng(73), Runtime(chip)
   seqs, m, width, n = 2, 40, 96, 4
   table, last, taps = rng.normal(0, 1, (seqs * m, width)), rng.normal(0, 1, (n - 1, seqs, width)), rng.normal(0, 1, (n, 1, width))
   picks = rng.integers(0, seqs * m + (n - 1) * seqs, (n, 1, 50))
+  # and runs of rows in order, which conv copies a run at a time: across a face's 16 rows and a tile's 32, on either
+  # side, and from the table's last rows into last's
+  picks[0, 0, 10:26], picks[1, 0, 28:44], picks[3, 0, 5:19] = range(70, 86), range(3, 19), range(24, 38)
+  picks[2, 0, :] = range(50)
   want = qwen.conv(np.concatenate([table, last.reshape(-1, width)]), picks[:, 0], taps)
   assert np.array_equal(qwen.conv(table, picks[:, 0], taps, last), want)
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), int(np.prod(a.shape[:-2])), "fp32")
