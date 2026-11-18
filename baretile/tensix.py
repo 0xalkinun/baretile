@@ -335,6 +335,22 @@ def exp(base2, nan=False):
                                          ins("SFPSHFT", vd=r, mod1=1, imm12=23), mul(4, 4, r))],
            *([sfp_load(0), CC_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), CC_OFF] if nan else []), sfp_store(4)])
 
+EXP16_P = [0.05313124, 0.2425207, 0.6937807]  # 2^r = 1 + r (c2 r^2 + c1 r + c0) on [-1/2, 1/2], 2e-4
+
+def exp16():
+  """e^x to bf16's precision, 2e-4, for softmax's p, in half exp's steps. t = x log2(e) is clamped to [-125, 127], n =
+  round(t) as in exp, 2^(t - n) comes from a cubic, and 2^n from its exponent bits. Below -125, as for a masked key's
+  -inf, it gives 2^-125 (2e-38) rather than 0, which a row's sum, at least the 1 of its largest, doesn't see."""
+  c2, c1, c0 = EXP16_P
+  return (sfp_const(1, 1 / math.log(2)) + sfp_const(2, c2) + sfp_const(3, c1),
+          [sfp_load(), mul(0, 0, 1), sfp_bf16(5, -125.0), ins("SFPSWAP", vd=5, vc=0, mod1=1), sfp_bf16(5, 127.0),
+           ins("SFPSWAP", vd=0, vc=5, mod1=1),  # t within [-125, 127]
+           sfp_bf16(6, 1.5 * 2**23), mad(4, 0, ONE, 6), mad(7, 4, ONE, 6, neg=2),  # LReg 7: n
+           ins("SFPIADD", vd=6, vc=4, mod1=6), mad(5, 7, ONE, 0, neg=1),  # LReg 6: n as an integer, 5: r = t - n
+           mad(4, 2, 5, 3), *sfp_const(7, c0), mad(4, 4, 5, 7), mad(4, 4, 5, ONE),  # 1 + r (c2 r^2 + c1 r + c0)
+           ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=127), ins("SFPSHFT", vd=6, mod1=1, imm12=23), mul(4, 4, 6),
+           sfp_store(4)])
+
 def recip(nan=False):
   """1/x: the 7-bit estimate y from SFPARECIP, then two Newton steps y += y e, with e = 1 - x y. The estimate is inf
   for 0 and denormals and 0 for inf, where e is 0 * inf = NaN. The steps only run where the first e is below 1 in
@@ -417,8 +433,9 @@ SFPU = {
   # max(x, 0). SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc. It only picks a value, so the
   # raw store works for int32 too.
   "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, mod0=RAW)]),
-  "exp": exp(False), "exp2": exp(True), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
-  "fexp": exp(False, True), "fexp2": exp(True, True), "recip": recip(), "frecip": recip(True), "sqrt": sqrt(),
+  "exp": exp(False), "exp16": exp16(), "exp2": exp(True), "fexp": exp(False, True), "fexp2": exp(True, True),
+  "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
+  "recip": recip(), "frecip": recip(True), "sqrt": sqrt(),
 }
 # Binary ops on the SFPU. x and y reach Dst by being added to zero, x at the op's Dst half and y 128 rows further on.
 # They load into LRegs 0 and 1, and the result is stored over x. Comparisons give 1.0 or 0: the all ones or 0 from

@@ -1251,6 +1251,13 @@ def test_sfpu(chip):
   check(tx.exp().tolist(), x, exp)
   check(tx.reciprocal().tolist(), x, recip)
   check((tx + ty).exp().tolist(), [[a + b for a, b in zip(ra, rb)] for ra, rb in zip(x, y)], exp)
+  # exp16, attention's e^x for p, is within a bf16 step too, from x = -86, where e^x is normal, up to 88. Below it gives
+  # at most 2^-124, as for a masked key's -inf. It runs on any input, and clamps past 88 where exp gives inf.
+  for got, row in zip(tx._unary("exp16").tolist(), x):
+    for g, v in zip(got, row):
+      v = flush(v)
+      assert (abs(g - math.exp(v)) <= math.exp(v) * 2**-7 if -86 <= v <= 88 else 0 <= g <= 2**-124 if v < -86 else
+              g > 1e38), (v, g)
   # relu fused onto a matmul plus an add is one launch. Rounding commutes with relu, so it matches op by op bit for bit.
   a, b, c = (Tensor.of(rt, [[bf(random.uniform(-1, 1)) for _ in range(64)] for _ in range(64)]) for _ in range(3))
   launches, fused = rt.launches, ((a @ b) + c).relu().tolist()

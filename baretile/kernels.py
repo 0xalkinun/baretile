@@ -896,7 +896,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   kept = f"(kt - k0 < {room})" if keep else "0"  # the key row is in the store
   cfg = kernel_config()
   first, onto = accumulating(oacc, False), accumulating(oacc, True)  # pack the output tiles in fp32, then add onto them
-  replays = allocate({"mmT", "mm", "exp", "one"} | ({"none"} if parts > 1 else set()))
+  replays = allocate({"mmT", "mm", "exp16", "one"} | ({"none"} if parts > 1 else set()))
   # Row r's largest scores are a quarter of accumulator tile r / 4: the even columns of its left faces, moved on 16
   # rows to the right faces and 2 to the odd columns as r % 4 picks. A tile of scores is at S, past the halves.
   acc, S = ACCS[0][0], 2 * DST_HALF
@@ -1051,7 +1051,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
                     f"if (kt == k0) {{ {kept_max(True)} }} else {{ {kept_max(False)} }}"),
                # each row's largest, for the packer
                each(f"{begin} {spread('0')} {tt(MATH_END)} h ^= {DST_HALF};") if parts > 1 else "",
-               each(f"{begin} {scores('add', 'h')} {spread(f'{S} - h')} {subtract} {tt(sfpu(['exp'], replays))} "
+               each(f"{begin} {scores('add', 'h')} {spread(f'{S} - h')} {subtract} {tt(sfpu(['exp16'], replays))} "
                     f"{tt(MATH_END)} h ^= {DST_HALF};") +
                " " + each(f"for (unsigned j = 0; j < {ht}; j++) {{ {product} }}") + " " + each(product), "")
   out = lambda j: f"r * {T} + {j}"  # row r's output tile j. Its sums are at j = ht and its largest at ht + 1
