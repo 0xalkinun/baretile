@@ -62,7 +62,7 @@ jobs:
       - run: python -m baretile.chip ttsim
       - run: >-
           python -m pytest -rs test/test_device.py::test_size test/test_models.py -k
-          "test_size or test_doc_links or test_readme_examples or test_website_matches_readme"
+          "test_size or test_doc_links or test_doc_size or test_readme_examples or test_website_matches_readme"
         env:
           SKIPS: fail
       - run: python -m build

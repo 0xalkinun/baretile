@@ -2,9 +2,8 @@
 
 This page lists what you can build on, and what it promises. Names it doesn't
 list, and names that start with an underscore, are internal and change freely.
-baretile is pre-alpha. A P150a has run bring-up through its probe stage, but a
-few kernel and model tests still fail there, so everything below is promised on
-ttsim only.
+baretile is pre-alpha. The tests behind each promise run on ttsim, and on a card
+as [the README](../README.md#status) says.
 
 baretile has its own small frontend, `tensor.Tensor`, which its models are
 written in. tinygrad programs also run on baretile, through the adapter, which
@@ -38,7 +37,7 @@ which [#7](https://github.com/0xalkinun/baretile/issues/7) defines.
 | `baretile.tensix`, `baretile.kernels` | Tensix code generation and the kernels | experimental |
 | `python3 -m baretile.models.serve` and its HTTP API | The OpenAI-compatible server | stable |
 | `python3 -m baretile.models.train` | Training GPT-2 from scratch | experimental |
-| `baretile.models` from Python: `llama`, `qwen`, `gpt2`, `serve`, `train`, `cost` | Loading, running and training models | experimental |
+| `baretile.models` from Python: `llama`, `qwen`, `gpt2`, `serve`, `train`, `cost`, and `python3 -m baretile.models.bench` | Loading, running and training models, and timing a decode or verify step | experimental |
 | `baretile.adapters.tinygrad_device`, `BARETILE_REPORT` | The tinygrad device, and its report of what ran on tinygrad's CPU | experimental, since it calls tinygrad's internals |
 
 ## What you can rely on
@@ -102,18 +101,13 @@ Each promise names the test that checks it.
 ### jit
 
 - `jit(f)` runs the first call normally, records the second, and replays its
-  launches from the third, on each call's inputs where they are. An input laid
-  out unlike a new tensor, such as a slice, is copied in, and back out if `f`
-  writes it. [`test_jit`](../test/test_kernels.py),
-  [`test_jit_writes_inputs`](../test/test_kernels.py)
-- Results and retained tensors reuse their buffers, so the next call overwrites
-  them. An input's `.grad` holds the latest call's gradient instead of adding
-  up. [`test_recording_lifetime_and_reuse`](../test/test_kernels.py),
-  [`test_jit_input_grads`](../test/test_kernels.py)
-- The same tensor can be passed twice, and a returned view of an input is on
-  that call's input, or on jit's copy of an input it had to copy in. Keep inputs
-  that `f` writes apart from each other and from captured tensors that `f` only
-  reads.
+  launches from the third, on each call's inputs where they are, by the rules
+  that [recording repeated work](runtime.md#recording-repeated-work) gives:
+  which inputs it copies, which aliases it can't replay, and that results reuse
+  their buffers. [`test_jit`](../test/test_kernels.py),
+  [`test_jit_writes_inputs`](../test/test_kernels.py),
+  [`test_recording_lifetime_and_reuse`](../test/test_kernels.py),
+  [`test_jit_input_grads`](../test/test_kernels.py),
   [`test_jit_input_aliases`](../test/test_kernels.py),
   [`test_jit_returned_views`](../test/test_kernels.py)
 
@@ -148,12 +142,10 @@ are the ones a caller meets first:
   `POST /v1/completions` and `POST /v1/chat/completions` in OpenAI's format,
   streamed or not. [`test_serve_http`](../test/test_models.py),
   [`test_serve_chat`](../test/test_models.py)
-- An invalid request gets HTTP 400 before it takes a slot, and a request that
-  finds no free slot gets 429 at once.
+- An invalid request, a full server, and a request past the input and
+  connection limits get the HTTP errors that [serving](models.md#serving)
+  lists, before they take a slot.
   [`test_serve_bad_requests`](../test/test_models.py),
-  [`test_serve_http`](../test/test_models.py)
-- A request whose headers and body take longer than the input wait gets 408,
-  once its request line has arrived, and a body over the limit 413. Connections
-  past the server's limit get 503, and past one address's share 429.
+  [`test_serve_http`](../test/test_models.py),
   [`test_http_input_limits`](../test/test_models.py),
   [`test_http_connection_limits`](../test/test_models.py)

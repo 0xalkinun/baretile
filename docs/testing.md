@@ -6,47 +6,48 @@ the programs a kernel runs, and what to do when a kernel hangs.
 
 ## Running the tests
 
-Run these from the checkout with Python 3.12 or later, clang and ld.lld on
-`PATH`. They use the simulator that `python3 -m baretile.chip ttsim` downloads,
-or the `libttsim.so` that `TTSIM` names. You'll need NumPy and pytest for the
-tests.
+Set up baretile and ttsim as [Try it](../README.md#try-it) does, then run these
+from the checkout, with clang and ld.lld on `PATH`:
 
 ```sh
+python3 -m pip install numpy pytest ruff
 python3 -m baretile.chip ttsim
 python3 -m pytest -s test
+ruff check
 ```
 
-The whole suite takes several minutes on ttsim. To run one layer at a time:
-
-```sh
-python3 -m pytest -s test/test_device.py
-python3 -m pytest -s test/test_kernels.py
-python3 -m pytest -s test/test_models.py
-```
-
-With [pytest-xdist](https://pypi.org/project/pytest-xdist/) installed,
+The tests use the simulator that `python3 -m baretile.chip ttsim` downloads, or
+the `libttsim.so` that `TTSIM` names. The whole suite takes several minutes on
+ttsim. With [pytest-xdist](https://pypi.org/project/pytest-xdist/) installed,
 `-n auto` runs the tests in a process for each CPU, each with its own
 simulator, as CI does.
 
 The tests follow the layers of the code. `test_device.py` starts at PCIe access
 and goes through the runtime. `test_kernels.py` tests the instructions and the
 tensor operations built from them. Models, the server, the adapters and the
-[ramps](../ramps) are in `test_models.py`, and so are `test_readme_examples`,
-which runs the README's Python examples and checks what they print, and
-`test_doc_links`, which checks every link to a file of the repository and its
-anchor. `test_layers` checks that each module imports only the layers below it.
-Each test seeds `random` from its own id, so a failure repeats in any order or
-worker.
+[ramps](../ramps) are in `test_models.py`. So are the doc checks:
+`test_readme_examples` runs the README's Python examples and checks what they
+print, `test_doc_links` checks every link to a file of the repository and its
+anchor, and `test_website_matches_readme` checks the homepage's code against the
+README's. `test_layers` checks that each module imports only the layers below
+it, and `test_size` the core's line budget. Each test seeds `random` from its
+own id, so a failure repeats in any order or worker.
 
 If pytest exits without explaining why, run it with `-s` and without `-n`. ttsim
 stops the process on errors such as an invalid address or decrementing an empty
-semaphore. pytest can otherwise hide that error message. The tests share a
+semaphore, and pytest can otherwise hide that error message. The tests share a
 `Chip` because the simulator can only be initialized once per process.
 
 The runtime compiles device programs with clang for `riscv32-unknown-elf` and
 links them with lld. Builds go in `$XDG_CACHE_HOME/baretile`, which is
-`~/.cache/baretile` by default, so you won't have to
-compile them again on the next run. Entries expire after a week without use.
+`~/.cache/baretile` by default, so you won't have to compile them again on the
+next run. Entries expire after a week without use.
+
+`PART=i/n` runs part i of n of the tests, split so the parts take about as long
+by the seconds each test took in [test/durations.json](../test/durations.json).
+`DURATIONS=write` rewrites that file from the tests a run runs, so run the whole
+suite with it after adding slow tests. `SKIPS=fail` turns a skip into a
+failure.
 
 ## Optional checks
 
@@ -54,18 +55,17 @@ Most model tests use small configurations. To compare against transformers,
 install PyTorch and a transformers release that includes the model you're
 testing. The MXFP4 test also needs safetensors, `test_tokenizer` needs
 tiktoken, and the adapter tests need tinygrad at the commit that CI pins (see
-[models](models.md#tinygrad-and-pytorch)). With a checkout in `TINYGRAD`, they
+[adapters](adapters.md#running-a-program)). With a checkout in `TINYGRAD`, they
 fail instead of skipping when tinygrad doesn't import. Check pytest's skipped
-tests if you expected one of these comparisons to run, or set `SKIPS=fail`,
-which turns a skip into a failure.
+tests if you expected one of these comparisons to run, or set `SKIPS=fail`.
 
 CI's test job doesn't install these, so its `references` job does, at pinned
 versions, and runs the comparisons with `SKIPS=fail`: `test_train`,
-`test_train_gpt2`, `test_llama_frequencies`, `test_tokenizer`,
-`test_tokenizer_gate`, `test_hf_families`, `test_qwen3_moe`,
+`test_train_gpt2`, `test_train_reference`, `test_llama_frequencies`,
+`test_tokenizer`, `test_tokenizer_gate`, `test_hf_families`, `test_qwen3_moe`,
 `test_qwen3_5_moe`, `test_mxfp4`, `test_torch_frontend`,
-`test_autonomous_generation` and `test_workload_commands`. It downloads no
-checkpoints.
+`test_autonomous_generation`, `test_workload_commands` and
+`test_workload_blackhole_py`. It downloads no checkpoints.
 
 To include pretrained checkpoint checks:
 
@@ -74,50 +74,27 @@ GPT2=/path/to/gpt2/model.safetensors python3 -m pytest -s test -k gpt2_model
 LLAMA=/path/to/SmolLM-135M python3 -m pytest -s test -k llama_model
 ```
 
-Those follow NumPy's choices. To have the chip generate from its own and hold it
-to the [first workload](workload.md#correctness-gates)'s gates against
-transformers, run `python3 test/generation.py /path/to/SmolLM-135M`.
+Those follow NumPy's choices. The [first workload](workload.md#correctness-gates)
+has the commands that hold a model to its gates: generating from its own picks,
+and agreeing with Tenstorrent's reference tokens.
 
 `LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` runs n
 random expressions in the kernel fuzz test instead of 30, when n is more.
 `TTSIM2=/path/to/libttsim.so` enables the two-chip test. ttsim's releases
 include that library as `libttsim_bh_x2.so`, or you can build ttsim's
-`release_bh_x2` target.
-
-`KMD_IOCTL=/path/to/ioctl.h` checks the arguments of the ioctls that `pci.Kmd`
-sends against tt-kmd's header, compiled by clang for this host. CI uses the
-header from tt-kmd 2.11.0.
-
-`llama.accuracy` compares generated choices with Tenstorrent reference tokens:
-
-```sh
-python3 -m baretile.models.llama /path/to/model /path/to/<model>.refpt [steps] [mode] [numpy]
-```
-
-`numpy` runs the comparison on the host instead. Reading the reference file
-requires PyTorch. The usual reference procedure has a 512-token prompt and 500
-following steps. Top-1 counts how often baretile picks the reference's best
-token. Top-5 counts how often its pick is among the reference's five best
-tokens.
+`release_bh_x2` target. `KMD_IOCTL=/path/to/ioctl.h` checks the arguments of
+the ioctls that `pci.Kmd` sends against tt-kmd's header, compiled by clang for
+this host. CI uses the header from tt-kmd 2.11.0.
 
 ## Benchmarks
 
-[test/benchmark.py](../test/benchmark.py) records matmul, decode, prefill and
-serving results; its opening comment gives the commands and workload sizes.
-`load` also drives an external OpenAI-compatible completion server. It asks
-for streamed usage and reports missing token counts or cache counts as `null`.
-Per-user rates include the whole request, including first-token latency.
-First-text latency measures the first nonempty SSE text event: a chunk may
-contain several tokens, so it is not an individual token timestamp. An empty
-completion has no first-text latency.
-
-A serving workload and each TT-NN demo subprocess have a one-hour deadline.
-Python callers can set `load(..., timeout=seconds)` for shorter runs. A failed
-or timed-out workload retains completed turns, reports failures, and includes
-the unfinished requests' elapsed time in its overall rate. TT-NN subprocesses
-write output as they run to `benchmark-ttnn-<run>.log`; a timeout stops their
-process group and retains that partial log. Version and line-count subprocesses
-have a separate 60-second limit.
+[test/benchmark.py](../test/benchmark.py) runs matmul, decode, prefill and
+serving benchmarks on baretile, and the first three on TT-NN on the same card,
+and compares the two. Its opening comment gives the commands and workload
+sizes. The TT-NN runs need tt-metal's Python environment, and through sysfs the
+card [given back](bring-up.md#giving-the-card-back) first. It also needs
+PyTorch to read the reference file, and `cloc` to count lines of code. `load`
+drives any OpenAI-compatible completion server.
 
 ## Where ttsim differs from a card
 
@@ -133,8 +110,9 @@ ttsim also decodes an unexpected `XMOV` in very long loops of inline Tensix
 instructions. We don't know why. The DeltaNet kernel calls SFPU functions to
 avoid generating a loop that long.
 
-[Bring-up](bring-up.md#what-still-needs-checking) lists the behavior that we can
-only check on a card.
+The [hardware reference](hardware.md) notes what a card does that ttsim
+doesn't, and [bring-up](bring-up.md#what-still-needs-checking) lists what we
+can only check on a card.
 
 ## ttsim-chaos
 
@@ -163,45 +141,6 @@ range. The RISC-V and Tensix settings give the probability of skipping a turn.
 Set `TTSIM_CHAOS_SEED` to repeat a run. `TTSIM_CHAOS_UNHARVESTED=1` enables all
 140 Tensix tiles, so you can check the code with a larger grid.
 
-`TTSIM_CHAOS_OUTSTANDING=x,y` starts Tensix tile (x, y) with 200 requests
-counted as outstanding on NoC 0 for transaction ID 0, and `x,y,n` with n, up to
-255. A P150a's firmware leaves that tile's counter nonzero after a reset, which
-would hang a runtime that waits for it to reach 0
-([#4](https://github.com/0xalkinun/baretile/issues/4)). A new runtime zeroes the
-counters before its firmware starts, so with `TTSIM_CHAOS_OUTSTANDING=1,2`,
-`python3 -m baretile.hello` passes. Without that, it hangs at launch 1 on (1, 2),
-and the report lists `NoC requests in flight by id: {0: 200}`.
-
-CI builds ttsim-chaos this way for every push to main and every pull request
-that changes more than Markdown. With the four delay settings above, the run
-number as the seed, so each run tries other timings, and
-`TTSIM_CHAOS_OUTSTANDING=1,2`, so each process boots (1, 2) as a card leaves it,
-it runs
-`test/test_device.py` and `test/test_kernels.py`, the model-specific DeltaNet
-and MoE kernel checks (`test_delta_step`, `test_delta_pieces` and `test_moe`),
-and the kernel ramp (`test_ramp[4_kernel.py]`). The device tests cover the
-runtime's takeover, cancellation, shutdown and host memory, where timing bugs
-hide. None of them depends on exact simulated timing. CI also runs the whole
-suite with `TTSIM_CHAOS_UNHARVESTED=1`, beside the released ttsim's.
-
-CI runs on boat.dev's runners, through its GitHub App, as few, large jobs, since
-boat's plans limit how many jobs start an hour and a day. It splits its runs
-with `PART=i/n`, which runs part i of n, split so the parts take about as long
-by the seconds each test took in [test/durations.json](../test/durations.json).
-`DURATIONS=write` rewrites that file from the tests a run runs, so run the whole
-suite with it after adding slow tests. The suite on each ttsim runs as two jobs,
-each in a pytest-xdist worker for each of its runner's 8 CPUs, and each lists
-its 20 slowest tests at the end. The noise runs as one job, a process for each
-CPU on its own part. The checks job, which every run has, runs ruff once, then
-the README's examples, `test_size` and the link and website tests on ttsim with
-`SKIPS=fail`, then checks the wheel on Python 3.12 to 3.14. A pull request that
-changes only Markdown runs just that job, and skips the suite's jobs. A
-process's noise follows from the seed and the tests it runs, in order, so
-`TTSIM_CHAOS_SEED=s PART=i/n`, with the job's settings and tests, repeats a
-failed part, and the log shows all of them. A test that runs over ten minutes
-prints the stacks of its process's threads, pytest's `faulthandler_timeout`, so
-a test that hangs in CI says where.
-
 `TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
 runs a random lo to hi clocks after it leaves its thread, and the thread goes on
 meanwhile. `STALLWAIT` and `SEMWAIT` then block only the instructions their
@@ -212,9 +151,26 @@ one uses the address modes it saw when it left its thread, since tt-llk relies
 on both. The unpackers, the packer and the configuration unit still finish at
 once, so this doesn't check the waits for them.
 
+`TTSIM_CHAOS_OUTSTANDING=x,y` starts Tensix tile (x, y) with 200 requests
+counted as outstanding on NoC 0 for transaction ID 0, and `x,y,n` with n, up to
+255, as a P150a's firmware leaves a tile after a reset
+([#4](https://github.com/0xalkinun/baretile/issues/4)). A new runtime zeroes the
+counters before its firmware starts, so with `TTSIM_CHAOS_OUTSTANDING=1,2`,
+`python3 -m baretile.hello` passes. Without that, it would hang at launch 1 on
+(1, 2), with `NoC requests in flight by id: {0: 200}` in the report.
+
 The patch also implements the NIU counter for bytes received by reads.
 `pci.Sim.counts` detects the patched library. Released ttsim doesn't support
 that counter, so profiles from it report `None` for bytes.
+
+For every push to main and every pull request that changes more than Markdown,
+CI runs the device and kernel tests, the DeltaNet and MoE kernel checks
+(`test_delta_step`, `test_delta_pieces` and `test_moe`) and the kernel ramp
+under ttsim-chaos, with the four delay settings above, the run number as the
+seed and `TTSIM_CHAOS_OUTSTANDING=1,2`. It runs them as parts, and a process's
+noise follows from the seed and the tests it runs, so
+`TTSIM_CHAOS_SEED=s PART=i/n` with the job's settings repeats a failed part. CI
+also runs the whole suite with `TTSIM_CHAOS_UNHARVESTED=1`.
 
 ## Reading a kernel's programs
 
@@ -231,10 +187,9 @@ the kernel and a hash of its image, such as `matmul-relu-1a2b3c4d/`. It has a
 `.c` file for each core with a program. Every file starts by including
 `device.h`, which holds the helpers that baretile puts before each program, so
 with `device.h` pasted in its place, a file is exactly what clang compiled.
-Diffing two dumps shows what a change did to the generated code.
-
-The [launch viewer](runtime.md#profiling) shows the same programs for the
-kernel you select.
+Diffing two dumps shows what a change did to the generated code. The
+[launch viewer](runtime.md#profiling) shows the same programs for the kernel you
+select.
 
 ## Printing from a kernel
 
@@ -252,21 +207,19 @@ the core and the launch that printed it:
 (1, 2) BRISC, launch 3 (add_relu): tile 0 of 4: 0x3f80
 ```
 
-The core leaves a record in a ring in its L1, and the host does the formatting.
-That keeps a call to a few dozen instructions, which store the format's address
-and the words. So the format must be a string literal, which the host reads from
-the kernel's image. Each argument is a 32-bit word: `%d` reads it as a signed
-int, `%u` and `%x` as an unsigned one, and `%f` as the bits of an fp32, so pass
-a float `x` as `*(unsigned *)&x`. There's no `%s`, and a line whose format
-doesn't match its words is shown raw.
+The core leaves a record in a ring in its L1, and the host does the formatting,
+so a call is a few dozen instructions. The format must be a string literal,
+which the host reads from the kernel's image. Each argument is a 32-bit word:
+`%d` reads it as a signed int, `%u` and `%x` as an unsigned one, and `%f` as the
+bits of an fp32, so pass a float `x` as `*(unsigned *)&x`. There's no `%s`, and
+a line whose format doesn't match its words is shown raw.
 
 Lines come grouped by worker, then by core. Each core's lines are in the order
 it printed them, but its four cores run at once, so lines from different cores
-aren't in time order. Each core's ring keeps its last 127 lines. When a launch
-prints more, or several do before a `wait()`, a line says how many came before
-the lines shown. A kernel that doesn't call `print` compiles to the same bytes,
-and the runtime reads the rings only after a kernel that calls it.
-[test_print](../test/test_device.py) shows each case.
+aren't in time order. Each core's ring keeps its last 127 lines, and a line says
+how many came before the lines shown. A kernel that doesn't call `print`
+compiles to the same bytes. [test_print](../test/test_device.py) shows each
+case.
 
 ## When a launch hangs
 
@@ -278,11 +231,10 @@ kernel [prints](#printing-from-a-kernel), the report ends with the last three
 lines that each of the worker's cores printed, which can show where it stopped.
 
 The 60 seconds are wall time, on ttsim too, where a launch takes as long as the
-simulator needs to run it. A large launch, such as a big model's output layer,
-or a machine that's busy with other simulators, can make a launch take longer
-without hanging. A real hang shows the same counters in reports a minute apart.
-For long checks, run one simulator at a time, or pass a longer timeout to
-`wait()`.
+simulator needs to run it. A large launch, or a machine that's busy with other
+simulators, can make a launch take longer without hanging. A real hang shows the
+same counters in reports a minute apart. For long checks, run one simulator at
+a time, or pass a longer timeout to `wait()`.
 
 If a worker never received `go`, check dispatch and multicast first. If the
 workers finished but the host is still waiting, check their atomic reports and

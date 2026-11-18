@@ -1994,6 +1994,20 @@ def test_doc_links():
       if not path.exists() or anchor and path.suffix == ".md" and anchor not in headings(path): broken.append(f"{page.name}: {target}")
   assert not broken, broken
 
+DOC_LINES = {"README.md": 160, "CONTRIBUTING.md": 140, "docs/README.md": 80, "docs/api.md": 160, "docs/runtime.md": 240,
+             "docs/compiler.md": 280, "docs/kernels.md": 80, "docs/models.md": 290, "docs/adapters.md": 100, "docs/training.md": 115,
+             "docs/testing.md": 250, "docs/hardware.md": 260, "docs/bring-up.md": 150, "docs/workload.md": 110}
+
+def test_doc_size():
+  # Each page stays within its line budget, so a page that's full loses something before it gains something, and a new
+  # page in docs/ comes with a budget. The changelog grows with each release and has none.
+  root = pathlib.Path(__file__).parent.parent
+  pages = {str(p.relative_to(root)): len(p.read_text().splitlines())
+           for p in [root / "README.md", root / "CONTRIBUTING.md", *root.glob("docs/*.md")]}
+  assert set(pages) == set(DOC_LINES), f"pages without a budget, or budgets without a page: {sorted(set(pages) ^ set(DOC_LINES))}"
+  over = {p: f"{n} lines, budget {DOC_LINES[p]}" for p, n in pages.items() if n > DOC_LINES[p]}
+  assert not over, f"over their budget: {over}. Cut something first"
+
 @pytest.mark.skipif("TTSIM2" not in os.environ, reason="set TTSIM2 to ttsim's two-chip libttsim_bh_x2.so")
 def test_two_chips():
   # ttsim's two-chip build is a P300: two Blackholes joined by two Ethernet links. It runs in its own process, since a

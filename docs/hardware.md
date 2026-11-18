@@ -107,7 +107,9 @@ Telemetry reports enabled banks and training status. `Chip` waits up to
 Host memory is reached through the PCIe tile. Addresses below `2**58` use the
 direct bus-address path. Bit 60 selects the outbound iATU path used by kmd and
 UMD. The dispatcher's command reads, readback and uploads all depend on one of
-them.
+them. On a P150a, DMA reaches host memory both ways, and the dispatcher's status
+writes arrive in order. A write that the PCIe tile forwards to host memory is
+posted, so `Chip.write` reads it back.
 
 `Kmd` asks kmd to pin 2 MiB with `PIN_PAGES` and its `NOC_DMA` flag. kmd maps
 the memory through the IOMMU when it translates, programs an iATU window for it,
@@ -119,7 +121,8 @@ translating, the pages must be physically contiguous, so `Kmd` pins a hugepage.
 programming iATU windows. You'll need root for this, and the IOMMU must be
 disabled or in passthrough mode so the card can use those addresses without
 translation. The ISA's `PCIExpressTile/README.md` says ARC firmware sets up the
-direct path at boot, but we haven't seen it work on a card yet.
+direct path at boot. We haven't run `Card` on a card yet, so it's untested
+there.
 
 If it doesn't, we'll need to program the iATU. The definitions are in kmd's
 `blackhole.c`. Region r starts at BAR2 `0x1000 + 0x200*r`: base at `+0x08/0x0C`,
@@ -167,7 +170,12 @@ The tile address map comes from `TensixTile/BabyRISCV/README.md`:
 | `0xFFE00000` and above | Tensix interfaces |
 
 Private RAM and the Tensix interfaces aren't accessible through the NoC. Use
-four-byte accesses for MMIO registers.
+four-byte accesses for MMIO registers. Nor is the Tensix config bank,
+`bh.TENSIX_CFG`: on a P150a, a read of it from the host took the card off its
+PCIe link until `tt-smi -r 0` reset it, so `Chip` refuses any access there. A
+packer's offset past its L1 address wraps at 256 KiB on a card, though not on
+ttsim (`bh.PACK_REACH`), so what a kernel packs stays within that of the
+packer's address.
 
 `SOFT_RESET_0` at `0xFFB121B0` holds a core in reset when its bit is set.
 BRISC uses bit 11, TRISC0–2 use bits 12–14, and NCRISC uses bit 18. Load code
@@ -178,7 +186,11 @@ the overrides at `0xFFB12234`.
 The compiler targets `rv32im`. `.ttinsn` uses the encoding space that would
 normally hold compressed RISC-V instructions. Don't use `mhartid` to identify
 these cores, and don't use `fence.i` to reload a kernel. Firmware invalidates
-the instruction caches through Tensix configuration instead.
+the instruction caches through Tensix configuration instead. On a P150a, a
+kernel loaded where another was runs its own code, and it arrives before the
+doorbell that launches it, though the two go through different TLBs:
+`test_relaunch_without_reset` loads 32 in turn at one address, each just before
+its doorbell, on every worker.
 
 Unsupported instructions have undefined behavior instead of trapping. Use
 instructions from the subset in the existing device programs.
@@ -199,7 +211,9 @@ low four address bits for L1, or low six when DRAM is involved. Wait for an
 initiator to become free before changing its registers, and read back its
 command register before consulting completion counters. Writes and atomics must
 request acknowledgements (`NOC_CMD_RESP_MARKED`) to be counted; reads are always
-answered.
+answered. On a card, an initiator can hold a request before the NIU counts it,
+so `noc_wait` waits for the initiators to be free first, and the NIU counts
+requests in flight modulo 256, so no core has more than 255 out at once.
 
 Multicast needs broadcast, path reservation and static VC class 2. Count write
 acknowledgements from the recipients. The outstanding-request counter goes up
@@ -210,6 +224,12 @@ them: after one, its firmware's clear of L1 by multicast from (1, 2) leaves that
 tile about 14,000 requests counted for transaction ID 0. So a new runtime
 clears every counter of its tiles while it holds them in reset, before their
 firmware starts ([#4](https://github.com/0xalkinun/baretile/issues/4)).
+
+On a card, multicasts from several workers into one rectangle queue up behind
+each other, so one worker shares a row that every worker needs. A multicast
+also reserves its path through the grid before each transaction, and on NoC 0
+it holds up the reads around it. So `mcast` links a share's 16 KiB packets and
+its flag into one transaction, on NoC 1 (`bh.NIU_1`), beside the reads on NoC 0.
 
 ## Ethernet links
 

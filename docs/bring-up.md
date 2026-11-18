@@ -1,44 +1,38 @@
 # Bring-up on a card
 
-These steps take baretile onto a Blackhole P150a for the first time. A P150a has
-run them through the probe stage, and SmolLM-135M matches NumPy on it; a few
-kernel and model tests still fail there. Start at the bottom of the stack and stop at the first
-failure, since the later tests need the earlier ones to work.
+These steps take baretile onto a Blackhole P150a. Start at the bottom of the
+stack and stop at the first failure, since the later tests need the earlier
+ones to work. [The README](../README.md#status) says which stages CI runs on a
+card.
 
 ## Before you start
 
 Check that the card appears in `lspci -d 1e52:b140`, has the required power,
 and has working board firmware. Install tt-kmd 2.5 or later, Tenstorrent's
-kernel driver, and check the firmware with Tenstorrent's tools. Then check what baretile needs:
+kernel driver, and check the firmware with Tenstorrent's tools. Then check what
+baretile needs:
 
 ```sh
 python3 -m baretile.chip check
 ```
 
 It reads sysfs without touching the card, so it runs without root. It checks
-clang, lld and NumPy, then how baretile will open the card. It exits with an
-error if anything would stop baretile.
+clang, lld and NumPy, then how baretile will open the card, whether the PCIe
+link runs at the card's best speed and width, and the firmware version. It
+exits with an error if anything would stop baretile.
 
 With tt-kmd driving the card, baretile opens its device file,
-`/dev/tenstorrent/0`, as `pci.Kmd`, which needs no root. The check reports
-tt-kmd's version, fails one older than 2.5, and checks that you can open the
-file. `Kmd` refuses an older tt-kmd too, asking tt-kmd for its version. kmd pins the memory that the
-card reaches by DMA. With an IOMMU translating, that's ordinary memory;
-otherwise it's a hugepage, so the check also counts the free ones. tt-smi can
-use the card at the same time.
+`/dev/tenstorrent/0`, as `pci.Kmd`, which needs no root. The check fails a
+tt-kmd older than 2.5, and checks that you can open the file. kmd pins the
+memory that the card reaches by DMA. With an IOMMU translating, that's ordinary
+memory; otherwise it's a hugepage, so the check also counts the free ones.
+tt-smi can use the card at the same time.
 
 Without tt-kmd, baretile opens the card through sysfs as `pci.Card`, which
 unbinds any other driver. The check reports whether you're root, whether the
 IOMMU passes DMA addresses through, and how many hugepages are free. Configure
-the IOMMU for passthrough (`iommu=pt`) or disable it.
-
-Either way, it reports whether the PCIe link runs at the card's best speed and
-width, and the firmware version that tt-kmd reads. To reserve hugepages, as
-root:
-
-```sh
-echo 4 > /proc/sys/vm/nr_hugepages
-```
+the IOMMU for passthrough (`iommu=pt`) or disable it, and reserve hugepages as
+root with `echo 4 > /proc/sys/vm/nr_hugepages`.
 
 ## Steps
 
@@ -49,54 +43,63 @@ that has the test dependencies. Through sysfs, run it as root:
 python3 test/bringup.py record
 ```
 
-It runs the stages below in order and stops at the first failure, since the
-later stages need the earlier ones to work. It says where the failing stage's
-output is and what to look at. Each stage's output goes in `record/<stage>.log`.
-`record/record.json` holds the device, the host, the commit, and each stage's
-result and time, so keep the folder as the record of the bring-up. After a fix,
-`--from <stage>` starts again at that stage, and `--only` runs the stages you
-name, separated by commas. An unknown stage name is an error, and a stage that
-`--only` names fails when its files aren't given.
+It runs the stages below in order and stops at the first failure, saying where
+the failing stage's output is and what to look at. Each stage's output goes in
+`record/<stage>.log`, and `record/record.json` holds the device, the host, the
+commit, and each stage's result and time, so keep the folder as the record of
+the bring-up. After a fix, `--from <stage>` starts again at that stage, and
+`--only` runs the stages you name, separated by commas. An unknown stage name is
+an error, and a stage that `--only` names fails when its files aren't given.
 
 1. **preflight** runs `python3 -m baretile.chip check`, as above.
 2. **chip** runs `python3 -m baretile.chip`: ARC status, the clock, available
    columns and DRAM training, before any worker program loads.
 3. **transfers** runs `test_config_space`, `test_arc`, `test_dma`, `test_l1` and
-   `test_dram` from `test/test_device.py`. They test register access and memory
-   transfers that the host drives, including DRAM at the top of each bank.
-   Nothing runs on the workers yet.
+   `test_dram` from `test/test_device.py`: register access and memory transfers
+   that the host drives. Nothing runs on the workers yet.
 4. **launches** runs `python3 -m baretile.hello`, then all of
-   `test/test_device.py`. `test_host_memory` checks that a worker can read and
-   write host memory, which the dispatcher's commands, uploads and readback
-   depend on.
+   `test/test_device.py`, including `test_host_memory`, which checks that a
+   worker can read and write host memory.
 5. **math** runs `test_tile_math` and `test_tensor_math` from
-   `test/test_kernels.py`, which check instruction encoding and basic unpack,
-   math and pack.
-6. **probe** runs `python3 -m baretile.probe 8 record/probe.json` before
-   anything uploads large tensors. It records the AI clock it measured at, which
-   `baretile.models.cost` converts the probe's cycles with. Compare
-   `upload over PCIe`, where workers read the data from host memory, with
-   `upload over PCIe, through the BAR`. `tensor.DMA_UPLOAD` picks between the
-   two by size, and its value is a guess until these measurements exist.
+   `test/test_kernels.py`: instruction encoding and basic unpack, math and pack.
+6. **probe** runs `python3 -m baretile.probe 8 record/probe.json`, which
+   measures launch overhead, transfers, memory latency and Tensix rates, and
+   records the AI clock it measured at. Compare `upload over PCIe` with
+   `upload over PCIe, through the BAR`: `tensor.DMA_UPLOAD` picks between the
+   two by size, and its value is untuned.
 7. **kernels** runs all of `test/test_kernels.py`. If a failure comes and goes,
-   check the waits that ttsim doesn't model. ttsim-chaos models some of them
-   (see [testing](testing.md#ttsim-chaos)).
+   check the waits that ttsim doesn't model, which
+   [ttsim-chaos](testing.md#ttsim-chaos) models in part.
 8. **models** runs `test/test_models.py`.
 9. **smollm** runs `test_llama_model` on SmolLM-135M's checkpoint, given by
    `--smollm path/to/SmolLM-135M`.
-10. **llama** runs the [first workload](workload.md)'s token accuracy, given
+10. **llama**, **timing** and **http** run the [first workload](workload.md)'s
+    reference agreement, timing and HTTP gates, given
     `--llama path/to/Llama-3.1-8B-Instruct` and
-    `--reference path/to/Llama-3.1-8B-Instruct.refpt`. It passes at top-1 90%
-    and top-5 98% over 500 steps.
-11. **timing** runs `test/workload.py time`, the first workload's timing
-    protocol in three fresh processes, and keeps its report as
-    `record/timing.json`.
-12. **http** runs `test/workload.py http`, the first workload's single-slot
-    HTTP gate, and keeps its report as `record/http.json`.
+    `--reference path/to/Llama-3.1-8B-Instruct.refpt`, and keep the reports in
+    `record/`.
 
-The stages run on ttsim too, which is how they're tested. Once they pass on a
-card, run `python3 -m baretile.bench`, and pass `probe=record/probe.json` to
-`python3 -m baretile.models.cost`.
+The stages run on ttsim too, which is how they're tested. After the probe,
+`probe=record/probe.json` gives `python3 -m baretile.models.cost` the card's
+rates. `python3 -m baretile.bench` and `python3 -m baretile.models.bench`
+time a matmul, and a decode or verify step at Qwen3.5-9B's shapes, each against
+what the card could do.
+
+## Running CI on the card
+
+The `card` job in [the workflow](../.github/workflows/test.yml) runs
+`test/bringup.py` from preflight through the smollm stage, leaving out the probe
+and the Llama stages, and keeps the record as an artifact. It waits for the card
+while another process has it open. It runs once the repository variable `CARD`
+is `true`, and the smollm stage when `SMOLLM` names a SmolLM-135M folder on the
+card's machine. It isn't a required check yet
+([#11](https://github.com/0xalkinun/baretile/issues/11)).
+
+A self-hosted runner runs whatever a pull request's code does, with its user's
+access. So the job never runs for a pull request from a fork, and the runner, a
+GitHub Actions runner service labeled `p150a`, runs as its own user,
+`baretile-ci`, which can reach the card, the checkout and its own files, and
+nothing in other users' homes.
 
 ## Giving the card back
 
@@ -109,110 +112,33 @@ so that tt-smi and TT-NN can use it:
 python3 -m baretile.chip release
 ```
 
-`test/benchmark.py` runs both stacks on the same card, so through sysfs, its
-TT-NN runs need this first.
-
 ## When a card hangs
 
 A new runtime resets the cores after a kernel hangs. If ARC or the NoC stops
 responding, close processes using the card before trying
 `python3 -m baretile.chip reset`, as root. That writes PCIe configuration, then
-removes and rescans the device. With tt-kmd loaded, the rescan binds the card to
-it again, and the command opens the card through it. So far, we've tested the
-reset code against fake sysfs files. We don't know yet whether it recovers a
-hung card.
-
-## Measuring a card
-
-`baretile.probe` measures launch overhead, transfers, memory latency and Tensix
-operations. `baretile.bench` runs a matmul, and `baretile.models.bench` times what a
-decode or verify step of a Qwen3.5-9B-shaped model runs, each against what the
-card could do. Use a card for performance numbers.
-
-`test/benchmark.py` compares matmul, Llama decode and prefill with TT-NN. Its
-fourth workload sends concurrent HTTP requests to baretile. The TT-NN runs need
-tt-metal's Python environment. You'll also need PyTorch to load the reference
-file, and `cloc` to count lines of code. The script lists its commands at the
-top.
-
-## Running CI on the card
-
-Once bring-up passes, CI can run it on the card for every change, so the card
-path doesn't break between manual checks. The `card` job in
-[the workflow](../.github/workflows/test.yml) runs `test/bringup.py` from
-preflight through the model tests, keeps the record as an artifact, and fails
-at the first failing stage. It names the SmolLM stage in `--only`, and so runs
-it, only when the repository variable `SMOLLM` gives a SmolLM-135M folder on the
-card's machine. It leaves out the probe, which measures, and the Llama stages,
-which take hours. It runs in a venv of the machine's own Python, and waits for
-the card while another process has it open, such as someone's work at the
-machine.
-
-A self-hosted runner runs whatever a pull request's code does, with its
-user's access. The job never runs for a pull request from a fork, and the
-runner runs as a user of its own, `baretile-ci`, which can reach the card, the
-checkout and its own files, and nothing in other users' homes. To set it up on
-the card's machine, with tt-kmd, clang and lld installed:
-
-```sh
-sudo useradd --create-home baretile-ci
-sudo -u baretile-ci sh -c 'mkdir ~/runner && cd ~/runner && curl -fsSLo r.tgz https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-linux-x64-2.338.2.tar.gz && echo "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40  r.tgz" | sha256sum -c && tar xzf r.tgz && rm r.tgz'
-token=$(gh api -X POST repos/0xalkinun/baretile/actions/runners/registration-token --jq .token)
-sudo -u baretile-ci sh -c "cd ~/runner && ./config.sh --unattended --url https://github.com/0xalkinun/baretile --token $token --name p150a --labels p150a"
-sudo sh -c 'cd /home/baretile-ci/runner && ./svc.sh install baretile-ci && ./svc.sh start'
-```
-
-The token lasts an hour. Then, in the repository's variables, set `CARD` to
-`true`, and `SMOLLM` to a SmolLM-135M folder that `baretile-ci` can read. The
-job becomes a required check once it has passed reliably for a week
-([#11](https://github.com/0xalkinun/baretile/issues/11)).
-
-## What a card has shown
-
-A P150a has settled these, which ttsim doesn't model:
-
-- DMA reaches host memory both ways, ARC turns the clocks on (the probe runs at
-  the busy clock, 1350 MHz), and the status writes arrive in order.
-- Loading a new kernel where another was invalidates the old instructions: 40
-  kernels loaded in turn at one address each ran on every core. A kernel
-  arrives before the doorbell that launches it, though they go through
-  different TLBs: `test_relaunch_without_reset` loads 40 in turn just before
-  their doorbells, and one loaded over zeros, which no core can run, ran right
-  every time.
-- A request initiator can hold a request before the NIU counts it, so
-  `noc_wait` waits for the initiators to be free first. The NIU counts requests
-  in flight modulo 256, so no core has more than 255 out at once.
-- A write that the PCIe tile forwards to host memory is posted, so
-  `Chip.write` reads it back.
-- A packer's offset past its L1 address wraps at 256 KiB (`bh.PACK_REACH`), so
-  what a kernel packs stays within that of the packer's address.
-- Multicasts into one rectangle from several workers queue up behind each
-  other, so one worker shares a row that every worker needs.
-- A multicast reserves its path through the grid before each transaction, which
-  costs ~370 cycles over all 108 grid workers, and on NoC 0 it holds up the
-  reads around it. So `mcast` links a share's 16 KiB packets and its flag into
-  one transaction, on NoC 1: a token's matmul shares A's row in pieces of 16
-  tiles while B streams on NoC 0, and MLP down at 32 rows takes 79 µs, not 123.
-- The Tensix config bank isn't on the NoC. Reading it from the host took the
-  card off its PCIe link until `tt-smi -r 0` reset it.
+removes and rescans the device, and gives the card 10 seconds to come back. With
+tt-kmd loaded, the rescan binds the card to it again, and the command opens the
+card through it. We've tested the reset against fake sysfs files only, so we
+don't know yet whether it recovers a hung card, or whether 10 seconds are
+enough. Tenstorrent's `tt-smi -r 0` has brought a P150a back after it left its
+PCIe link.
 
 ## What still needs checking
 
-The BAR2 offsets and parts of ARC's protocol come from the drivers and
-simulator because the ISA doesn't document them. The SFPU programs read -1.0
-from LReg 11, which leaving the SFPU's soft reset sets and tt-llk keeps there.
-baretile doesn't reset the SFPU itself; the card's SFPU tests pass, but nothing
-reads the register itself.
-
-`python3 -m baretile.chip release` is tested against fake sysfs files only.
-
-The host relies on x86 ordering between writes to the ring and the doorbell.
-There's no explicit barrier for other host architectures.
-
-`chip reset` gives the card 10 seconds to reset, come back and be bound to
-tt-kmd again; check that this is enough on a card.
-
-There are also ISA and simulator differences: `UNPACR` fields have different
-names, `SETDVALID` is unavailable in ttsim, and some address-mode documentation
-describes Wormhole. The code uses the encodings accepted by the Blackhole
-simulator.
+- `chip reset` on a hung card, [as above](#when-a-card-hangs), and
+  `chip release`, which is tested against fake sysfs files only.
+- `pci.Card`'s path through sysfs, whose DMA to host memory takes the
+  [direct path](hardware.md#host-memory-and-arc): the card's machine uses
+  tt-kmd.
+- The BAR2 offsets and parts of ARC's protocol come from the drivers and
+  simulator because the ISA doesn't document them.
+- The SFPU programs read -1.0 from LReg 11, which leaving the SFPU's soft reset
+  sets and tt-llk keeps there. baretile doesn't reset the SFPU itself; the
+  card's SFPU tests pass, but nothing reads the register itself.
+- The host relies on x86 ordering between writes to the ring and the doorbell.
+  There's no explicit barrier for other host architectures.
+- ISA and simulator differences: `UNPACR` fields have different names,
+  `SETDVALID` is unavailable in ttsim, and some address-mode documentation
+  describes Wormhole. The code uses the encodings accepted by the Blackhole
+  simulator.

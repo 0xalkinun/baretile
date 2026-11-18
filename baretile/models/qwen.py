@@ -990,7 +990,7 @@ def carry_kernel(st, kt, vt, rep, per):
 
 def carry(S, k, vnew, cum, end, on):
   """The state after a path through a piece that rule ran, as a prompt of the path would leave it, so nothing runs
-  again (Steed's commit of a verified tree): S = e^G S + sum over the path of e^(G - cum_j) k_j v_new_j^T, where G is
+  again (a verified tree's commit): S = e^G S + sum over the path of e^(G - cum_j) k_j v_new_j^T, where G is
   cum at the path's last token. k is as rule takes it, as the conv gives it, and v_new and cum as rule gives them; end is a row with 1 at the
   path's last token and on a column with 1 on its tokens, for each sequence of S's value heads. S is written over and
   returned. On the chip it's carry_kernel's one launch."""
