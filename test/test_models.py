@@ -1727,15 +1727,20 @@ def test_delta_tree(chip):
       after = qwen.rule(*(a[:, path, :] for a in (q, k, v, beta, g)), S, state=True)[3]
       assert rel(qwen.carry(S.copy(), k, *want[1:], end, on), after) < 1e-5
       assert rel(value(qwen.carry(up(S), up(k), *got[1:], up(end), up(on))), after) < 0.01
-      # and with beta and g made in the kernel, from b and a as deltanet has them (a column a value head), dt_bias
-      # and decay: beta = sigmoid(b), g = decay softplus(a + dt_bias)
-      raw = rng.normal(0, 2, (m, 4)), rng.normal(0, 2, (m, 4)), rng.normal(0, 1, (1, 4)), -rng.uniform(0, 1, (1, 4))
+      # and with deltanet's raw: beta and g made in the kernel from b and a as deltanet has them (a column a value
+      # head), dt_bias and decay, beta = sigmoid(b) and g = decay softplus(a + dt_bias), and the outputs RMS-normed,
+      # times the norm's weight and gated by silu(z)
+      raw = (rng.normal(0, 2, (m, 4)), rng.normal(0, 2, (m, 4)), rng.normal(0, 1, (1, 4)), -rng.uniform(0, 1, (1, 4)),
+             rng.normal(0, 1, (m, 4 * 32)), rng.normal(1, 0.1, (1, 32)))
       x = raw[1] + raw[2]
       beta, g = (1 / (1 + np.exp(-raw[0]))).T[:, :, None], (raw[3] * np.logaddexp(x, 0)).T[:, :, None]
-      want = qwen.rule(q, k, v, beta, g, S, seen)
-      got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), raw=tuple(up(a[None]) for a in raw))
+      o, vnew, cum = qwen.rule(q, k, v, beta, g, S, seen)
+      z = raw[4].reshape(m, 4, 32).transpose(1, 0, 2)
+      want = o * ((o * o).mean(-1, keepdims=True) + 1e-6) ** -0.5 * raw[5] * z / (1 + np.exp(-z)), vnew, cum
+      got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), raw=(*(up(a[None]) for a in raw), 1e-6))
       assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
-  qwen.rule_kernel(1, 4, 4, 2, False, 128, True)  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree
+  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree, with deltanet's raw
+  qwen.rule_kernel(1, 4, 4, 2, False, 128, (1e-6, 128))
 
 def test_conv_last(chip):
   # qwen.conv reads each token's inputs from the table, or past its rows from the conv state where it lies (last): as
@@ -1770,7 +1775,7 @@ def test_delta_rule(chip):
     q, k, v, b, g, _ = gates(f.silu(sum(rows[:, j:j + m, :] * taps[j:j + 1, :, :] for j in range(c.conv))))
     q, k = f.repeat(qwen.unit(q, c.kd ** -0.5), c.vh // c.kh), f.repeat(qwen.unit(k), c.vh // c.kh)
     cum, decay, u, w = qwen.corrected(k, v, f.sigmoid(b), g)
-    return (q * f.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ (u - w @ S)
+    return (q * f.exp(cum)) @ S + ((q @ f.t(k)) * decay) @ (u - w @ S), False
   def run(p, up, zeros, rule):  # the outputs for then after first, and the states before and after
     state = llama.kv_cache(c, 64, zeros)[0]
     qwen.deltanet(up(first), p, c, state, phases)
