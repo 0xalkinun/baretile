@@ -651,7 +651,8 @@ class Tiles:
 
   A unit's tiles are L1 slots from take. What the packer writes comes first, after slot 0, then the output slots
   (outs), all within bh.PACK_REACH of slot 0; the inputs follow. BRISC fetches a unit's inputs once math has reported
-  the last unit done, and writes results out as they're packed."""
+  the last unit done, and writes results out as they're packed. It can fetch them as several frames, one after
+  another: math waits for the first, and at each later() for the next."""
   programs = {"mul": lambda r: [sfp_load(0, r), sfp_load(1, R2), mul(2, 0, 1), sfp_store(2, r)],
               "rsub": lambda r: [sfp_load(0, r), sfp_load(1, R2), mad(2, 0, ONE, 1, neg=1), sfp_store(2, r)],  # R2 - r
               "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, r)],
@@ -741,12 +742,16 @@ class Tiles:
     return (f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) "
             f"get(a[{i}], {tile_of(i, b, 'r', 'c')}, {base} + r * {cols} + c);")
 
+  def later(self): self.ops.append(("fetched();", ""))  # the ops after this read the inputs of fetch's next frame
+
   def kernel(self, name, fetch, total):
-    """The kernel of the ops, with fetch, BRISC's fetch of a unit's inputs, and total, the tiles a unit writes out."""
+    """The kernel of the ops, with fetch, BRISC's fetch of a unit's inputs, a frame for each later() and one before
+    them, and total, the tiles a unit writes out."""
     if (self.OUT + 2) * 4096 > bh.PACK_REACH or self.used > UNPACKABLE or slot_base("fp32") + self.used * 4096 > OUTS:
       raise ValueError(f"{name}: a unit's tiles don't fit in L1")
     units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned e = a[0] + u; {body} }}"
-    brisc = units(f"reached(frame_done[0]); {fetch} ready(); frame_done[0] = ++events;")
+    if len(fetch) != 1 + sum(m == "fetched();" for m, _ in self.ops): raise ValueError(f"{name}: a frame of fetch for each later()")
+    brisc = units(f"reached(frame_done[0]); {' ready(); '.join(fetch)} ready(); frame_done[0] = ++events;")
     cfg = kernel_config("fp32", "fp32")
     library = "".join(f"__attribute__((noinline)) static void p_{n}(void) {{ {tt(self.library[n])} }}\n" for n in sorted(self.called))
     return compile_kernel(brisc_program(f"a[1] * {total}", brisc, "fp32", "fp32"), unpack_program(units("fetched();"), cfg),
@@ -898,7 +903,7 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
             get(arg["vb"], VB(0, 0), st, vt) + get(arg["decay"], DC(0, 0), st, st)) + get(arg["S"], SS(0, 0), kt, vt) +
            f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);" +
            (get(arg["eg"], EG, 1, 1) + get(arg["kl"], KL(0, 0), kt, st) if state else ""))
-  return t.kernel("rule_kernel", fetch, 2 * st * vt + kt * vt * state + st * scaled)
+  return t.kernel("rule_kernel", [fetch], 2 * st * vt + kt * vt * state + st * scaled)
 
 def unit(t, scale=1.0):  # t's rows to length scale, as transformers' l2norm of Gated DeltaNet's q and k
   f = llama.fns(t)
@@ -953,7 +958,8 @@ def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False, raw=None):
 def carry_kernel(st, kt, vt, rep, per):
   """The kernel for carry, one value head a unit, in Tiles' ops: w = on e^min(G - cum, 0) filling its tiles, where G
   is cum at end (end's row filled down, times cum's column filled, from two TF32 parts), then S = e^G S + (k w)^T
-  v_new, k w turned by the identity, with S as it came. st, kt and vt are as rule_kernel's.
+  v_new, k w turned by the identity, with S as it came. A unit fetches S last, while the ops that come before
+  its rows run, and each column of k w is turned just before the rows of S that read it. st, kt and vt are as rule_kernel's.
 
   Arguments: the first unit and the number of units, then four words for each tensor (as rule_kernel's): S, which
   the kernel writes over; k, for each key head (a unit reads its value head's, e / rep); v_new and cum, for each
@@ -964,8 +970,8 @@ def carry_kernel(st, kt, vt, rep, per):
   GF, EG, W, ENF, ONF, NK = t.take(1), t.take(1), t.take(st), t.take(st), t.take(st), t.take(st)
   OUT = t.outs()
   SS, K, VN, CC, EN, ON, CN = (t.take(kt * vt, vt), t.take(st * kt, kt), t.take(st * vt, vt), t.take(st), t.take(st),
-                               t.take(st), t.take(8))
-  E0, E0T, op = CN + 6, CN + 7, t.op  # ones in row 0, ones in column 0
+                               t.take(st), t.take(3))
+  E0, E0T, op = CN + 1, CN + 2, t.op  # ones in row 0 and in column 0, after the identity: the constants it reads
   for j in range(st):  # end's row filled down, on's column across, and cum's, in parts for the FPU
     op(ENF + j, [(E0T, EN + j, False)]), op(ONF + j, [(ON + j, E0, False)])
     t.parts(CP, j, start=CC + j)
@@ -976,17 +982,17 @@ def carry_kernel(st, kt, vt, rep, per):
     op(W + j, [(CP(j, p), E0, False) for p in range(2)], posts=[("rsub", (GF,)), ("min0", ()), ("fexp", ()), ("mul", (ONF + j,))],
        exact=True)
     t.norm(NK + j, K(j, 0), kt)
-    for c in range(kt): op(KW(j, c), start=K(j, c), posts=[("mul", (NK + j,)), ("mul", (W + j,))])
     for v in range(vt): op(VR(j, v), start=VN(j, v))
-  for c in range(kt):
+  for c in range(kt):  # each column of k w turned just before the rows of S that read it, while the column before's go out
+    for j in range(st): op(KW(j, c), start=K(j, c), posts=[("mul", (NK + j,)), ("mul", (W + j,))])
     for j in range(st): op(KT(c, j), [(CN, KW(j, c), True)])
-  for c in range(kt):
+    if c == 0: t.later()  # S, fetched while the ops before run
     for v in range(vt): op(OUT, [(KT(c, j), VR(j, v), False) for j in range(st)], posts=[("fma", (SS(c, v), EG))], home=(c, v))
   arg, get = {name: 6 + 4 * i for i, name in enumerate(["k", "vnew", "cum", "end", "on", "consts"])}, t.get
-  fetch = (get(2, SS(0, 0), kt, vt) + get(arg["k"], K(0, 0), st, kt, f"e / {rep}") + get(arg["vnew"], VN(0, 0), st, vt) +
-           get(arg["cum"], CC, st, 1) + get(arg["end"], EN, 1, st, f"e / {per}") + get(arg["on"], ON, st, 1, f"e / {per}") +
-           f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);")
-  return t.kernel("carry_kernel", fetch, kt * vt)
+  fetch = (get(arg["k"], K(0, 0), st, kt, f"e / {rep}") + get(arg["vnew"], VN(0, 0), st, vt) + get(arg["cum"], CC, st, 1) +
+           get(arg["end"], EN, 1, st, f"e / {per}") + get(arg["on"], ON, st, 1, f"e / {per}") +
+           f"for (unsigned t = 0; t < 3; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't ? 5 + t : 0', 0, 0)}, {CN} + t);")
+  return t.kernel("carry_kernel", [fetch, get(2, SS(0, 0), kt, vt)], kt * vt)
 
 def carry(S, k, vnew, cum, end, on):
   """The state after a path through a piece that rule ran, as a prompt of the path would leave it, so nothing runs
