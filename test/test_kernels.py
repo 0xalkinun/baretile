@@ -968,6 +968,26 @@ def test_matmul_chunks(chip):
     assert reads() - before == want and np.array_equal(value(y), value(x @ w)), (m, k, n, how, reads() - before, want)
     assert wc.tobytes() == w.tobytes(), "column storage reads back unchanged"
 
+def test_matmul_tile_rows(chip):
+  # A lone matmul by a block-float B by columns, with several tile rows of A, takes a launch for each tile row, as a
+  # token's row takes one, when B is too wide for Tensor.matmul to cut K into a batch at one tile row. Each launch
+  # writes its rows of the result, so every tile row is bit for bit the matmul of its rows alone. A residual of the same
+  # rows goes with them, and the last tile row can be short. A narrower B stays on the grid, in one launch.
+  rt = Runtime(chip)
+  rng = np.random.default_rng(53)
+  for m, n, how, launches in ((64, 4096, "bfp4", 2), (96, 4096, "bfp8", 3), (70, 4096, "bfp4", 3), (64, 512, "bfp4", 1)):
+    a, b, r = (bf16(rng.uniform(-1, 1, shape)) for shape in ((m, 480), (480, n), (m, n)))
+    w = Tensor.of(rt, b.tolist()).cast(how).columns().realize()
+    x, res = Tensor.of(rt, a.tolist()), Tensor.of(rt, r.tolist())
+    rt.wait()
+    since, y = rt.launches, (x @ w + res).realize()
+    assert kernels(rt, since) == launches, (m, n, how)
+    each = [value(Tensor.of(rt, a[i:i + 32].tolist()) @ w + Tensor.of(rt, r[i:i + 32].tolist()))[0]
+            for i in range(0, m, 32)]
+    assert launches == 1 or np.array_equal(value(y)[0], np.concatenate(each)), (m, n, how)
+    v = value(w)[0]
+    assert np.all(np.abs(value(y)[0] - (a @ v + r)) <= 2**-8 * (np.abs(a) @ np.abs(v) + np.abs(r))), (m, n, how)
+
 def test_accumulate_parts(chip):
   # Build a one-worker matmul with six K tiles split into three parts. The first two parts accumulate in fp32
   # in L1. The last waits on SEM_L1, reloads the sum through SrcA as TF32, then adds its products in Dst.

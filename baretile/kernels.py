@@ -46,7 +46,8 @@ def grid_parts(rt, w, kt, grid, base, more=0):
   return False
 
 def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None, leading=None, formats=None):
-  """Compile an expression into one kernel. Return (image, work units).
+  """Compile an expression into one kernel. Return (image, work units, whether it takes a row of tiles the way a
+  token's matmul does: bcast, below).
 
   Expressions use nested tuples. An integer refers to an input by its index in shapes:
   - (op, x, y) for add, sub, mul and binary SFPU operations.
@@ -756,7 +757,7 @@ j0 = {col0};
   image = compile_kernel(brisc, unpack_program(program(U), cfg, indices + ours),
                          math_program(replays, program(M), dst, indices + ours, bool(wide)),
                          pack_program(program(P), decls=ours))
-  return image, (nb * rt * w // L if reducing else nb * br * bcols)  # and the number of units in the result
+  return image, (nb * rt * w // L if reducing else nb * br * bcols), bcast is not None
 
 FRAMES_A = 4  # an attention unit's frames, where they fit: its reads run up to 3 frames ahead of its math
 

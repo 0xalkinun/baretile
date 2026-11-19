@@ -180,16 +180,16 @@ names are easy to reverse: the left matrix A goes to SrcB, and B goes to SrcA.
 A pair of 32 by 32 tiles takes sixteen `MVMUL` instructions per fidelity phase.
 A matmul with `dtype="int32"` accumulates in fp32 and then converts the result.
 
-For a matrix with several tile rows, workers share A across grid rows and B down
-grid columns. Three buffers let them rotate through inputs without a separate
-message for each freed buffer. If K doesn't fit, the kernel splits it and keeps
-partial sums in L1. If the output accumulators don't fit either, it processes
-groups of columns and reads A again for each group.
+A single tile row, as in token decoding, has workers take output columns, share
+A, and stream B from DRAM. With column storage, they read through their own
+bank ports in requests of up to 16 KiB. `CHUNKS` and `DEPTH` are four, untuned.
+A block float by columns, too wide to cut K for, takes several tile rows this
+way, a tile row a launch: on a card that beats the grid below, reading B again.
 
-A single tile row, as in token decoding, uses a different path. Workers take
-output columns, share A, and stream B from DRAM. With column storage, workers
-read through their assigned bank ports in requests of up to 16 KiB. The default
-`CHUNKS` and `DEPTH` are both four, untuned.
+Other matrices of several tile rows, or rows of A too long for L1, have workers
+share A across grid rows and B down grid columns, in three buffers. If K doesn't
+fit, the kernel splits it and keeps partial sums in L1. If those don't fit
+either, it takes groups of columns, reading A again for each.
 
 For a mixture of experts, matmul reads the expert indices from a tensor on the
 chip. It uses those indices to select matrices from B. An index past the last
