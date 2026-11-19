@@ -3888,6 +3888,73 @@ def test_cost_draft_head():
   # Verification and drafting both attend to the cache for two positions per user.
   assert step.flops == 2 * 4 * (s.values + s.draft_values + head) + 2 * 4 * 4 * 64 * 10
 
+# Qwen3.6-35B-A3B's config.json, which test_cost and test_cost_launches price
+QWEN36 = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
+          "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
+          "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
+          "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "mtp_num_hidden_layers": 1,
+          "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 10, "model_type": "qwen3_5_moe_text",
+          "rope_parameters": {"rope_theta": 1e7, "partial_rotary_factor": 0.25, "rope_type": "default"}}}
+
+def test_cost_launches(chip, tmp_path):
+  # cost.LAUNCHES is what this counts: a dry run at Qwen3.6-35B-A3B's shapes, in experts mode, of serve.Engine's decode,
+  # verify (check) and draft (guesses) with eight slots, which records each launch's name and sends none. The weights
+  # are empty tensors laid out as llama.upload leaves them, and each call is counted the second time, as a replay runs
+  # it. Engines of one to four blocks tell the kinds apart: a Gated DeltaNet block with the shared expert as its MLP,
+  # one and two with experts, and three of them then an attention block. A kind counts the block's norms and MLP, and
+  # experts what a mixture of experts adds to the MLP. The table is for the grid that cost prices, 120 tiles.
+  rt = Runtime(chip)
+  if tuple(map(len, rt.grid)) != tuple(map(len, cost.GRID)): pytest.skip("cost.LAUNCHES counts on the grid of 120 tiles")
+  (tmp_path / "config.json").write_text(json.dumps(QWEN36))
+  c, names = llama.config(str(tmp_path)), []
+  prec, d, hd, nh, qk, vw = llama.precision(c, "experts"), c.dim, llama.head(c), 2 * c.heads + 2 * c.kv, c.kh * c.kd, c.vh * c.vd
+  def weight(name, rows, cols, batch=1):  # an empty tensor laid out as llama.upload leaves the weight
+    f = llama.weight_format(name, prec)
+    if not (llama.matrix(name) or name.startswith("embed.T") or name == "mtp.fc"): return Tensor(rt, rows, cols, batch=batch, dtype=f)
+    out, runs, tr = Tensor(rt, rows, cols, "view", batch=batch, dtype=f), -(-cols // (32 * len(bh.DRAM))), -(-rows // 32)
+    out.op, out.runs, out.addr = None, (runs, tr, 0), rt.dram_alloc(batch * runs * tr * tensix.tile_bytes(f))
+    return out
+  def block(l, kind, dense):  # block l's weights, by name and shape
+    p = {"input_layernorm": (1, d), "post_attention_layernorm": (1, d)}
+    p |= ({"gate_up_proj": (d, 2 * c.shared), "down_proj": (c.shared, d)} if dense else
+          {"router": (d, c.experts), "experts.gate_up": (d, 2 * c.moe, c.experts), "experts.down": (c.moe, d, c.experts),
+           "shared_expert.gate_up_proj": (d, 2 * c.shared), "shared_expert.down_proj": (c.shared, d), "shared_expert_gate": (d, 1)})
+    if kind == "linear_attention":
+      p |= {"qkv_proj": (d, 2 * qk + 2 * vw + 2 * c.vh), "o_proj": (vw, d), "conv": (1, 2 * qk + vw, c.conv), "decay": (1, c.vh),
+            "dt_bias": (1, c.vh), "norm": (1, c.vd)}
+    else: p |= {"qkv_proj": (d, nh * hd), "o_proj": (c.heads * hd, d), "qk_norm": (1, hd, nh), "qk_on": (1, 1, nh)}
+    return {f"layers.{l}.{k}": weight(f"layers.{l}.{k}", *shape) for k, shape in p.items()}
+  outer = {k: weight(k, *shape) for k, shape in {"embed": (c.vocab, d), "embed.T": (d, c.vocab), "embed.T draft": (d, c.vocab),
+           "norm": (1, d), "mtp.fc": (2 * d, d), "mtp.pre_fc_norm_embedding": (1, d), "mtp.pre_fc_norm_hidden": (1, d),
+           "mtp.norm": (1, d), "cos": (64, nh * hd), "sin": (64, nh * hd), "turn": (hd, hd)}.items()}
+  def launches(types, dense=False):  # (decode, verify, draft) of an engine of blocks of types, then the prediction layer
+    v = llama.custom(**vars(c) | dict(layers=len(types), layer_types=types + ["full_attention"]))
+    v.precision, w = llama.precision(v, "experts"), dict(outer)
+    for l, kind in enumerate(v.layer_types): w |= block(l, kind, dense and l < len(types))
+    e = serve.Engine(rt, w, v, None, slots=8, places=64, chunk=16)
+    ids, places, taken = e.on([1, 2] * 8), e.on([3, 4] * 8), e.on([1.0] * 8, "fp32")
+    calls = ((e.decode, e.on(list(range(8))), e.on([3] * 8), e.column([1.0] * 8), 64),
+             (e.check, ids, places, taken, e.column([1.0] * 16), 64), (e.guesses, ids, places, taken, 64))
+    def second(f, *a):
+      f(*a)
+      names.clear()
+      f(*a)
+      return len(names)
+    rt.launch = lambda kernel, args=(), units=None, name="": names.append(name)
+    try: return np.array([second(*call) for call in calls])
+    finally: del rt.launch
+  linear = ["linear_attention"]
+  plain, one, two, whole = launches(linear, True), launches(linear), launches(linear * 2), launches(c.layer_types[:4])
+  experts = one - plain
+  deltanet = two - one - experts
+  rest = one - deltanet - experts
+  attention = whole - 3 * deltanet - 4 * experts - rest
+  assert experts[0] == experts[1], experts  # the table has one experts entry for both
+  got = {"attention": attention[0], "experts": experts[0], "deltanet": deltanet[0], "rest": rest[0], "attention verify": attention[1],
+         "deltanet verify": deltanet[1], "rest verify": rest[1], "draft": whole[2]}
+  got = {k: int(n) for k, n in got.items()}
+  assert cost.LAUNCHES == got, got
+
 def test_cost(tmp_path):
   # baretile.models.cost works from a config alone. Qwen3.6-35B-A3B has 35.5B parameters (0.9B in the multi-token prediction
   # layer) and reads 2.95B a token, about 21.9 GB in the one-card formats. Its KV cache is 20 KB a token (10 attention
@@ -3895,15 +3962,9 @@ def test_cost(tmp_path):
   # 128 in fp32, plus the last 3 conv inputs). Llama-3.1-8B reads benchmark.py's 6.20 GB a token, within 2%. At 256
   # tokens, a prompt chunk reads almost all the experts of each block, so Qwen3.6's 4K-token prompt is over 6 times
   # slower in chunks of 256 than of 2,048. At 32K tokens, attention's reads slow it down again.
-  qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
-          "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
-          "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
-          "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "mtp_num_hidden_layers": 1,
-          "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 10, "model_type": "qwen3_5_moe_text",
-          "rope_parameters": {"rope_theta": 1e7, "partial_rotary_factor": 0.25, "rope_type": "default"}}}
   llama8b = {"model_type": "llama", "hidden_size": 4096, "num_attention_heads": 32, "num_key_value_heads": 8, "num_hidden_layers": 32,
              "rms_norm_eps": 1e-5, "max_position_embeddings": 131072, "vocab_size": 128256, "intermediate_size": 14336, "rope_theta": 5e5}
-  for name, j in (("qwen", qwen), ("llama", llama8b)): (tmp_path / name).mkdir(); (tmp_path / name / "config.json").write_text(json.dumps(j))
+  for name, j in (("qwen", QWEN36), ("llama", llama8b)): (tmp_path / name).mkdir(); (tmp_path / name / "config.json").write_text(json.dumps(j))
   c = llama.config(str(tmp_path / "qwen"))
   s, use = cost.shape(c, "experts"), dict(cost.USE)
   assert 35.4e9 < s.held < 35.6e9 and 2.9e9 < s.values < 3.0e9 and 21.8e9 < s.bytes < 22.2e9, (s.held, s.values, s.bytes)  # includes the draft head
