@@ -770,8 +770,8 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
   - q and k, for each key head; a unit reads those of its value head's (e / rep)
   - kb = beta k, kbe = beta k e^cum, qe = q e^cum and vb = beta v, for each value head, then decay: the decay from
     token j to token i where i follows j (or is it), else 0. With kd, v, beta as tiles of each row's value, g and
-    seen (corrected's) in their place, or with gated, v, then b, a, dt_bias and decay as deltanet has them (rule's
-    raw) in place of beta and g, seen, and z and the norm's weight
+    seen (corrected's) in their place, or with gated, v, then b, a, dt_bias and decay (a row each) as deltanet has
+    them (rule's raw) in place of beta and g, seen, and z and the norm's weight
   - S, the state before the piece
   - consts: the identity, the pairs masks of spans 1, 2, 4, 8 and 16 (llama.pairs), ones in row 0, ones in column 0
   - with state, e^G, where G is cum at the last token, in every place of a tile, and kl = (k e^(G - cum))^T
@@ -781,15 +781,19 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
   cum, which goes out after v_new, its tiles filled, the decays, and the rounded q, k, kb, kbe, qe and vb, each
   rounded once. cum = seen g, and cum's column filling its tiles, or turned for cum_i - cum_j, come from the FPU, from two
   TF32 parts of each value: 22 bits of it, where the tensor ops' fp32 matmul has bf16's two parts, 16. With gated, it
-  makes beta = sigmoid(b) and g = decay softplus(a + dt_bias) too, for one sequence: BRISC copies the unit's column
-  of each into column 0, and the SFPU spreads each row's value along its row. a + dt_bias and g go in slots of the
-  inverse's, which it makes later. Then each output row is RMS-normed with eps, times the weight and gated by silu(z),
+  makes beta = sigmoid(b) and g = decay softplus(a + dt_bias) too, for one sequence: BRISC reads the unit's column of
+  each, b's and a's from the two faces that hold it and dt_bias's and decay's from their row, and copies it into
+  column 0, and the SFPU spreads each row's value along its row. a + dt_bias and g go in slots of the inverse's,
+  which it makes later. Then each output row is RMS-normed with eps, times the weight and gated by silu(z),
   as deltanet's last step, the outputs kept in vb's slots and their norm in L's, which are spent by then. gated is
   deltanet's eps and the width of a value, for the norm.
 
   The ops follow corrected and chunk: L = (kb k^T) decay, then the inverse of I + L in blocks, w = inv kbe (kept
   negated), v_new = inv vb - w S, the outputs qe S + ((q k^T) decay) v_new, and the state e^G S + kl v_new. L's diagonal
-  is never read, since every pairs mask lies below it. st, kt and vt are the tiles of a piece, a key and a value."""
+  is never read, since every pairs mask lies below it. st, kt and vt are the tiles of a piece, a key and a value.
+
+  BRISC reads a unit's inputs in frames, each while the ops before it run: with gated, the gates; with kd, seen and
+  the constants (and beta and g), then q, k and v, or else the inputs but S; then S and what only the last ops read."""
   t, scaled = Tiles(), kd is not None
   L, INV, LP, X = (t.take(st * st, st) for _ in range(4))
   NW, VN, QK = t.take(st * kt, kt), t.take(st * vt, vt), t.take(st * st, st)
@@ -820,6 +824,7 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
     op(TM, start=BR + 1, posts=[("add", (BR + 2,)), *row], exact=True)
     softplus = [("nabs", ()), ("fexp", ()), ("inc", ()), ("log", ()), ("addmax0", (TM,))]
     op(GI, start=TM, posts=[*softplus, ("mul", (BR + 3,)), *row], exact=True)
+    t.later()
   if scaled:  # cum = seen g, then filling its tiles (its column times ones in row 0), e^cum, and the decays:
     for i in range(st):  # exp(min(cum_i - cum_j, 0)) where i sees j, cum_j's tile turned by ones in column 0
       t.parts(GP, i, start=GI + i)
@@ -829,6 +834,7 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
     for i, j in lower:
       op(DC(i, j), [(E0T, CP(j, p), True) for p in range(2)],
          posts=[("rsub", (CU + i,)), ("min0", ()), ("fexp", ()), ("mul", (SN(i, j),))], exact=True)
+    t.later()
     NQ, NK = (lambda i: GP(i, 0)), (lambda i: GP(i, 1))  # 1 / |q| times kd^-1/2, and 1 / |k|, in g's parts' slots
     for i in range(st):  # then the scaled rows, each rounded once (op rounds what it keeps)
       t.norm(NQ(i), QR(i, 0), kt, kd ** -0.5), t.norm(NK(i), KR(i, 0), kt)
@@ -839,8 +845,6 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
         op(KBE(i, c), start=KR(i, c), posts=[k, ("mul", (BE + i,)), ("mul", (EE + i,))])
         op(QE(i, c), start=QR(i, c), posts=[q, ("mul", (EE + i,))])
       for j in range(vt): op(VB(i, j), start=VR(i, j), posts=[("mul", (BE + i,))])
-  for c in range(kt):
-    for j in range(vt): op(SR(c, j), start=SS(c, j))  # rounded, as rule rounds the other inputs
   for i, j in lower: op(L(i, j), [(KB(i, c), K(j, c), True) for c in range(kt)], posts=[("mul", (DC(i, j),))])
   for i in range(st): op(INV(i, i), start=L(i, i), posts=[("mul", (CN + 1,)), ("rsub", (CN,))])  # I - L, a token at a time
   for n, span in enumerate((2, 4, 8, 16)):  # join blocks within each tile: inv -= (inv (L pairs)) inv
@@ -858,6 +862,9 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
     span *= 2
   for i in range(st):
     for c in range(kt): op(NW(i, c), [(INV(i, l), KBE(l, c), False) for l in range(i + 1)], posts=[("neg", ())])
+  t.later()
+  for c in range(kt):
+    for j in range(vt): op(SR(c, j), start=SS(c, j))  # rounded, as rule rounds the other inputs
   for i in range(st):
     for j in range(vt):
       op(VN(i, j), [(INV(i, l), VB(l, j), False) for l in range(i + 1)] + [(NW(i, c), SR(c, j), False) for c in range(kt)],
@@ -888,22 +895,27 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
            *(["eg", "kl"] if state else [])]
   arg, get = {name: 6 + 4 * i for i, name in enumerate(names)}, t.get  # each input's four words, after the result's
   rows = ((QR, KR, VR) if scaled else (Q, K, VB))
-  raw = ""
-  if gated:  # the gates' tiles, each with the unit's column copied into column 0 (a 1-row tensor repeats its row)
-    raw = "".join(f"get(a[{arg[n]}], {tile_of(arg[n], 0, 0, 'e / 32')}, {BR + j});" for j, n in enumerate(gates))
-    raw += (f"noc_wait(); for (unsigned s = 0; s < 4; s++) {{ volatile unsigned *x = (volatile unsigned *)"
-            f"SLOT({BR} + s); for (unsigned r = 0; r < 32; r++) x[at(r, 0)] = x[at(r, e % 32)]; }}")
+  consts = f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);"
+  qk = get(arg["q"], rows[0](0, 0), st, kt, f"e / {rep}") + get(arg["k"], rows[1](0, 0), st, kt, f"e / {rep}")
+  frames, last = [], get(arg["S"], SS(0, 0), kt, vt)
+  if gated:  # of each gate, the unit's column, from the faces that hold it, or row 0 of dt_bias and decay
+    frames = ["".join(f"for (unsigned f = 0, t = {tile_of(arg[n], 0, 0, 'e / 32')}, o; f < {2 - (j > 1)}; f++) "
+                      f"o = (2 * f + e % 32 / 16) * 1024, noc_get(BANK(t), AT(a[{arg[n]}], t, 4096) + o, "
+                      f"SLOT({BR + j}) + o, {64 if j > 1 else 1024});" for j, n in enumerate(gates)) +
+              f"noc_wait(); for (unsigned s = 0; s < 4; s++) {{ volatile unsigned *x = (volatile unsigned *)"
+              f"SLOT({BR} + s); for (unsigned r = 0; r < 32; r++) x[at(r, 0)] = x[at(s < 2 ? r : 0, e % 32)]; }} "
+              f"l1_settle(SLOT({BR} + 3));"]  # the copies down column 0 land before the unpacker reads them
     z, w = arg["z"], arg["weight"]
-    raw += (f"for (unsigned c = 0; c < {vt}; c++) get(a[{z}], {tile_of(z, 0, 0, f'e * {vt} + c')}, {Z} + c), "
-            f"get(a[{w}], {tile_of(w, 0, 0, 'c')}, {WT} + c);")
-  fetch = (get(arg["q"], rows[0](0, 0), st, kt, f"e / {rep}") + get(arg["k"], rows[1](0, 0), st, kt, f"e / {rep}") +
-           (get(arg["v"], VR(0, 0), st, vt) + (raw or get(arg["beta"], BE, st, 1) + get(arg["g"], GI, st, 1))
-            + get(arg["seen"], SN(0, 0), st, st) if scaled else
-            "".join(get(arg[n], m(0, 0), st, kt) for n, m in (("kb", KB), ("kbe", KBE), ("qe", QE))) +
-            get(arg["vb"], VB(0, 0), st, vt) + get(arg["decay"], DC(0, 0), st, st)) + get(arg["S"], SS(0, 0), kt, vt) +
-           f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);" +
-           (get(arg["eg"], EG, 1, 1) + get(arg["kl"], KL(0, 0), kt, st) if state else ""))
-  return t.kernel("rule_kernel", [fetch], 2 * st * vt + kt * vt * state + st * scaled)
+    last += (f"for (unsigned c = 0; c < {vt}; c++) get(a[{z}], {tile_of(z, 0, 0, f'e * {vt} + c')}, {Z} + c), "
+             f"get(a[{w}], {tile_of(w, 0, 0, 'c')}, {WT} + c);")
+  if scaled:
+    beta_g = "" if gated else get(arg["beta"], BE, st, 1) + get(arg["g"], GI, st, 1)
+    frames += [get(arg["seen"], SN(0, 0), st, st) + consts + beta_g, qk + get(arg["v"], VR(0, 0), st, vt)]
+  else:
+    frames += [qk + "".join(get(arg[n], m(0, 0), st, kt) for n, m in (("kb", KB), ("kbe", KBE), ("qe", QE))) +
+               get(arg["vb"], VB(0, 0), st, vt) + get(arg["decay"], DC(0, 0), st, st) + consts]
+  last += get(arg["eg"], EG, 1, 1) + get(arg["kl"], KL(0, 0), kt, st) if state else ""
+  return t.kernel("rule_kernel", frames + [last], 2 * st * vt + kt * vt * state + st * scaled)
 
 def unit(t, scale=1.0):  # t's rows to length scale, as transformers' l2norm of Gated DeltaNet's q and k
   f = llama.fns(t)
@@ -916,10 +928,12 @@ def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False, raw=None):
   use_qk_l2norm_in_kernel, unless they come normed. seen is as corrected takes it. On the chip it's rule_kernel's one
   launch, for a piece of one tile without state, from q and k as the conv gives them; with more, cum, the decays and
   the scaled rows come from tensor ops in fp32 before it. With raw, deltanet's for one sequence (b and a as x's
-  columns, dt_bias, decay, z as x's columns, the norm's weight and eps), the outputs come RMS-normed and gated by z,
-  deltanet's last step, which that launch does itself, with beta and g, so beta and g aren't read."""
+  columns, dt_bias and decay a row each, z as x's columns, the norm's weight and eps), the outputs come RMS-normed and
+  gated by z, deltanet's last step, which that launch does itself, with beta and g, so beta and g aren't read."""
   f, s, rep = llama.fns(q), q.shape[-2], v.shape[0] // q.shape[0]
   if raw and raw[4].shape[-1] != v.shape[0] * v.shape[-1]: raise ValueError("rule's raw is one sequence's")
+  if raw and raw[2].shape[-2] * raw[3].shape[-2] != 1:
+    raise ValueError("rule's raw needs dt_bias and decay as a row each")
   # the norm as tensor ops, where the kernel doesn't make it
   norm = lambda o: o * f.rsqrt(f.mean(o * o) + raw[6]) * raw[5] * f.silu(f.split(raw[4], v.shape[0])) if raw else o
   # on the chip for a piece of one tile, the kernel takes q and k to length 1 and makes cum, the decays and the rows

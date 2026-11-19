@@ -1835,22 +1835,27 @@ def test_delta_tree(chip):
       assert rel(value(qwen.carry(up(S), up(k), *got[1:], up(end), up(on))), after) < 0.01
       # and with deltanet's raw: beta and g made in the kernel from b and a as deltanet has them (a column a value
       # head), dt_bias and decay, beta = sigmoid(b) and g = decay softplus(a + dt_bias), and the outputs RMS-normed,
-      # times the norm's weight and gated by silu(z)
-      raw = (rng.normal(0, 2, (m, 4)), rng.normal(0, 2, (m, 4)), rng.normal(0, 1, (1, 4)), -rng.uniform(0, 1, (1, 4)),
-             rng.normal(0, 1, (m, 4 * 32)), rng.normal(1, 0.1, (1, 32)))
-      x = raw[1] + raw[2]
-      beta, g = (1 / (1 + np.exp(-raw[0]))).T[:, :, None], (raw[3] * np.logaddexp(x, 0)).T[:, :, None]
-      o, vnew, cum = qwen.rule(q, k, v, beta, g, S, seen)
-      z = raw[4].reshape(m, 4, 32).transpose(1, 0, 2)
-      want = o * ((o * o).mean(-1, keepdims=True) + 1e-6) ** -0.5 * raw[5] * z / (1 + np.exp(-z)), vnew, cum
-      ins = [up(a) for a in (q, k, v, beta, g, S, seen, *(a[None] for a in raw))]
-      since, got = rt.launches, qwen.rule(*ins[:7], raw=(*ins[7:], 1e-6))
-      for t in got: t.realize()
-      # the rule's launch, then a copy each of o's and v_new's 20 rows from its output, of which cum is a view
-      assert rt.launches - since == 3, rt.launches - since
-      assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
-  # and Qwen3.5-9B's heads, 128 wide, fit the packer's reach for a tree, with deltanet's raw
-  qwen.rule_kernel(1, 4, 4, 2, False, 128, (1e-6, 128))
+      # times the norm's weight and gated by silu(z). 20 value heads, so a head's column lies in either face of a tile,
+      # and Qwen3.5-9B's 16 key and 32 value heads of 128
+      seen = seen[:1]
+      for kh, h, kd, vd in ((2, 20, 64, 32), (16, 32, 128, 128)):
+        q, k, v, S = (rng.normal(0, 1, (kh, m, kd)), rng.normal(0, 1, (kh, m, kd)), rng.normal(0, 1, (h, m, vd)),
+                      rng.normal(0, 0.1, (h, kd, vd)))
+        raw = (rng.normal(0, 2, (m, h)), rng.normal(0, 2, (m, h)), rng.normal(0, 1, (1, h)), -rng.uniform(0, 1, (1, h)),
+               rng.normal(0, 1, (m, h * vd)), rng.normal(1, 0.1, (1, vd)))
+        x = raw[1] + raw[2]
+        beta, g = (1 / (1 + np.exp(-raw[0]))).T[:, :, None], (raw[3] * np.logaddexp(x, 0)).T[:, :, None]
+        o, vnew, cum = qwen.rule(q, k, v, beta, g, S, seen)
+        z = raw[4].reshape(m, h, vd).transpose(1, 0, 2)
+        want = o * ((o * o).mean(-1, keepdims=True) + 1e-6) ** -0.5 * raw[5] * z / (1 + np.exp(-z)), vnew, cum
+        ins = [up(a) for a in (q, k, v, beta, g, S, seen, *(a[None] for a in raw))]
+        since, got = rt.launches, qwen.rule(*ins[:7], raw=(*ins[7:], 1e-6))
+        for t in got: t.realize()
+        # the rule's launch, then a copy each of o's and v_new's 20 rows from its output, of which cum is a view
+        assert rt.launches - since == 3, rt.launches - since
+        assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
+      with pytest.raises(ValueError, match="dt_bias and decay as a row each"):
+        qwen.rule(*ins[:7], raw=(*ins[7:9], ins[7], *ins[10:], 1e-6))
   # carry on one worker, which takes every unit in turn, along a path through two tiles of rows, against NumPy's. Its
   # decays are small: at up to e^-1 a token the kernel is ~1% from NumPy
   with Runtime(chip, end=chip.tensix[1]) as one:

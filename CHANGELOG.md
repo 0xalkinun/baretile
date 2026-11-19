@@ -36,6 +36,8 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   `(w["cos"], w["sin"], w["turn"], places)` in place of the gathered rows: `llama.rope_kernel` reads the rows itself, in
   the launch that norms and turns q and k. `llama.rope_launch` takes the KV cache's format and returns the heads and
   the k and v heads, which for a bfp8 cache it packs in bfp8, so attention puts them with no cast launch.
+- `qwen.rule`'s raw takes dt_bias and decay as a row each, as `qwen.deltanet` gives them, and raises ValueError
+  otherwise.
 - Multicasts go on NoC 1, as linked transactions, so a token's matmul shares A's row while B streams on NoC 0.
 - `llama.layer(x, y, ...)` takes the residual stream and the last block's output, and returns the same pair: the
   next norm adds them. Pass `None` for y to the first block, and finish with `x, h = llama.rms(x, w["norm"], c, y)`.
@@ -44,7 +46,8 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   from `exp16` and merges its parts in its own launch, so `Tensor.attend`'s `parts` stop at one unit a worker;
   attention builds its masks a row's 32 keys at a time, while the key tiles' reads are under way; the SFPU works on a
   matrix's live rows alone; `gather`, `put`, `topk` and a single row's upload read or spread less; `assign` moves
-  straight into a new destination; the bfp4 cast rounds a matrix's live rows alone.
+  straight into a new destination; the bfp4 cast rounds a matrix's live rows alone; `qwen.rule`'s kernel reads its
+  inputs in frames, each while the ops before it run, and of each gate only the head's column.
 
 ### Fixed
 
