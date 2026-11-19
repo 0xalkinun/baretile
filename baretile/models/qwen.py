@@ -22,7 +22,7 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
   Tokens belong to one sequence, or form equal-length groups for several sequences. live marks active
   tokens; inactive tokens leave state unchanged. After the projections, computation uses fp32.
   Decode and verification run the convolution, gates and recurrence in one kernel. Prompts use
-  64-token chunks.
+  pieces, of 32 tokens on the chip (prompt) and of 64 in NumPy (chunk).
 
   state contains [conv, S]:
   - conv holds the previous c.conv - 1 convolution inputs, with one matrix per history position and
@@ -76,7 +76,7 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     o = f.delta(S, x, past, taps, p["dt_bias"], p["decay"], live, *((state[3], accept, state[2]) if m == 2 else ()))
     if isinstance(S, np.ndarray) and llama.state_format(c) == "bf16":  # NumPy's states hold what bf16 ones on the chip do
       for s in (S, *((state[3],) if m == 2 else ())): s[...] = gpt2.bf16_packed(s)
-  else:  # a prompt, maybe in one slot of several. chunk batches its pieces of 64, then runs the state through them in turn
+  else:  # a prompt, maybe in one slot of several, in pieces, the state through them in turn
     # The conv reads each token's inputs from x's rows, or the last ones from the conv state where they lie, which
     # conv_state then writes over in place: a copy of them for one slot of several (Row's), or with live
     held = past if live is None else past + 0
@@ -84,11 +84,14 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     y = conv(x[:, :width], picks, taps, held)
     conv_state(held, x[:, :width], after)
     if held is not state[0]: f.assign(state[0], keep(state[0], held))
-    q, k, v, b, g, _ = gates(y)
-    o, S2 = chunk(q, k, v, f.sigmoid(b), g, S)
-    o = f.now(o)  # o reads the state, so realize it before the state is written over
+    q, k, v, b, g, raw = gates(y)
+    if isinstance(x, Tensor):  # on the chip, pieces of 32 of each sequence, normed and gated (prompt), from an fp32 state
+      S2 = S if S.dtype == "fp32" and live is None else f.assign(f.empty(S.shape), S.float())  # written in place
+      o, S2, done = *prompt(*(t if seqs == 1 else f.now(t) for t in (q, k, v)), raw, S2, seqs), True
+    else: o, S2 = chunk(q, k, v, f.sigmoid(b), g, S)
     S2 = big(state[1], S2)  # rounded to the states' format as it's stored: a cast for bf16 on the chip
-    f.assign(state[1], S2.cast(state[1].dtype) if isinstance(S2, Tensor) else gpt2.bf16_packed(S2) if llama.state_format(c) == "bf16" else S2)
+    if S2 is not state[1]:
+      f.assign(state[1], S2.cast(state[1].dtype) if isinstance(S2, Tensor) else gpt2.bf16_packed(S2) if llama.state_format(c) == "bf16" else S2)
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   if not done:  # each head RMS-normed and gated by z
     o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(x[:, width:width + vw], c.vh))
@@ -175,6 +178,30 @@ def chunk(q, k, v, beta, g, S, size=64):
     o, _, _, S = rule(*(t[i::n, :, :] for t in (q, k, v, beta, g)), S, state=True, normed=True)
     f.assign(f.parts(out, n)[i::n, :, :], o)
   return out if n * s == m else out[:, :m, :], S
+
+def prompt(q, k, v, raw, S, seqs=1):
+  """A prompt on the chip, of seqs sequences of m tokens in turn, in pieces of 32 tokens: each qwen.rule with raw, then
+  qwen.carry takes the sequence's S, an fp32 state, over it, in place. Take q, k, v and S as chunk does, and deltanet's
+  raw for all the sequences. Return the outputs, RMS-normed and gated, in chunk's layout, and S. A piece of one token
+  gets a row of zeros after it, since a slice of one row fills its tile with it, and past a longer prompt its output
+  goes into a row of out's own, as a row can't be written alone."""
+  f, (n, m, vd), kh, vh = llama.fns(q), v.shape, q.shape[0] // seqs, v.shape[0] // seqs
+  out = f.empty((n, m + (m > 1 and m % 32 == 1), vd))
+  for b, i in ((b, i) for b in range(seqs) for i in range(0, m, 32)):
+    s = min(32, m - i)
+    r, x, heads, keys = slice(i, i + s), slice(b * m + i, b * m + i + s), slice(b * vh, b * vh + vh), slice(b * kh, b * kh + kh)
+    rows = lambda t: t if s > 1 else t.pad(((0, 1), (0, 0)))  # x's rows, or each head's
+    qp, kp, vp = (rows(t[keys if t is not v else heads, r, :]) for t in (q, k, v))
+    o, vnew, cum = rule(qp, kp, vp, None, None, S[heads, :, :],
+                        raw=(rows(raw[0][x, :]), rows(raw[1][x, :]), *raw[2:4], rows(raw[4][x, :]), *raw[5:]))
+    w = min(s + (s == 1), out.shape[1] - i)  # the rows the piece writes
+    f.assign(out[heads, i:i + w, :], o if o.shape[1] == w else o[:, :w, :])
+    carry(S[heads, :, :], kp, vnew, cum, *ends(q.rt, s))
+  return out if out.shape[1] == m else out[:, :m, :], S
+
+@functools.cache
+def ends(rt, s):  # carry's end and on for a piece of s tokens, a tile of them
+  return Tensor.of(rt, [[[float(j == s - 1) for j in range(32)]]], "fp32"), Tensor.of(rt, [[[float(j < s)] for j in range(32)]], "fp32")
 
 def delta_kernel(kt, vt, vh, rep, m=1, dtype="fp32"):
   """The kernel for delta: the Gated DeltaNet decode step of each sequence, or a verify step's token and its draft,

@@ -116,11 +116,11 @@ prompt's last with a cast), half up as the packer rounds, which differs from
 rounding to nearest even only on exact ties.
 
 A prompt's convolution reads the last inputs from the conv state where they lie,
-and `qwen.conv_state` writes the new ones. The gated delta rule works in pieces of 64 tokens.
-Within a piece, each token's correction solves a triangular system, whose inverse
-`qwen.corrected` builds by joining blocks, from single tokens up: each step reads only inverses, which stay
-near 1. On the chip a piece is one kernel, `qwen.rule`: every product on the FPU, which reads the fp32 tiles as
-TF32, and the rest on the SFPU. State updates are written in place so later replays see the new state.
+and `qwen.conv_state` writes the new ones. The gated delta rule works in pieces, of 64 tokens in NumPy
+(`qwen.chunk`) and of 32 on the chip (`qwen.prompt`). Within a piece, each token's correction solves a triangular
+system, whose inverse is built by joining blocks, from single tokens up, each step reading only inverses, which stay
+near 1. On the chip a piece is one `qwen.rule` kernel, which makes the gates, the rule and the norm, then `qwen.carry`,
+which takes the state over the piece, in place, so later replays see it. Products run on the FPU, the rest on the SFPU.
 
 These operations also take tokens in an order of their own, such as a tree's:
 
