@@ -32,6 +32,7 @@ which [#7](https://github.com/0xalkinun/baretile/issues/7) defines.
 | `tensor.Tensor`: its constructors, operations, movement, `cast`, `realize`, `assign`, `tolist`, `tobytes`, `backward` and `gradient` | Tensors | stable |
 | `Tensor.to`, `Tensor.columns`, `Tensor.run` | Moving to another chip, storage by tile columns, launching a kernel | experimental |
 | `Tensor.rounded` | fp32 values rounded to fp16, kept in fp32, for a framework's fp16 tensors | experimental |
+| `Tensor.filled` | A view of one column of a kernel's output that fills its tiles with it | experimental |
 | `tensor.jit` | Recording and replaying a function's launches | stable |
 | `tensor.Recording`, `runtime.Bound` | Recordings by hand | experimental |
 | `baretile.tensix`, `baretile.kernels` | Tensix code generation and the kernels | experimental |

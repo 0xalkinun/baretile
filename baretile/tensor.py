@@ -309,6 +309,14 @@ class Tensor:
     else:
       t = self._map(shape, (0, 1, 2), [g.start for g in ranges], [g.step for g in ranges])
     return t._track("slice", (self,), ranges)
+  def filled(self, c, rows):
+    """Column c of each matrix's first rows rows, as a view that shares storage, where a slice of one column copies.
+    It's valid only where the kernel that made this tensor filled column c's tiles across, each of their 32 columns
+    holding column c, and left 0 in the rows past those taken: every 1-column tensor's tiles are filled so, and kernels
+    read the view like one. Nothing checks this, and a wrong call gives wrong values with no error. The view keeps
+    the whole tensor alive."""
+    if not (0 <= c < self.cols and 0 < rows <= self.rows): raise ValueError(f"{self.shape}: no column {c}, {rows} rows")
+    return self._view(rows, 1, self.batch, c // 32, self.bstride)
 
   def _lead_item(self, key):
     """x[i], or slices with leading dimensions, where missing leading slices are whole. Leading slices that pick
@@ -885,9 +893,8 @@ class Tensor:
     out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(),
             *places._where(), kt,
             self.rows, units=units * P, name="attention")
-    # p v over the sums, each sum filling its tile's 32 columns, a valid 1-column view
-    view = lambda at, cols: out._view(out.rows, cols, self.batch, at, out.bstride)
-    return (view(0, self.cols) / view(ht, 1)).cast("bf16")
+    # p v over the sums, which fill their tiles
+    return (out[:, :, :self.cols] / out.filled(self.cols, self.rows)).cast("bf16")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above so autograd works on them
   @_matrices
