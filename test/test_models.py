@@ -4,7 +4,7 @@ import numpy as np
 from types import SimpleNamespace
 from baretile import bh, pci, tensix, tensor
 from baretile.tensor import Tensor
-from baretile.runtime import Bound, Runtime
+from baretile.runtime import TIMES, Bound, Runtime
 from conftest import bf16, scheduled, value
 import benchmark, train, train_reference
 from baretile.models import cost, gpt2, llama, qwen, serve
@@ -1787,7 +1787,7 @@ def test_delta_step(chip):
 
 def test_delta_pieces(chip):
   # qwen.chunk runs a Gated DeltaNet prompt in pieces of 64 tokens, and must match a piece at a time to 1e-6. Then the
-  # small Qwen3.5 runs a 150-token prompt, three pieces with the last one padded, within 5% of numpy.
+  # small Qwen3.5 runs a 150-token prompt within 5% of numpy, which runs three pieces of 64, the chip five of 32.
   rng = np.random.default_rng(47)
   c, weights = qwen35(rng, places=256)
   w = llama.arrays(weights)
@@ -1837,21 +1837,42 @@ def test_delta_pieces(chip):
   whole, kept = calls(*up, llama.zeros(rt), (0, 150))
   got, states = calls(*up, llama.zeros(rt), cuts)
   assert rel(got, want) < 0.02 and np.array_equal(states[0], kept[0]), rel(got, want)
-  # Three sequences of 4 tokens together, the second not live, from states of their own: its states stay as they were,
+  # Three sequences of 33 tokens together, two pieces each, the second not live, from states of their own: its states stay as they were,
   # exactly in NumPy and to 1e-6 on the chip, where x + 0 (y - x) reads x as TF32, and the others' outputs and states
   # are theirs alone, to 1e-5 in NumPy and within 2% on the chip
-  live, h = np.repeat([1.0, 0.0, 1.0], 4)[:, None], bf16(rng.normal(0, 1, (12, c.dim)))
+  live, h = np.repeat([1.0, 0.0, 1.0], 33)[:, None], bf16(rng.normal(0, 1, (99, c.dim)))
   conv, S = rng.normal(0, 1, (c.conv - 1, 3, 2 * c.kh * c.kd + c.vh * c.vd)), rng.normal(0, 0.1, (3 * c.vh, c.kd, c.vd))
   fp32 = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
   for (p, up), held, d, free in ((p, np.copy, 1e-5, 0), (up, fp32, 0.02, 1e-6)):
     many = [held(conv), held(S)]
-    o = value(qwen.deltanet(up(h), p, c, many, phases, live if held is np.copy else Tensor.of(rt, live.tolist()))).reshape(12, -1)
+    o = value(qwen.deltanet(up(h), p, c, many, phases, live if held is np.copy else Tensor.of(rt, live.tolist()))).reshape(99, -1)
     slot = lambda a, i, u: a[:, u:u + 1] if i == 0 else a[c.vh * u:c.vh * (u + 1)]  # sequence u's conv state, then its S
     assert all(rel(slot(value(s), i, 1), slot(b, i, 1)) <= free for i, (s, b) in enumerate(zip(many, (conv, S)))), "a free slot's states"
     for u in (0, 2):
       alone = [held(slot(conv, 0, u)), held(slot(S, 1, u))]
-      assert rel(o[4 * u:4 * u + 4], value(qwen.deltanet(up(h[4 * u:4 * u + 4]), p, c, alone, phases)).reshape(4, -1)) < d, u
+      assert rel(o[33 * u:33 * u + 33], value(qwen.deltanet(up(h[33 * u:33 * u + 33]), p, c, alone, phases)).reshape(33, -1)) < d, u
       assert all(rel(slot(value(s), i, u), value(a)) < d for i, (s, a) in enumerate(zip(many, alone))), u
+
+def test_delta_prompt(chip):
+  # On the chip a prompt runs in pieces of 32 tokens, each qwen.rule with the gates and the norm in its kernel, then
+  # qwen.carry takes the state over it. Prompts of 1, 31, 32, 33 and 100 tokens in one slot of three, so even 1 token
+  # is a prompt, each after a prompt of 40, so the states aren't zero: the outputs and the states within 1% of NumPy's
+  rng, rt, phases = np.random.default_rng(89), Runtime(chip), lambda op: None
+  c, weights = qwen35(rng)
+  p, t = gpt2.block(llama.arrays(weights), "layers.0."), gpt2.block(llama.upload(rt, weights), "layers.0.")
+  rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
+  for m in (1, 31, 32, 33, 100):
+    first, then = bf16(rng.normal(0, 1, (40, c.dim))), bf16(rng.normal(0, 1, (m, c.dim)))
+    got = []
+    for w, up, zeros in ((p, lambda a: a, np.zeros), (t, lambda a: Tensor.of(rt, a.tolist()), llama.zeros(rt))):
+      kv = llama.kv_cache(c, 3 * 64, zeros, 3)
+      qwen.deltanet(up(first), w, c, llama.slot(c, kv, 1, 3)[0], phases)
+      since = rt.launches
+      got.append([value(qwen.deltanet(up(then), w, c, llama.slot(c, kv, 1, 3)[0], phases)).reshape(m, -1), *map(value, kv[0])])
+    errors = [rel(a, b) for a, b in zip(got[1], got[0])]
+    assert max(errors) < 0.01, (m, errors)
+    names = [rt.sent[n % TIMES][0] for n in range(since + 1, rt.launches + 1)]
+    assert names.count("rule") == names.count("carry") == -(-m // 32), (m, names)  # a launch of each a piece
 
 def test_delta_solve(chip):
   # qwen.chunk solves each piece's corrections, (I + L) u = beta v, by joining blocks. A product (I + P)(I + P^2)... over

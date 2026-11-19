@@ -32,6 +32,10 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 
 ### Changed
 
+- On the chip a Gated DeltaNet prompt runs each sequence in pieces of 32 tokens (`qwen.prompt`), a `qwen.rule` launch
+  that makes the gates and the output norm, then a `qwen.carry` launch, where `qwen.chunk` ran about 20 tensor-op
+  launches for each piece of 64. The state stays fp32 through the prompt and is rounded once into a bf16 cache.
+  `qwen.chunk` remains NumPy's prompt and runs on the chip when called.
 - A Gated DeltaNet prompt's convolution reads the last inputs from the conv state where they lie, and
   `qwen.conv_state` writes the new ones, from up to 1,024 picks: a layer takes 3 launches fewer. `qwen.shifted`
   returns `(picks, after)`, for `qwen.conv` with `last` and for `qwen.conv_state`; a pick past x's rows reads the

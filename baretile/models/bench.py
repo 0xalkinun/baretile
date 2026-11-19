@@ -63,16 +63,13 @@ def table(chip, probe=None):
   row("attention, 6 rows over 8192 bf16 positions", seconds(lambda: q.attend(k, v, places, fidelity=4).realize()),
       2 * KV * keys * HEAD * 2, "GB/s of the cache", dram)
   width = 2 * KH * HD + VH * HD  # Gated DeltaNet's decode step for one token: the states are read and written once
-  S, x = zeros(HD, HD, VH, "fp32"), zeros(1, width + VH * HD + 2 * VH, 1, "fp32")
+  x = zeros(1, width + VH * HD + 2 * VH, 1, "fp32")
   conv, taps, dt, decay = zeros(1, width, 3, "fp32"), zeros(1, width, 4, "fp32"), zeros(1, VH, 1, "fp32"), zeros(1, VH, 1, "fp32")
   live = Tensor.of(rt, [[1.0]])
   for d, what in (("fp32", ""), ("bf16", ", bf16 states")):
     held = zeros(HD, HD, VH, d)
     row(f"Gated DeltaNet, a decode step{what}", seconds(lambda: qwen.delta(held, x, conv, taps, dt, decay, live).realize()),
         2 * VH * HD * HD * tile_bytes(d) // 1024, "GB/s of the states")
-  for m in (32, 64):  # and by the chunked rule, from tensor operations, as a prompt's piece runs it
-    (q, k), (v, beta, g) = (zeros(m, HD, KH, "fp32") for _ in range(2)), (zeros(m, c, VH, "fp32") for c in (HD, 1, 1))
-    row(f"Gated DeltaNet, {m} tokens by the chunked rule", seconds(lambda: [t.realize() for t in qwen.chunk(q, k, v, beta, g, S)]))
   (x, y), w = (zeros(32, DIM, 1, "fp32") for _ in range(2)), zeros(1, DIM)  # the fp32 residual stream and a block's output
   row(f"RMSNorm of the stream and a block's output, 32 rows of {DIM}",
       seconds(lambda: [t.realize() for t in llama.rms(x, w, SimpleNamespace(eps=1e-6, centered=True), y)]))
