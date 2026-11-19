@@ -502,14 +502,18 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   q, k, v = heads[:c.heads, :, :], cache[:c.kv, :, :], cache[c.kv:, :, :]
   sinks = p.get("sinks")  # gpt-oss: each head has a sink, a logit that counts in the softmax but has no value
   # A few rows, as a decode step's: a key head's query heads as the rows of one tile row, which reads each key and value
-  # tile once for them all. 32 rows would take 4 tile rows a unit, which is slower than a unit a head.
-  grouped = not slots and places is not None and attends(c, p) and n * rep <= 32 and places.shape[:2] == (1, n)
+  # tile once for them all. 32 rows would take 4 tile rows a unit, which is slower than a unit a head. Places of n rep
+  # rows are by head already: each row's rep times in turn, as serve.frontier's with rep.
+  grouped = (not slots and places is not None and attends(c, p) and n * rep <= 32
+             and places.shape[:2] in ((1, n), (1, n * rep)))
   if grouped:
     q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv, n * rep, hd)
-    by_head = places.__dict__.setdefault("by_head", {})  # each row's place, made once for a call's layers
-    if rep not in by_head:  # with its tree's columns, if any
-      by_head[rep] = f.expand(places.reshape(n, 1, w := places.shape[-1]), (n, rep, w)).reshape(1, n * rep, w).realize()
-    places = by_head[rep]
+    if places.shape[1] != n * rep:
+      by_head = places.__dict__.setdefault("by_head", {})  # each row's place, made once for a call's layers
+      if rep not in by_head:  # with its tree's columns, if any
+        w = places.shape[-1]
+        by_head[rep] = f.expand(places.reshape(n, 1, w), (n, rep, w)).reshape(1, n * rep, w).realize()
+      places = by_head[rep]
   if slots:  # a batch entry for each key head and sequence, with its query heads' rows side by side
     k, v, t = f.parts(k, slots), f.parts(v, slots), n // slots
     q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv * slots, t * rep, hd)

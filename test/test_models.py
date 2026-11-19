@@ -1293,10 +1293,11 @@ def test_tokenizer_gate(tmp_path, monkeypatch):
   monkeypatch.setattr(llama.Tokenizer, "encode", lambda self, text, special=False: [0])
   assert len(tokenizer.check(str(tmp_path))) == len(tokenizer.TEXTS)
 
-@pytest.mark.parametrize("n", [16, 40])
+@pytest.mark.parametrize("n", [6, 16, 40])
 def test_llama_layer(chip, n):
   # A Llama block in SmolLM-135M's shapes on n tokens, against the same code in numpy float64. The intermediates are
-  # bf16 here, so the test allows 3% error in the block's change to x.
+  # bf16 here, so the test allows 3% error in the block's change to x. 6 tokens take attention's grouped path, which
+  # repeats each row's place for its key head's 3 query heads, in two launches, or takes them so already, to the bit.
   rt, rng = Runtime(chip), np.random.default_rng(12)
   c, w = smol(rng, 1)
   p = {k.removeprefix("layers.0."): v for k, v in w.items() if k.startswith("layers.0.")}
@@ -1305,8 +1306,16 @@ def test_llama_layer(chip, n):
   on = lambda a: Tensor.of(rt, a.tolist())
   cache, np_cache = on(np.zeros((6, n, 64))), np.zeros((6, n, 64))
   places = Tensor.of(rt, [list(range(n))], "int32")
-  got = llama.layer(on(x), None, {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn), places),
-                    (on(mask), places.reshape(1, n, 1), 0), cache, places)
+  tx, tp, rotary, tmask = on(x), {k: on(v) for k, v in p.items()}, (on(cos), on(sin), on(turn), places), on(mask)
+  run = lambda at: [t.realize() for t in llama.layer(tx, None, tp, c, rotary, (tmask, at, 0), cache, places)]
+  got = run(places.reshape(1, n, 1))
+  if n == 6:
+    launches = []
+    for at in places.reshape(1, n, 1).realize(), Tensor.of(rt, [[i] for i in range(n) for _ in range(3)], "int32"):
+      before, again = rt.launches, run(at)
+      launches.append(rt.launches - before)
+      assert all(a.tobytes() == b.tobytes() for a, b in zip(again, got))
+    assert launches[1] == launches[0] - 2, launches
   want = llama.layer(x, None, p, c, (np.float64(cos), np.float64(sin), turn, range(n)), np.float64(mask), np_cache, range(n))
   got, want = got[0] + got[1], want[0] + want[1]  # the stream after the block
   change = np.abs(want - x).max()
@@ -2698,18 +2707,20 @@ def test_frontier(chip):
   # serve.frontier takes a tree's next pass on the chip: the n best of a pass's candidates by score, ties to the first,
   # and for each its token, its parent's row, attend's places (its row, the base, its parent's bits with its own), its
   # cache row, the position and its score, with the candidates logged. The cases: 4 of 4 candidates from one row,
-  # then 6 of 24 with ties, -0 and 0 and negative scores, with bits in every column; then a log alone.
+  # then 6 of 24 with ties, -0 and 0 and negative scores, with bits in every column, and again with places by head, 4
+  # rows each, of which frontier reads the first; then a log alone, with places by head too.
   rt, rng = Runtime(chip), np.random.default_rng(7)
   vocab = rng.choice(250000, 300, replace=False)
   table, log = Tensor.of(rt, [[int(v)] for v in vocab], "int32"), Tensor.zeros(rt, 12, 96, dtype="int32").realize()
   length = Tensor.of(rt, [[1000]], "int32")
-  for p, b, n, start, depth, row in ((1, 4, 4, 0, 0, 0), (6, 4, 6, 40, 7, 5), (6, 4, 0, 0, 0, 11)):
+  for p, b, n, start, depth, row, rep in ((1, 4, 4, 0, 0, 0, 1), (6, 4, 6, 40, 7, 5, 1), (6, 4, 6, 40, 7, 4, 4),
+                                          (6, 4, 0, 0, 0, 11, 4)):
     s = -rng.random((p, b)).astype(np.float32) * 5
     if p > 1: s[1, 2] = s[4, 0] = s.max() + 1; s[2, 3], s[3, 1] = -0.0, 0.0
-    cols, sees = rng.integers(0, 300, (p, b)), np.zeros((p, 8), np.int64)
-    sees[:, 2:] = rng.integers(0, 1 << 16, (p, 6)) if p > 1 else 0
+    cols, sees = rng.integers(0, 300, (p, b)), np.zeros((p * rep, 8), np.int64)
+    sees[:, 2:] = rng.integers(0, 1 << 16, (p * rep, 6)) if p > 1 else 0
     got = serve.frontier(Tensor.frombytes(rt, p, b, s.tobytes(), dtype="fp32"), Tensor.of(rt, cols.tolist(), "int32"),
-                         Tensor.of(rt, sees.tolist(), "int32"), length, table, log, row, n, start, depth)
+                         Tensor.of(rt, sees.tolist(), "int32"), length, table, log, row, n, start, depth, rep)
     keys = np.where(s == 0, 0.0, s).ravel()  # -0 as 0, as topk keys it
     pick = np.argsort(-keys, kind="stable")[:n]
     logged = value(log).reshape(12, 96)[row]
@@ -2717,12 +2728,17 @@ def test_frontier(chip):
     assert np.array_equal(logged[64:64 + p * b], vocab[cols.ravel()])
     if not n: assert got is None; continue
     tok, parent, places, rows, pos, score = (value(t).reshape(t.shape[-2:]) for t in got)
-    want = sees[pick // b].copy()
+    want = sees[pick // b * rep].copy()
     want[:, 0], want[:, 1] = 1000 + start + np.arange(n), 1000
     for i in range(n): want[i, 2 + (start + i) // 16] |= 1 << (start + i) % 16
     assert np.array_equal(tok, vocab[cols.ravel()[pick]][None]) and np.array_equal(parent, (pick // b)[None])
-    assert np.array_equal(places, want) and np.array_equal(rows, want[None, :, 0]) and pos.tolist() == [[1000 + depth]]
+    assert np.array_equal(places, np.repeat(want, rep, 0)) and np.array_equal(rows, want[None, :, 0])
+    assert pos.tolist() == [[1000 + depth]]
     assert np.array_equal(score.astype(np.float32).view(np.uint32), s.ravel()[pick, None].view(np.uint32))
+  for sees, rep in (sees, 2), (np.zeros((48, 8), np.int64), 8):  # the last case's, 4 rows each, and more than a tile
+    with pytest.raises(ValueError, match="rep rows each"):
+      serve.frontier(Tensor.frombytes(rt, p, b, s.tobytes(), dtype="fp32"), Tensor.of(rt, cols.tolist(), "int32"),
+                     Tensor.of(rt, sees.tolist(), "int32"), length, table, log, row, 0, 0, 0, rep)
 
 def test_sampling():
   # Request.pick samples from the head of a row (serve.Head), checked against a full sort of the vocabulary. top_p on a

@@ -106,30 +106,32 @@ def grouped_scan(k, cols, dtype, groups):
           }}
       }}"""
 
-def frontier(scores, cols, sees, length, vocab, log, row, n=0, start=0, depth=0):
+def frontier(scores, cols, sees, length, vocab, log, row, n=0, start=0, depth=0, rep=1):
   """A step of best-first search over a tree of tokens, on the chip: the n best of a pass's candidates, from its scores
-  (p, b) fp32, each candidate's path score, cols (p, b) int32, its token's row in vocab (V, 1) int32, and sees (p, 8)
-  int32, attend's tree places of each candidate's parent (row p's): its row, the tree's first key, and bits of the
-  tree's tokens it sees, 16 a column. Return (tokens 1 x n, their parents' rows 1 x n, places n x 8, cache rows 1 x n,
-  position 1 x 1, scores n x 1) for the pass that runs them, each pick i at cache row length + start + i, seeing the
-  tree's tokens its parent sees and itself (bit start + i), at position length + depth, with length a 1 x 1 int32. Of
-  equal scores, the first in row order wins. Log row `row` of log (R, 96) int32 gets the picks, then the candidates'
-  scores as fp32 bits and their tokens, in tile columns 0, 1 and 2, p b of each. With n 0, it only logs. BRISC does it
-  all, on one worker."""
+  (p, b) fp32, each candidate's path score, cols (p, b) int32, its token's row in vocab (V, 1) int32, and sees
+  (p rep, 8) int32, attend's tree places of each candidate's parent (row p's): its row, the tree's first key, and bits
+  of the tree's tokens it sees, 16 a column. Return (tokens 1 x n, their parents' rows 1 x n, places n rep x 8, cache
+  rows 1 x n, position 1 x 1, scores n x 1) for the pass that runs them, each pick i at cache row length + start + i,
+  seeing the tree's tokens its parent sees and itself (bit start + i), at position length + depth, with length a 1 x 1
+  int32. Of equal scores, the first in row order wins. Log row `row` of log (R, 96) int32 gets the picks, then the
+  candidates' scores as fp32 bits and their tokens, in tile columns 0, 1 and 2, p b of each. With n 0, it only logs.
+  BRISC does it all, on one worker. places and sees hold each row rep times in turn, up to 32 rows, as llama.attention
+  takes places by head for a key head's rep query heads; of a parent's rep rows frontier reads the first."""
   p, b = scores.shape[-2:]
-  if not (n <= p * b <= 32 and start + n <= 96 and cols.shape[-2:] == (p, b) and sees.shape[-2:] == (p, 8)
-          and log.cols == 96 and row < log.rows and scores.dtype == "fp32"
+  if not (n <= p * b <= 32 and start + n <= 96 and cols.shape[-2:] == (p, b) and sees.shape[-2:] == (p * rep, 8)
+          and 0 < rep and max(n, p) * rep <= 32 and log.cols == 96 and row < log.rows and scores.dtype == "fp32"
           and all(t.dtype == "int32" for t in (cols, sees, log))):
-    raise ValueError(f"frontier takes up to 32 fp32 scores, their int32 columns and places 8 wide, n of them at most "
-                     f"and ending by token 96, and logs into 96 int32 columns: {scores.shape}, n={n}, start={start}")
+    raise ValueError(f"frontier takes up to 32 fp32 scores, their int32 columns and places 8 wide, rep rows each and "
+                     f"up to 32, n of them at most and ending by token 96, and logs into 96 int32 columns: "
+                     f"{scores.shape}, places {sees.shape}, n={n}, start={start}, rep={rep}")
   new = lambda r, c, d="int32": Tensor(scores.rt, r, c, dtype=d)
-  outs = [new(1, n), new(1, n), new(n, 8), new(1, n), new(1, 1), new(n, 1, "fp32")] if n else [log] * 6
-  key = ("frontier", p, b, n, start, depth, row)
+  outs = [new(1, n), new(1, n), new(n * rep, 8), new(1, n), new(1, 1), new(n, 1, "fp32")] if n else [log] * 6
+  key = ("frontier", p, b, n, start, depth, row, rep)
   log.run(key, lambda: frontier_kernel(*key[1:]), *outs, log, scores, cols, sees, length, vocab, units=1,
           name="frontier")
   return outs if n else None
 
-def frontier_kernel(p, b, n, start, depth, row):
+def frontier_kernel(p, b, n, start, depth, row, rep):
   """frontier's kernel. args: [first unit, units], then four words for each tensor (DRAM address, batch and row tile
   strides, tile offset): the six results, the log, then scores, cols, sees, length and vocab. BRISC reads the four
   small inputs' tiles and each candidate's token, keys the scores as topk does, takes the n best by selection, and
@@ -147,8 +149,11 @@ def frontier_kernel(p, b, n, start, depth, row):
     unsigned j = pick[i], r = j / {b}, crow = L + {start} + i, own = {start} + i;
     for (unsigned q = 0; q < 32; q++)
       TOK[at(q, i)] = token[j], PAR[at(q, i)] = r, CROW[at(q, i)] = crow, SCORE[at(i, q)] = s[at(r, j % {b})];
-    PLACE[at(i, 0)] = crow, PLACE[at(i, 1)] = L;
-    for (unsigned h = 0; h < 6; h++) PLACE[at(i, 2 + h)] = prev[at(r, 2 + h)] | (h == own / 16 ? 1u << own % 16 : 0);
+    for (unsigned e = i * {rep}; e < (i + 1) * {rep}; e++) {{  // its rep rows of places
+      PLACE[at(e, 0)] = crow, PLACE[at(e, 1)] = L;
+      for (unsigned h = 0; h < 6; h++)
+        PLACE[at(e, 2 + h)] = prev[at(r * {rep}, 2 + h)] | (h == own / 16 ? 1u << own % 16 : 0);
+    }}
   }}
   for (unsigned q = 0; q < 1024; q++) POS[q] = L + {depth};
   {" ".join(put(4 + k, 2 + 4 * k) for k in range(6))}""" if n else ""
