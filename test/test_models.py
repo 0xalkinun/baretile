@@ -1953,6 +1953,24 @@ def test_delta_tree(chip):
     assert rel(value(qwen.carry(*(Tensor.frombytes(one, *a.shape[1:], np.float32(a).tobytes(), a.shape[0], "fp32") for a in given))),
                qwen.carry(S.copy(), *given[1:])) < 0.01
 
+def test_delta_decays(chip):
+  # With strong decays, like those of some of Qwen3.5-9B's heads, cum runs to -50 within a piece, and the decays e^(cum_i
+  # - cum_j) magnify its error. rule's kernel and carry's make cum on the FPU from two parts of g, which must each fit
+  # the 10 significand bits that a product keeps: cum within 1e-6 of NumPy (5.5e-7 here; 1.2e-6 with the second part
+  # unrounded, 3.9e-6 with it in bf16), the outputs and the state within 0.5% (0.15% and 0.13% here). A first part of
+  # TF32's 11 significand bits lost its last: cum was 5e-4 off, the outputs 0.7%, the state 1.2%
+  rng, rt = np.random.default_rng(83), Runtime(chip)
+  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
+  rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
+  q, k, v = rng.normal(0, 1, (1, 32, 64)), rng.normal(0, 1, (1, 32, 64)), rng.normal(0, 1, (2, 32, 32))
+  beta, g, S = rng.uniform(0, 1, (2, 32, 1)), np.float32(-np.exp(rng.normal(0, 1, (2, 32, 1)))), rng.normal(0, 0.1, (2, 64, 32))
+  want = qwen.rule(q, k, v, beta, g, S)
+  got = [value(t) for t in qwen.rule(*map(up, (q, k, v, beta, g, S)))]
+  assert rel(got[2], want[2]) < 1e-6 and rel(got[0], want[0]) < 0.005, (rel(got[2], want[2]), rel(got[0], want[0]))
+  end, on = np.eye(32)[None, 31:], np.ones((1, 32, 1))
+  after = qwen.rule(q, k, v, beta, g, S, state=True)[3]
+  assert rel(value(qwen.carry(up(S), up(k), *map(up, want[1:]), up(end), up(on))), after) < 0.005
+
 def test_conv_last(chip):
   # qwen.conv reads each token's inputs from the table, or past its rows from the conv state where it lies (last): as
   # conv over the table with last's rows after it, exactly in NumPy and within 1e-5 on the chip (the SiLU's e^x), for

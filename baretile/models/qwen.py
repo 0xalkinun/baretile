@@ -682,9 +682,10 @@ R2, R3 = 2 * DST_HALF, 3 * DST_HALF  # where an op fills tiles for the SFPU besi
 
 class Tiles:
   """A kernel of tile ops for one unit at a time, all in fp32 (rule_kernel, carry_kernel). Every product runs on the
-  FPU, which reads fp32 tiles as TF32 (10 bits of mantissa), and everything else on the SFPU. The unpacker truncates
-  to TF32, a bias that sums over K, so every tile the FPU reads is rounded to nearest first: op rounds what it keeps,
-  unless it's exact, for the SFPU alone. The math thread unpacks everything: into Dst for the SFPU, into SrcA and SrcB
+  FPU, which reads fp32 tiles as TF32 (11 significand bits), and everything else on the SFPU. The unpacker truncates
+  to TF32, a bias that sums over K, so every tile the FPU reads is rounded to TF32 first: op rounds what it keeps,
+  unless it's exact, for the SFPU alone. A product keeps 10 of an operand's 11 significand bits, as measured on ttsim
+  and the card (parts), so it still drops the last. The math thread unpacks everything: into Dst for the SFPU, into SrcA and SrcB
   for the FPU. Each op makes one tile in a Dst half, which pack writes into L1 for the ops after it, or for BRISC to
   write out to a tile of the result.
 
@@ -699,9 +700,10 @@ class Tiles:
               "rsub": lambda r: [sfp_load(0, r), sfp_load(1, R2), mad(2, 0, ONE, 1, neg=1), sfp_store(2, r)],  # R2 - r
               "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, r)],
               "fma": lambda r: [sfp_load(0, r), sfp_load(1, R2), sfp_load(2, R3), mad(3, 1, 2, 0), sfp_store(3, r)],
-              "round": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_store(0, r, mod0=RAW)],  # to TF32's 10 bits
-              # what rounding to TF32 leaves: x - round(x), exact in fp32, and min(x, 0)
-              "lo": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_load(5, r), mad(6, 0, ONE, 5, neg=1), sfp_store(6, r)],
+              "round": lambda r: [sfp_load(0, r), *SFPU["ftoh"][1][1:-1], sfp_store(0, r, mod0=RAW)],  # to TF32's 11 significand bits
+              # to bf16's 8 bits (half up), what that leaves (x - hi(x), exact in fp32), and min(x, 0)
+              "hi": lambda r: [sfp_load(0, r), *SFPU["ftob"][1][1:-1], sfp_store(0, r, mod0=RAW)],
+              "lo": lambda r: [sfp_load(0, r), *SFPU["ftob"][1][1:-1], sfp_load(5, r), mad(6, 0, ONE, 5, neg=1), sfp_store(6, r)],
               "min0": lambda r: [sfp_load(0, r), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=0, vc=1, mod1=1),
                                  sfp_store(0, r)],
               "square": lambda r: [sfp_load(0, r), mul(1, 0, 0), sfp_store(1, r)],
@@ -764,7 +766,7 @@ class Tiles:
     elif start in self.wide: words.append(tt([DST_FREE] + free + aim("h") + self.widened(start, 0) + aim(0)))
     else: words.append(tt([DST_FREE] + free + fill(start, "h") + FILLED))
     kept = home is None or slot != self.OUT
-    for p, ts in [*posts, *[("round", ())] * (kept and not exact)]:  # an FPU operand: TF32 to nearest, unbiased
+    for p, ts in [*posts, *[("round", ())] * (kept and not exact)]:  # an FPU operand, to TF32's nearest (a product drops its last bit)
       if p in self.library: self.called.add(p)
       run = f"{tt(aim('h'))} p_{p}(); {tt(aim(0))}" if p in self.library else f"p_{p}(h);"
       put = lambda t, r: self.widened(t, r) if t in self.wide else fill(t, r)
@@ -789,8 +791,9 @@ class Tiles:
     self.op(slot, start=row, posts=[("square", ()), *[("fma", (row + c, row + c)) for c in range(1, kt)], ("sum2", ()),
                                     ("eps", ()), ("sqrt", ()), ("frecip", ()), *[("scale", ())] * (scale != 1)], exact=True)
 
-  def parts(self, at, i, **made):  # a tile in two TF32 parts, rounded and what that leaves, for the FPU: 22 bits of it
-    for p in range(2): self.op(at(i, p), **made, posts=[("lo", ())] * p)
+  def parts(self, at, i, **made):  # a tile in two parts for the FPU, which keeps 10 significand bits of an operand: bf16's
+    # 8, then what they leave, rounded to TF32: 18 bits of it. A first part of TF32's 11 lost its last
+    for p in range(2): self.op(at(i, p), **made, posts=[("lo" if p else "hi", ())], exact=not p)
 
   @staticmethod
   def get(i, base, rows, cols, b="e", bf16=False):  # BRISC's fetch of rows x cols tiles of the tensor at word i, from slot
@@ -813,11 +816,11 @@ class Tiles:
     units = lambda body: f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned e = a[0] + u; {body} }}"
     if len(fetch) != 1 + sum(m == "fetched();" for m, _ in self.ops): raise ValueError(f"{name}: a frame of fetch for each later()")
     brisc = units(f"reached(frame_done[0]); {' ready(); '.join(fetch)} ready(); frame_done[0] = ++events;")
-    cfg = kernel_config("fp32", "fp32")
+    cfg, setups = kernel_config("fp32", "fp32"), {"round": SFPU["ftoh"][0], "hi": SFPU["ftob"][0], "lo": SFPU["ftob"][0]}
     library = "".join(f"__attribute__((noinline)) static void p_{n}(void) {{ {tt(self.library[n])} }}\n" for n in sorted(self.called))
     return compile_kernel(brisc_program(f"a[1] * {total}", brisc, "fp32", self.out), unpack_program(units("fetched();"), cfg),
                           math_program(self.replays, units("fetched(); " + " ".join(m for m, _ in self.ops) + " " + tt(REPORT)),
-                                       True, helpers(self.programs, {"round": SFPU["ftoh"][0], "lo": SFPU["ftoh"][0]}) + library,
+                                       True, helpers(self.programs, setups) + library,
                                        wide=True),
                           pack_program(units(" ".join(c for _, c in self.ops) + self.switch("fp32")), 2 + len(self.keeps)))
 
@@ -841,7 +844,7 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None, dtype="fp32"):
   come as the conv gives them, and the kernel takes them to length 1 (q then times kd^-1/2, as qwen.unit), and makes
   cum, which goes out after v_new, its tiles filled, the decays, and the rounded q, k, kb, kbe, qe and vb, each
   rounded once. cum = seen g, and cum's column filling its tiles, or turned for cum_i - cum_j, come from the FPU, from two
-  TF32 parts of each value: 22 bits of it, where the tensor ops' fp32 matmul has bf16's two parts, 16. With gated, it
+  parts of each value, 18 significand bits of it, where the tensor ops' fp32 matmul has bf16's two, 16. With gated, it
   makes beta = sigmoid(b) and g = decay softplus(a + dt_bias) too, for one sequence: BRISC reads the unit's column of
   each, b's and a's from the two faces that hold it and dt_bias's and decay's from their row, and copies it into
   column 0, and the SFPU spreads each row's value along its row. a + dt_bias and g go in slots of the inverse's,
@@ -861,7 +864,7 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None, dtype="fp32"):
   NW, VN, QK = t.take(st * kt, kt), t.take(st * vt, vt), t.take(st * st, st)
   SR = t.take(kt * vt, vt)  # the state rounded, for the FPU
   scaled_rows = lambda: ([t.take(st * kt, kt) for _ in range(5)], t.take(st * vt, vt))
-  if scaled:  # made here, so within the packer's reach: the scaled rows, g and cum in two TF32 parts, cum filling
+  if scaled:  # made here, so within the packer's reach: the scaled rows, g and cum in two parts, cum filling
     (Q, K, KB, KBE, QE), VB = scaled_rows()  # its tiles, e^cum and the decays
     GP, CP, CU, EE, DC = t.take(2 * st, 2), t.take(2 * st, 2), t.take(st), t.take(st), t.take(st * st, st)
     if gated: BE, TM, GI = t.take(st), X(0, 0), LP(0, 0)
@@ -1036,7 +1039,7 @@ def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False, raw=None):
 
 def carry_kernel(st, kt, vt, rep, per, dtype="fp32"):
   """The kernel for carry, one value head a unit, in Tiles' ops: w = on e^min(G - cum, 0) filling its tiles, where G
-  is cum at end (end's row filled down, times cum's column filled, from two TF32 parts), then S = e^G S + (k w)^T
+  is cum at end (end's row filled down, times cum's column filled, from two parts), then S = e^G S + (k w)^T
   v_new, k w turned by the identity, with S as it came. A unit fetches S last, while the ops that come before
   its rows run, and each column of k w is turned just before the rows of S that read it. st, kt and vt are as rule_kernel's.
 

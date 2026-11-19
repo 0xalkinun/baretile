@@ -67,6 +67,10 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   up; `Chip` refuses the Tensix config bank and reads back a write forwarded to host memory; a runtime zeroes a tile's
   NoC counts before its firmware starts; tt-kmd's file stays open at exit until the runtimes stop.
 - A prompt's tokens take prefill's precision even one at a time, so a cached prompt gives the same tokens.
+- `qwen.rule`'s and `qwen.carry`'s kernels split g and cum for the FPU into bf16's 8 significand bits and what they
+  leave, since a product keeps 10 of an operand's 11: a first part of TF32's 11 lost its last bit. At Qwen3.5-9B's
+  shapes with strong decays, cum was 4.5e-4 off and the outputs 4.9e-2; now 1.5e-5 and 2.4e-3, as with the tensor ops'
+  cum.
 
 ## 0.0.7
 
