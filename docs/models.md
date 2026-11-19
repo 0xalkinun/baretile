@@ -82,10 +82,12 @@ the norm's scale would round once for a whole head, and a score doesn't average
 that error out over its products, as it does the roundings of single values.
 Qwen3-0.6B's norm weights make scores near 48, where a rounding of 2^-8 is 0.19.
 On the chip the norm and RoPE are one launch, `llama.rope_kernel`, a head of a
-tile row a unit. The swap of a head's halves is a choice of tile, where the
-tensor ops take a matmul by `turn`. It adds the two products exactly before it
-rounds, where the FPU's add aligns the smaller to the larger's 10 bits first, so
-the two can differ by a bf16 step in the dimensions that turn.
+tile row a unit. It reads the cos and sin tables' rows at the call's positions
+itself, one position for each row or one for all, where the tensor ops gather
+them first, once for a call's layers. The swap of a head's halves is a choice of
+tile, where the tensor ops take a matmul by `turn`. It adds the two products
+exactly before it rounds, where the FPU's add aligns the smaller to the larger's
+10 bits first, so the two can differ by a bf16 step in the dimensions that turn.
 
 The loader fuses q, k and v projections, and gate and up projections, where
 appropriate. Matmul weights are stored by tile columns. The KV cache is

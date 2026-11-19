@@ -31,6 +31,10 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 - `Tensor.put` into a block float takes rows in its dtype and copies each run with its exponent, where it took bf16
   and rounded on BRISC. Cast the rows first, or for bfp8 have the matmul that makes them pack it, as
   `a.matmul(cache, "bfp8")` does.
+- `llama.layer`'s rotary is `(cos, sin, turn, positions)`: the whole tables and the call's positions as an int32 row,
+  one for each row or one for all, where it held the tables' rows at the positions. Pass
+  `(w["cos"], w["sin"], w["turn"], places)` in place of the gathered rows: `llama.rope_kernel` reads the rows itself, in
+  the launch that norms and turns q and k.
 - Multicasts go on NoC 1, as linked transactions, so a token's matmul shares A's row while B streams on NoC 0.
 - `llama.layer(x, y, ...)` takes the residual stream and the last block's output, and returns the same pair: the
   next norm adds them. Pass `None` for y to the first block, and finish with `x, h = llama.rms(x, w["norm"], c, y)`.
