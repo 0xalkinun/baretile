@@ -32,6 +32,10 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 
 ### Changed
 
+- A Gated DeltaNet prompt's convolution reads the last inputs from the conv state where they lie, and
+  `qwen.conv_state` writes the new ones, from up to 1,024 picks: a layer takes 3 launches fewer. `qwen.shifted`
+  returns `(picks, after)`, for `qwen.conv` with `last` and for `qwen.conv_state`; a pick past x's rows reads the
+  conv state.
 - baretile needs tt-kmd 2.5 or later. The core's line budget is 4,716, from 4,500.
 - `Tensor.put` into a block float takes rows in its dtype and copies each run with its exponent, where it took bf16
   and rounded on BRISC. Cast the rows first, or for bfp8 have the matmul that makes them pack it, as

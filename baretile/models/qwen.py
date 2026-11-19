@@ -77,11 +77,13 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     if isinstance(S, np.ndarray) and llama.state_format(c) == "bf16":  # NumPy's states hold what bf16 ones on the chip do
       for s in (S, *((state[3],) if m == 2 else ())): s[...] = gpt2.bf16_packed(s)
   else:  # a prompt, maybe in one slot of several. chunk batches its pieces of 64, then runs the state through them in turn
-    # The conv inputs of each sequence are its last ones, then this call's. Realize them before the last ones are
-    # written over.
-    rows = f.now(f.cat(f.swap(past), x[:, :width].reshape(seqs, m, width)))
-    y = conv(rows.reshape(seqs * (m + c.conv - 1), width), shifted(h, seqs, m, c.conv), taps)  # each token after its last inputs
-    f.assign(state[0], keep(state[0], f.swap(rows[:, m:, :])))
+    # The conv reads each token's inputs from x's rows, or the last ones from the conv state where they lie, which
+    # conv_state then writes over in place: a copy of them for one slot of several (Row's), or with live
+    held = past if live is None else past + 0
+    picks, after = shifted(h, seqs, m, c.conv)
+    y = conv(x[:, :width], picks, taps, held)
+    conv_state(held, x[:, :width], after)
+    if held is not state[0]: f.assign(state[0], keep(state[0], held))
     q, k, v, b, g, _ = gates(y)
     o, S2 = chunk(q, k, v, f.sigmoid(b), g, S)
     o = f.now(o)  # o reads the state, so realize it before the state is written over
@@ -525,13 +527,18 @@ def helpers(programs, setups={}):
                  f"else {{ {body(n, p, 0)} }} }}\n" for n, p in programs.items())
 
 def shifted(x, seqs, m, n):
-  """conv's picks for a prompt of m tokens in each of seqs sequences, whose conv inputs are each sequence's last n - 1
-  and then its m: token i's n inputs, oldest first. An int32 tensor on x's chip, made once for each shape."""
-  picks = np.int32([[b * (m + n - 1) + i + j for b in range(seqs) for i in range(m)] for j in range(n)])
-  return picks if isinstance(x, np.ndarray) else _shifted(x.rt, picks.tobytes(), n, seqs * m)
+  """The picks of conv and of conv_state for a prompt of m tokens in each of seqs sequences, x's rows, whose conv inputs
+  are each sequence's last n - 1, which the conv state holds, and then its m: token i's n inputs, oldest first, and
+  each sequence's last n - 1 after the prompt. Int32 tensors on x's chip, made once for each shape."""
+  pick = lambda b, i: b * m + i - (n - 1) if i >= n - 1 else seqs * m + i * seqs + b  # sequence b's input i, the last ones first
+  picks = np.int32([[pick(b, i + j) for b in range(seqs) for i in range(m)] for j in range(n)])
+  after = np.int32([[pick(b, m + j) for j in range(n - 1) for b in range(seqs)]])
+  return (picks, after) if isinstance(x, np.ndarray) else _shifted(x.rt, seqs, m, n)
 
 @functools.cache
-def _shifted(rt, picks, n, cols): return Tensor.frombytes(rt, 1, cols, picks, n, "int32")
+def _shifted(rt, seqs, m, n):
+  picks, after = shifted(np.zeros(0), seqs, m, n)
+  return Tensor.frombytes(rt, 1, seqs * m, picks.tobytes(), n, "int32"), Tensor.of(rt, after.tolist(), "int32")
 
 def conv_kernel(n):
   """The kernel for conv: the SiLU of the sum over n taps of the table's picked rows times the tap, one result tile a
@@ -627,25 +634,31 @@ def conv_state_kernel():
   units, then four words each for last and the table (DRAM address, batch tile stride, row tile stride, tile offset)
   and the picks, then the table's rows, last's rows and its batch. A unit reads each new row's two runs of 16 into
   L1, from the table or from last as it was, before it writes any, then writes the runs into their rows of last, as
-  delta_kernel writes the conv state."""
-  get = "noc_get(BANK(from), AT(a[L ? 2 : 6], from, 4096) + at(r, 16 * f) * 4, RUNS + (2 * i + f) * 64, 64)"
-  put = "noc_put(RUNS + (2 * i + f) * 64, BANK(to), AT(a[2], to, 4096) + at(i % a[15], 16 * f) * 4, 64)"
+  delta_kernel writes the conv state. It waits every 64 rows, so no more than 128 requests are in flight."""
+  get = "noc_get(BANK(from), AT(a[L ? 2 : 6], from, 4096) + at(r % 32, 16 * f) * 4, RUNS + (2 * i + f) * 64, 64)"
+  put = "noc_put(RUNS + (2 * i + f) * 64, BANK(to), AT(a[2], to, 4096) + at(i % a[15] % 32, 16 * f) * 4, 64)"
   return compile_kernel(f"""
 #define IDS {DATA:#x}
 #define RUNS {DATA + 4096:#x}
 {BANKS}
 void kmain(volatile unsigned *a) {{
-  for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(a[13]), AT(a[10], a[13], 4096) + o, IDS + o, 64);
+  unsigned n = a[15] * a[16];
+  for (unsigned t = 0; t * 16 < n; t++)  // the picks, a run of 16 after another
+    noc_get(BANK(a[13] + t / 2), AT(a[10], a[13] + t / 2, 4096) + t % 2 * 1024, IDS + t * 64, 64);
   noc_wait();
-  for (unsigned u = 0, n = a[15] * a[16]; u < a[1]; u++) {{
+  for (unsigned u = 0; u < a[1]; u++) {{
     unsigned j = a[0] + u;
     for (unsigned i = 0; i < n; i++) {{  // input i / sequences of sequence i % sequences, from the table or last
-      unsigned p = ((volatile unsigned *)IDS)[at(0, i)], L = p >= a[14], q = p - a[14], r = L ? q % a[15] : p % 32;
-      unsigned from = L ? {tile_of(2, 'q / a[15]', 0, 'j')} : {tile_of(6, 0, 'p / 32', 'j')};
+      unsigned p = ((volatile unsigned *)IDS)[i], L = p >= a[14], q = p - a[14], r = L ? q % a[15] : p;
+      unsigned from = L ? {tile_of(2, 'q / a[15]', 'r / 32', 'j')} : {tile_of(6, 0, 'r / 32', 'j')};
       for (unsigned f = 0; f < 2; f++) {get};
+      if (i % 64 == 63) noc_wait();
     }}
     noc_wait();
-    for (unsigned i = 0, to; i < n; i++) for (unsigned f = 0; f < 2; f++) to = {tile_of(2, 'i / a[15]', 0, 'j')}, {put};
+    for (unsigned i = 0, to; i < n; i++) {{
+      for (unsigned f = 0; f < 2; f++) to = {tile_of(2, 'i / a[15]', 'i % a[15] / 32', 'j')}, {put};
+      if (i % 64 == 63) noc_wait();
+    }}
     noc_wait();
   }}
 }}""")
@@ -654,14 +667,14 @@ def conv_state(last, table, picks):
   """Write into the conv state last (conv - 1, sequences, width, as deltanet keeps it), in place, the rows that picks
   names, as conv's do: sequence b's input j is pick j sequences + b, a row of table or, past its rows, of last as it
   was. picks is an int32 row, its indices unchecked, as conv's. On the chip, conv_state_kernel's one launch: the conv
-  state after a path through a tree, from the rows the tree ran and the state before them."""
+  state after a prompt, or after a path through a tree, from the rows that ran and the state before them."""
   if isinstance(last, np.ndarray):
     rows = np.concatenate([table.reshape(-1, table.shape[-1]), last.reshape(-1, last.shape[-1])])[np.ravel(picks)]
     last[...] = rows.reshape(last.shape)
     return last
   if not (table.batch == 1 and table.dtype == last.dtype == "fp32" and table.cols == last.cols and
-          picks.dtype == "int32" and picks.shape[-2:] == (1, last.batch * last.rows) and picks.cols <= 32):
-    raise ValueError("conv_state needs fp32 rows of the state's width, and an int32 row of 32 picks or fewer")
+          picks.dtype == "int32" and picks.shape[-2:] == (1, last.batch * last.rows) and picks.cols <= 1024):
+    raise ValueError("conv_state needs fp32 rows of the state's width, and an int32 row of 1,024 picks or fewer")
   return last.run(("conv_state",), conv_state_kernel, last, table, picks, table.rows, last.rows, last.batch,
                   units=-(-last.cols // 32), name="conv_state")
 

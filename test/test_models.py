@@ -1820,6 +1820,38 @@ def test_delta_pieces(chip):
     if llama.linear(c, l):
       stored = np.frombuffer(held[l][1].tobytes(), np.uint16)
       assert np.array_equal(gpt2.bf16_packed(np.frombuffer(kv[l][1].tobytes(), np.float32)).view(np.uint32) >> 16, stored), l
+  # A block's prompt in calls of 100, 2 and 48 tokens, the second fewer than the conv's taps: each call's conv reads the
+  # last inputs that the call before left in the conv state, which conv_state then writes. In NumPy the outputs and the
+  # states are the whole prompt's to 1e-5. On the chip the outputs are within 2% of NumPy's and the conv state is the
+  # whole prompt's on the chip, exactly
+  c.precision, h, phases = None, bf16(rng.normal(0, 1, (150, c.dim))), lambda op: None
+  rel = lambda a, b: np.abs(a - b).max() / np.abs(b).max()
+  def calls(p, up, zeros, cuts):
+    state = llama.kv_cache(c, 256, zeros)[0]
+    o = [value(qwen.deltanet(up(h[a:b]), p, c, state, phases)) for a, b in zip(cuts, cuts[1:])]
+    return np.concatenate(o, -2), [value(s) for s in state]
+  (p, up), cuts = ((gpt2.block(w, "layers.0."), lambda a: a), (gpt2.block(t, "layers.0."), lambda a: Tensor.of(rt, a.tolist()))), (0, 100, 102, 150)
+  want, wanted = calls(*p, np.zeros, (0, 150))
+  got, states = calls(*p, np.zeros, cuts)
+  assert rel(got, want) < 1e-5 and all(rel(a, b) < 1e-5 for a, b in zip(states, wanted))
+  whole, kept = calls(*up, llama.zeros(rt), (0, 150))
+  got, states = calls(*up, llama.zeros(rt), cuts)
+  assert rel(got, want) < 0.02 and np.array_equal(states[0], kept[0]), rel(got, want)
+  # Three sequences of 4 tokens together, the second not live, from states of their own: its states stay as they were,
+  # exactly in NumPy and to 1e-6 on the chip, where x + 0 (y - x) reads x as TF32, and the others' outputs and states
+  # are theirs alone, to 1e-5 in NumPy and within 2% on the chip
+  live, h = np.repeat([1.0, 0.0, 1.0], 4)[:, None], bf16(rng.normal(0, 1, (12, c.dim)))
+  conv, S = rng.normal(0, 1, (c.conv - 1, 3, 2 * c.kh * c.kd + c.vh * c.vd)), rng.normal(0, 0.1, (3 * c.vh, c.kd, c.vd))
+  fp32 = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
+  for (p, up), held, d, free in ((p, np.copy, 1e-5, 0), (up, fp32, 0.02, 1e-6)):
+    many = [held(conv), held(S)]
+    o = value(qwen.deltanet(up(h), p, c, many, phases, live if held is np.copy else Tensor.of(rt, live.tolist()))).reshape(12, -1)
+    slot = lambda a, i, u: a[:, u:u + 1] if i == 0 else a[c.vh * u:c.vh * (u + 1)]  # sequence u's conv state, then its S
+    assert all(rel(slot(value(s), i, 1), slot(b, i, 1)) <= free for i, (s, b) in enumerate(zip(many, (conv, S)))), "a free slot's states"
+    for u in (0, 2):
+      alone = [held(slot(conv, 0, u)), held(slot(S, 1, u))]
+      assert rel(o[4 * u:4 * u + 4], value(qwen.deltanet(up(h[4 * u:4 * u + 4]), p, c, alone, phases)).reshape(4, -1)) < d, u
+      assert all(rel(slot(value(s), i, u), value(a)) < d for i, (s, a) in enumerate(zip(many, alone))), u
 
 def test_delta_solve(chip):
   # qwen.chunk solves each piece's corrections, (I + L) u = beta v, by joining blocks. A product (I + P)(I + P^2)... over
@@ -1941,10 +1973,10 @@ def test_conv_last(chip):
 
 def test_conv_state(chip):
   # qwen.conv_state writes into the conv state the rows its picks name, from the table or from the state as it was,
-  # the rows it overwrites included, exactly.
+  # the rows it overwrites included, exactly: for a few sequences, and for picks and sequences past one tile.
   rng, rt = np.random.default_rng(79), Runtime(chip)
   up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], a.tobytes(), int(np.prod(a.shape[:-2])), "fp32")
-  for seqs in (1, 2):
+  for seqs in (1, 2, 11, 40):
     table, last = np.float32(rng.normal(0, 1, (40, 96))), np.float32(rng.normal(0, 1, (3, seqs, 96)))
     picks = np.int32([[39, 40 + 2 * seqs, 3][j] + b for j in range(3) for b in range(seqs)])[None]  # the state's last
     want = qwen.conv_state(last.copy(), table, picks)                                               # row moves first

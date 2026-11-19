@@ -115,12 +115,12 @@ says so: the kernels compute in fp32 and round a state as they store it (a
 prompt's last with a cast), half up as the packer rounds, which differs from
 rounding to nearest even only on exact ties.
 
-Prompt processing works in pieces of 64 tokens. Within a piece, each token's
-correction solves a triangular system, whose inverse `qwen.corrected` builds by
-joining blocks, from single tokens up: each step reads only inverses, which stay
-near 1. On the chip a piece is one kernel, `qwen.rule`: every product on the
-FPU, which reads the fp32 tiles as TF32, and the rest on the SFPU. State updates are written in place so later
-replays see the new state.
+A prompt's convolution reads the last inputs from the conv state where they lie,
+and `qwen.conv_state` writes the new ones. The gated delta rule works in pieces of 64 tokens.
+Within a piece, each token's correction solves a triangular system, whose inverse
+`qwen.corrected` builds by joining blocks, from single tokens up: each step reads only inverses, which stay
+near 1. On the chip a piece is one kernel, `qwen.rule`: every product on the FPU, which reads the fp32 tiles as
+TF32, and the rest on the SFPU. State updates are written in place so later replays see the new state.
 
 These operations also take tokens in an order of their own, such as a tree's:
 
