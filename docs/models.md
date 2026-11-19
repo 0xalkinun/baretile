@@ -234,10 +234,10 @@ the normalization sum, which greedy selection and top_k up to 64 can use. A
 greedy pick of 4 rows or more takes `serve.grouped_topk`, which reads only the
 groups of a row's columns that can hold its largest. `serve.frontier` picks a
 step of best-first search over a tree of tokens on the chip and logs its picks
-and candidates, so the host reads the tree back once. Penalties, logprobs and
-constrained output need the full row, and so do some other sampling requests.
-When a stop string cuts the text, logprobs cover only the returned text's
-tokens.
+and candidates, so the host reads the tree back once. With `rep` its places
+come by head, as grouped attention reads them. Penalties, logprobs, constrained
+output and some other sampling requests need the full row. When a stop string
+cuts the text, logprobs cover only the returned text's tokens.
 
 Chat templates are Python approximations of each model's template, so a model
 with a new template may need code in `serve.py`. A `chat_template` that is a

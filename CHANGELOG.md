@@ -14,9 +14,10 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   can make the gates and the output norm itself; `qwen.conv` with `last`, `qwen.conv_state` and `qwen.carry` each take
   one launch; `qwen.predict` runs a prediction layer on its own ([models](docs/models.md#experts-and-gated-deltanet)).
 - `Tensor.attend` takes a tree's places, `serve.frontier` picks a step of a tree of tokens grown best first, on the
-  chip, and `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows
-  at once, and adds a block's output onto the residual stream as it does. `llama.rope_kernel` norms a Qwen3-family
-  layer's q and k heads and turns them by RoPE in one launch.
+  chip, with its places by head if asked, which `llama.attention`'s grouped rows take with no copy, and
+  `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows at once,
+  and adds a block's output onto the residual stream as it does. `llama.rope_kernel` norms a Qwen3-family layer's q
+  and k heads and turns them by RoPE in one launch.
 - `Tensor.gather` reads the same rows of every matrix of a batch, and rows of a block float, like a KV cache's in
   bfp8 or bfp4, each run of 16 with its exponent as it is. It refused both.
 - `Tensor.filled` views one column of a kernel's output that fills its tiles with it, where a slice of one column
