@@ -1766,6 +1766,24 @@ def test_delta_step(chip):
           call(alive)
           reads += [r[3] for r in rt.profile(since) if r[0] == "delta"]
         assert n * (reads[1] - kh * 64 * m) == (n - 1) * reads[0], (m, n, reads)
+  # bf16 states: the same outputs as fp32 states of the same values, and the new states (and first) those of the fp32
+  # states rounded as the packer rounds, half up on the bits (gpt2.bf16_packed)
+  bits = lambda t: np.frombuffer(t.tobytes(), np.uint16 if t.dtype == "bf16" else np.uint32).reshape(t.shape)
+  for m, (n, kh, vh, kd, vd) in ((m, shape) for m in (1, 2) for shape in ((3, 2, 4, 64, 96), (4, 16, 32, 128, 128))):
+    width = 2 * kh * kd + vh * vd
+    x, conv, conv2, taps = (rng.normal(0, s, shape) for s, shape in ((1, (1, n * m, width + vh * vd + 2 * vh)), (1, (3, n, width)),
+                                                                     (1, (3, n, width)), (0.5, (4, 1, width))))
+    rest = (x, conv, taps, rng.normal(0, 1, (1, 1, vh)), -rng.uniform(0.5, 2, (1, 1, vh)))
+    S, first = (gpt2.bf16_packed(rng.normal(0, 0.1, (n * vh, kd, vd))) for _ in range(2))
+    live, accept = Tensor.of(rt, [[float(i // m != 1)] for i in range(n * m)], "bf16"), np.float32(np.arange(n) % 2).reshape(1, 1, n)
+    got = []
+    for d in ("fp32", "bf16"):
+      states = [up(a).cast(d).realize() for a in (S, first)]
+      o = qwen.delta(states[0], *map(up, rest), live, *((states[1], up(accept), up(conv2)) if m > 1 else ()))
+      got.append([bits(t) for t in (o, *states[:m])])
+    assert np.array_equal(got[0][0], got[1][0]), (m, "the outputs")
+    for a, b in zip(got[0][1:], got[1][1:]):
+      assert np.array_equal(gpt2.bf16_packed(a.view(np.float32)).view(np.uint32) >> 16, b), (m, "the states")
 
 def test_delta_pieces(chip):
   # qwen.chunk runs a Gated DeltaNet prompt in pieces of 64 tokens, and must match a piece at a time to 1e-6. Then the
@@ -1785,8 +1803,23 @@ def test_delta_pieces(chip):
   t, on = llama.upload(rt, weights), lambda row: Tensor.of(rt, [row], "int32")
   ids = [int(i) for i in rng.integers(0, 256, 150)]
   want = llama.forward(ids, list(range(150)), w, c, llama.kv_cache(c, 256, np.zeros), every=True)
-  got = gpt2.values(llama.forward(on(ids), on(list(range(150))), t, c, llama.kv_cache(c, 256, llama.zeros(rt)), every=True))
+  kv = llama.kv_cache(c, 256, llama.zeros(rt))
+  got = gpt2.values(llama.forward(on(ids), on(list(range(150))), t, c, kv, every=True))
   assert max(np.abs(a - b).max() / np.abs(b).max() for a, b in zip(got, want)) < 0.05 and near(got, want)
+  # From a bf16 state, chunk over the three pieces gives the same bits as from an fp32 state of the same values: the
+  # first piece reads bf16, the others the fp32 state the one before gives. And the prompt into a bf16 cache leaves
+  # each state the fp32 cache's, cast as the packer rounds
+  up = lambda a: Tensor.frombytes(rt, a.shape[-2], a.shape[-1], np.float32(a).tobytes(), a.shape[0], "fp32")
+  S = gpt2.bf16_packed(S)
+  a, b = (qwen.chunk(*map(up, (q, k, v, beta, g)), up(S).cast(d)) for d in ("fp32", "bf16"))
+  assert all(x.tobytes() == y.tobytes() for x, y in zip(a, b))
+  c.precision = {("state", None): ("bf16", None)}
+  held = llama.kv_cache(c, 256, llama.zeros(rt))
+  llama.forward(on(ids), on(list(range(150))), t, c, held, every=True)
+  for l in range(c.layers):
+    if llama.linear(c, l):
+      stored = np.frombuffer(held[l][1].tobytes(), np.uint16)
+      assert np.array_equal(gpt2.bf16_packed(np.frombuffer(kv[l][1].tobytes(), np.float32)).view(np.uint32) >> 16, stored), l
 
 def test_delta_solve(chip):
   # qwen.chunk solves each piece's corrections, (I + L) u = beta v, by joining blocks. A product (I + P)(I + P^2)... over
@@ -1836,6 +1869,10 @@ def test_delta_tree(chip):
     want = qwen.rule(q, k, v, beta, g, S, seen, state=not tree)
     got = qwen.rule(*(up(a) for a in (q, k, v, beta, g, S, seen)), state=not tree)
     assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
+    if not tree:  # the prompt piece from a bf16 state: the same bits as from an fp32 state of the same values
+      a, b = (qwen.rule(*(up(x) for x in (q, k, v, beta, g)), up(gpt2.bf16_packed(S)).cast(d), up(seen), state=True)
+              for d in ("fp32", "bf16"))
+      assert all(x.tobytes() == y.tobytes() for x, y in zip(a, b))
     if tree:  # carry takes the state along the path to the last token as a prompt of the path would, from what rule gave
       path = [j for j in range(m) if seen[0, m - 1, j]]
       end, on = np.eye(m)[None, m - 1:], seen[:1, m - 1, :, None]
@@ -1863,8 +1900,19 @@ def test_delta_tree(chip):
         # the rule's launch, then a copy each of o's and v_new's 20 rows from its output, of which cum is a view
         assert rt.launches - since == 3, rt.launches - since
         assert all(rel(value(a), b) < 0.01 for a, b in zip(got, want)), [rel(value(a), b) for a, b in zip(got, want)]
+      with pytest.raises(ValueError, match="operand"):  # Tiles' bf16 inputs go to the SFPU alone, and its bf16 results out of OUT
+        bf16 = qwen.Tiles("bf16"); bf16.wide.add(1); bf16.op(2, [(1, 3, False)])
+      with pytest.raises(ValueError, match="out from OUT"): bf16.outs(); bf16.op(2, start=3, home=(0, 0))
       with pytest.raises(ValueError, match="dt_bias and decay as a row each"):
         qwen.rule(*ins[:7], raw=(*ins[7:9], ins[7], *ins[10:], 1e-6))
+      # from a bf16 state, the same bits as from an fp32 state of the same values, and carry's state those of the fp32
+      # state's carry rounded as the packer rounds, half up on the bits
+      held = lambda d: up(gpt2.bf16_packed(S)).cast(d).realize()  # a new copy, as carry writes over it
+      a, b = (qwen.rule(*ins[:5], held(d), *ins[6:7], raw=(*ins[7:], 1e-6)) for d in ("fp32", "bf16"))
+      assert all(x.tobytes() == y.tobytes() for x, y in zip(a, b))
+      end, on = np.eye(m)[None, m - 1:], seen[:1, m - 1, :, None]
+      after = [qwen.carry(held(d), ins[1], *a[1:], up(end), up(on)) for d in ("fp32", "bf16")]
+      assert np.array_equal(np.float32(gpt2.bf16_packed(value(after[0]))), np.float32(value(after[1])))
   # carry on one worker, which takes every unit in turn, along a path through two tiles of rows, against NumPy's. Its
   # decays are small: at up to e^-1 a token the kernel is ~1% from NumPy
   with Runtime(chip, end=chip.tensix[1]) as one:
@@ -1938,12 +1986,17 @@ def test_speculative(chip):
   # Two slots verify their token and draft in one replayed call, with a third slot free. A right draft is accepted. A
   # wrong one is rejected (accept 0), and the next step goes on from the Gated DeltaNet states as they were after the
   # first token. The multi-token prediction layer (qwen.draft) must match numpy too, with the output layer and with a
-  # bfp4 copy of it.
+  # bfp4 copy of it. The states are bf16, and numpy's hold the same rounding.
   rng = np.random.default_rng(37)
   c, weights = qwen35(rng)
-  w, size = llama.arrays(weights), 32
+  w, size, c.precision = llama.arrays(weights), 32, {("state", None): ("bf16", None)}
   rt = Runtime(chip)
   t, kv = llama.upload(rt, weights), llama.kv_cache(c, 3 * size, llama.zeros(rt), 3, speculative=True)
+  assert [x.dtype for x in kv[0]] == ["fp32", "bf16"] * 2, "the conv states stay fp32"
+  held = llama.kv_cache(c, size, np.zeros)  # numpy's states after a prompt and after a token hold bf16 values, rounded half up
+  for ids, places in (([7, 200, 31], [0, 1, 2]), ([4], [3])):
+    llama.forward(ids, places, w, c, held)
+    assert all(np.array_equal(gpt2.bf16_packed(x[1]), x[1]) and x[1].any() for x in held[:3])
   on, rel = lambda row, d="int32": Tensor.of(rt, [row], d), lambda got, want: np.abs(got - want).max() / np.abs(want).max()
   ref = lambda s: llama.forward(s, list(range(len(s))), w, c, llama.kv_cache(c, size, np.zeros), every=True)  # numpy, from an empty cache
   seqs = {0: [7, 200, 31], 1: [5, 64, 9, 9, 9]}  # each starts as a prompt and gains the tokens it knows
@@ -1957,13 +2010,13 @@ def test_speculative(chip):
       mine = gpt2.values(qwen.draft(on(s[1:]), on(list(range(len(s) - 1))), h, t, c, llama.slot(c, kv, u, 3)))
       theirs = qwen.draft(s[1:], list(range(len(s) - 1)), nh, w, c, llama.kv_cache(c, size, np.zeros))
       assert max(rel(mine[r], theirs[r]) for r in range(len(s) - 1)) < 0.03
-      c.precision = {("draft head", None): ("bfp4", 1)}
+      c.precision = {("draft head", None): ("bfp4", 1), ("state", None): ("bf16", None)}
       head = llama.upload(rt, {k: weights[k] for k in ("embed.T", "mtp.fc")}, c.precision)["embed.T draft"]
       assert head.dtype == "bfp4"
       mine = gpt2.values(qwen.draft(on(s[1:]), on(list(range(len(s) - 1))), h, t | {"embed.T draft": head}, c, llama.slot(c, kv, u, 3)))
       theirs = qwen.draft(s[1:], list(range(len(s) - 1)), nh, llama.arrays(weights, c.precision), c, llama.kv_cache(c, size, np.zeros))
       assert max(rel(mine[r], theirs[r]) for r in range(len(s) - 1)) < 0.03
-      c.precision = None
+      c.precision = {("state", None): ("bf16", None)}
   step = tensor.jit(lambda ids, places, accept: llama.forward(ids, places, t, c, kv, 3, accept=accept))
   accept = [1.0, 1.0, 1.0]
   for i in range(6):
@@ -3504,18 +3557,20 @@ def served(engine, *requests):  # sends requests to an engine, each after the on
     for r in batch if isinstance(batch, list) else [batch]:
       while r.out.get(timeout=600) is not None: pass
 
-@pytest.mark.parametrize("kv", ["bfp8", "bfp4"])
-def test_serve_sessions(chip, tmp_path, kv):
+@pytest.mark.parametrize("kv, state", [("bfp8", None), ("bfp4", None), ("bfp4", "bf16")])
+def test_serve_sessions(chip, tmp_path, kv, state):
   # The serve.py engine with Gated DeltaNet blocks. An agent's next turn resumes from the session kept when its last
   # request ended, or from the one kept after its prompt, and prefills only the new tokens. With bfp4, park 0 leaves
-  # no room on the chip, so sessions go to the host and come back in bf16, which holds their values.
+  # no room on the chip, so sessions go to the host and come back in bf16, which holds their values, with the Gated
+  # DeltaNet states in fp32 or bf16.
   # In bfp4, with 3 bits a value, a key that the chip rounds the other way from numpy moves by an eighth of the largest
   # in its run. numpy's logits move 2.9% when the qkv weights are off by bf16 rounding, against 1.0% in bfp8, so
   # the bound is 6%. In bfp8, over 6 decode steps from each of 6 prompts, the chip's largest error is 3.0% with the
   # median at 0.9%, and 3.1% and 1.0% when the residual stream was bf16, so the bound is 4%.
   rt, rng = Runtime(chip), np.random.default_rng(31)
   c, weights = qwen35(rng)
-  w, tok, c.precision = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.precision(c, "bf16", kv=kv)
+  w, tok = llama.arrays(weights), bytes_tokenizer(tmp_path)
+  c.precision = llama.precision(c, "bf16", kv=kv, state=state)
   c.mtp = 0  # decode a token a step. test_serve_speculative drafts with the MTP layer
   engine = serve.Engine(rt, llama.upload(rt, {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.4."))}), c, tok,
                         slots=2, places=64, chunk=16, park=0 if kv == "bfp4" else None)
@@ -3854,6 +3909,8 @@ def test_cost(tmp_path):
   assert 35.4e9 < s.held < 35.6e9 and 2.9e9 < s.values < 3.0e9 and 21.8e9 < s.bytes < 22.2e9, (s.held, s.values, s.bytes)  # includes the draft head
   one = cost.session(c, use | {"context": 1})
   assert (one.kv, one.state) == (10 * 2 * 2 * 256 * 2, 30 * 4 * (32 * 128 * 128 + 3 * (2 * 16 * 128 + 32 * 128)))
+  assert cost.session(c, use | {"context": 1, "state": "bf16"}).state == 30 * (2 * 32 * 128 * 128 + 4 * 3 * (2 * 16 * 128 + 32 * 128))
+  assert "MB of Gated DeltaNet states (bf16)" in cost.report(str(tmp_path / "qwen"), "experts", state="bf16")
   l8 = llama.config(str(tmp_path / "llama"))
   read = cost.shape(l8, "bfp4").every + cost.session(l8, use | {"context": 612.5, "kv": "bfp8"}).kv
   assert abs(read / 6.20e9 - 1) < 0.02, read

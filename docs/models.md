@@ -108,18 +108,18 @@ tokens. The server's chunks of 2,048 tokens fit. From Python,
 `serve.Engine(chunk=...)` and `llama.prefill`'s `tokens` set the chunk.
 
 Qwen3.5 and Qwen3.6 combine attention with Gated DeltaNet. A DeltaNet block
-keeps convolution history and a fixed-size recurrent state. Its decode kernel
-performs the convolution, gates and state update in fp32. DeltaNet needs key and
-value head dimensions that are multiples of 32, and a convolution of 4 taps,
-which `llama.config` checks.
+keeps convolution history and a fixed-size recurrent state, and needs key and
+value head dimensions that are multiples of 32 and 4 taps, as `llama.config`
+checks. The states are fp32, or bf16 where the precision's `("state", None)`
+says so: the kernels compute in fp32 and round a state as they store it (a
+prompt's last with a cast), half up as the packer rounds, which differs from
+rounding to nearest even only on exact ties.
 
 Prompt processing works in pieces of 64 tokens. Within a piece, each token's
 correction solves a triangular system, whose inverse `qwen.corrected` builds by
-joining blocks, from single tokens up. A product of powers over the whole piece
-is the same inverse, but where a piece's keys point nearly the same way its
-powers reach 1e10 and float32 loses the result. On the chip a piece is one
-kernel, `qwen.rule`: every product on the FPU, which reads the fp32 tiles as
-TF32, and the rest on the SFPU. State updates are written in place so later
+joining blocks, from single tokens up: each step reads only inverses, which stay
+near 1. On the chip a piece is one kernel, `qwen.rule`: every product on the
+FPU, which reads the fp32 tiles as TF32, and the rest on the SFPU. State updates are written in place so later
 replays see the new state.
 
 These operations also take tokens in an order of their own, such as a tree's:
