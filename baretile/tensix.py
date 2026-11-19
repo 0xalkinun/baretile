@@ -196,8 +196,8 @@ def reload(at, z):  # fp32 tile z of the accumulator at `at` into SrcA, with zer
 def bfp_b(wt, slots, region=0, base=None):
   fmt, base = (FORMAT[wt], base or B8 + region * slots * tile_bytes(wt)) if slots else (bh.BF16, slot_base("bf16"))
   return reconfigure(SEC0_format=fmt, SEC0_out_format=fmt, SEC0_z_dim=max(slots, 1), SEC0_base=base // 16 - 1)
-def step_unpack(s):  # a matmul step. B's tile goes from stream slot s into SrcA, and the next tile of A's row into SrcB
-  return [setadc(bh.UNPACK0, s), unpacr(0, 0), unpacr(1, 1)] + REPORT
+def step_unpack(s, rows=1):  # a matmul step. B's tile goes from stream slot s into SrcA, and the next tile of each of
+  return [setadc(bh.UNPACK0, s), unpacr(0, 0)] + [unpacr(1, 1)] * rows + REPORT  # A's rows into SrcB in turn
 # PAIR unpacks a tile into SrcA and one into SrcB, then moves each unpacker's Z on by 1. WALK is a matmul step along
 # B's column and A's row when both are kept in L1.
 PAIR = [unpacr(0, 1), unpacr(1, 1)]
@@ -209,24 +209,26 @@ def aim(row):
           field(ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=0), row)]
 # In the C programs, h is the first Dst row of the half that the next op gets, 0 or DST_HALF. h ^= DST_HALF moves on.
 DST_FREE = ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)  # waits until a Dst half is free
-# Waits for a free Dst half and aims the FPU at it. If the math accumulates, it also zeroes the half, 16 rows at a time.
+# Waits for a free Dst half and aims the FPU at it. If the math accumulates, it also zeroes the half's tiles, 16 rows at
+# a time.
 # Where ZEROACC zeroes isn't only `where`: with the offset plus the Dst counter at 256 or more, it zeroes rows 256
 # further on (ttsim's ZEROACC). The counter moves 8 rows an instruction and lasts from one kernel to the next, so it
-# starts from 0 here.
-def math_begin(zero):
-  return [DST_FREE, *aim("h")] + ([ins("SETRWC", bit_mask=0b0100)] +
-                                  [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16")
-                                   for b in range(4)] if zero else [])
+# starts from 0 for each tile here.
+def math_begin(zero, tiles=1):
+  return [DST_FREE, *aim("h")] + ([w for t in range(tiles) for w in [ins("SETRWC", bit_mask=0b0100)] +
+                                   [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=4 * t + b), "h / 16")
+                                    for b in range(4)]] if zero else [])
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
             ins("SEMPOST", sem_sel=SEM_DST)]
-# packs 64 Dst rows from `row` into an L1 slot, then frees them and posts the semaphores in done
-def pack(row, slot, *done):
+# packs 64 Dst rows from `row` into an L1 slot, then frees the half unless more of its tiles follow (get), and posts the
+# semaphores in done
+def pack(row, slot, *done, get=True):
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
           field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=0), row),  # channel 0 Y: Dst row
           # channel 1 Y: L1 slot
           field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=0), slot),
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
-          ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + \
+          ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK)] + [ins("SEMGET", sem_sel=SEM_DST)] * get + \
          [ins("SEMPOST", sem_sel=d) for d in done]
 # Waits until the semaphore is above 0, then takes one.
 def take(sem): return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=sem, wait_sem_cond=1), ins("SEMGET", sem_sel=sem)]
@@ -636,13 +638,15 @@ def runs(replays, name, times): return [Loop(times, run(replays, name))]
 # recorded at setup
 def math_runs(replays): return [w for name, (at, n) in replays.items() for w in record(at, MATH_RUNS[name][:n])]
 
-def release(word):  # the same ELW*/MVMUL with clear_dvalid set, so both Src banks go back to the unpackers
-  first, width = bh.TENSIX_OPS["MVMUL"][1]["clear_dvalid"]
-  return word | ((1 << width) - 1) << first
-def phased(replays, name, phases):  # a run of MATH_RUNS for each fidelity phase. its last word releases both Src banks
-  words = MATH_RUNS[name]
-  return ([ins("SETRWC", bit_mask=0b1111)] + run(replays, name) * (phases - 1) + run(replays, name, len(words) - 1)
-          + [release(words[-1])])
+def release(word, keep=False):  # the same ELW*/MVMUL with clear_dvalid set, so both Src banks go back to the unpackers,
+  first, width = bh.TENSIX_OPS["MVMUL"][1]["clear_dvalid"]  # or with keep SrcB alone
+  return word | (2 if keep else (1 << width) - 1) << first
+def phased(replays, name, phases, row=0, keep=False):
+  """A run of MATH_RUNS for each fidelity phase. Its last word releases both Src banks, or with keep SrcB alone. With
+  row, it goes `row` Dst rows on, from words pushed one by one, since the replay buffer holds them at row 0."""
+  words = [w + row for w in MATH_RUNS[name]]
+  play = lambda n=None: run(replays, name, n) if not row else words[:n]
+  return [ins("SETRWC", bit_mask=0b1111)] + play() * (phases - 1) + play(len(words) - 1) + [release(words[-1], keep)]
 # The address modes that the walk of a transposed B rewrites (see matmul_phase), as (SrcA step, SrcB step). The
 # rest of the time they hold what ADDR_MODES says.
 TRANSPOSED = {4: (32, 0), 5: (32, 8), 6: (48, 8), 2: (16, 8)}
@@ -650,7 +654,7 @@ def walk(transposed):  # sets the math thread's address modes for the steps of a
   return [ins("SETC16", setc16_reg=bh.ADDR_MOD_AB + m, setc16_value=a | b << 8)
           for m, (a, b) in ((m, TRANSPOSED[m] if transposed else ADDR_MODES[m][0]) for m in sorted(TRANSPOSED))]
 
-def matmul(replays, phases=4, transposed=False):
+def matmul(replays, phases=4, transposed=False, row=0, keep=False):
   """One matmul step with its first `phases` fidelity phases. SETRWC starts each step at phase 0.
 
   A phase multiplies some of the 8 significand bits of A (in SrcB) by some of B's (in SrcA) (ISA SrcASrcB.md):
@@ -659,8 +663,8 @@ def matmul(replays, phases=4, transposed=False):
     phase 2: A's last bit by B's top 5
     phase 3: A's last bit by B's last 3
   Four phases leave nothing out, and three leave out under 2^-11 of the product. Two drop A's last bit, which truncates
-  by 2^-7 at most. One keeps only 5 bits of B."""
-  return phased(replays, "mmT" if transposed else "mm", phases)
+  by 2^-7 at most. One keeps only 5 bits of B. row and keep go to phased, for a tile of B against several of A."""
+  return phased(replays, "mmT" if transposed else "mm", phases, row, keep)
 
 def elementwise(op, replays, dst=0):
   """Math for a tile of SrcA op SrcB at Dst row dst, 8 rows of 16 per instruction. Address mode 0 steps 8 rows.

@@ -7,15 +7,15 @@ from baretile import bh
 from baretile.runtime import DATA, FLAGS, MAILBOX, ZEROS, compile_kernel
 from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_OFF, CC_ON, CHUNKS, COMBINE, DEPTH,
                              DST_HALF, FILLED, FLAGS_B, FOLDS, FP32_OPS, FRAMES, INT32_OPS, ITEMSIZE, MATH_END, MAX_OPS,
-                             ONE, OUTS, PAIR, REPORT, ROWS, SEM_L1, SEM_PACKED, SFPU, SFPU_START, UNPACKABLE,
-                             WALK, ZERO_SLOT, Loop, accumulating, across_rows, aim, allocate, bfp_b, brisc_program,
-                             chunk_tiles, counters, elementwise, ext, field, fill, fold, haloize, ins, kernel_config,
-                             mad, mask_columns, mask_rows_at, math_begin, math_program, matmul, pack, pack_program,
-                             reconfigure, reduce_finish, reduce_step, reload, repack, runs, setadc, sfpu, sfp_bits,
-                             sfp_load, sfp_store, slot_base, step_unpack, table, tile_bytes, tile_of, tt, unpack,
-                             unpack_program, walk, widen)
+                             ONE, OUTS, PAIR, REPORT, ROWS, SEM_L1, SEM_PACKED, SFPU, SFPU_START, UNPACKABLE, WALK,
+                             ZERO_SLOT, Loop, accumulating, across_rows, aim, allocate, bfp_b, brisc_program,
+                             chunk_tiles, config, counters, elementwise, ext, field, fill, fold, haloize, ins,
+                             kernel_config, mad, mask_columns, mask_rows_at, math_begin, math_program, matmul, pack,
+                             pack_program, reconfigure, reduce_finish, reduce_step, reload, repack, runs, setadc, sfpu,
+                             sfp_bits, sfp_load, sfp_store, slot_base, step_unpack, table, tile_bytes, tile_of, tt,
+                             unpack, unpack_program, walk, widen)
 
-A_PIECE = 16  # tiles of A's row in each multicast by which a token's matmul shares it (bcast)
+A_PIECE = 16  # K steps of A's rows in each multicast by which a token's matmul shares them (bcast): a tile a row each
 
 def worker_block(rt, w, grid):  # each worker's block of a grid matmul's rt x w result tiles: bp rows by bq columns
   return -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
@@ -45,7 +45,8 @@ def grid_parts(rt, w, kt, grid, base, more=0):
           return -(-kt // -(-kt // kp)), q, acc  # make the parts as even as possible
   return False
 
-def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None, leading=None, formats=None):
+def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None, leading=None, formats=None,
+                 rows=1):
   """Compile an expression into one kernel. Return (image, work units, whether it takes a row of tiles the way a
   token's matmul does: bcast, below).
 
@@ -71,6 +72,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   reduction over the batch, is (K, S): result matrix b folds K matrices S apart, from b // S * K * S + b % S on, as
   for a leading dimension of K with S matrices to each step of it. Without it, the batch folds into one matrix.
   formats gives each input's dtype, by default dtype: an fp32 kernel can read bf16 inputs, which it widens as it loads.
+  rows, for a bare matmul by a block float by columns with that many full tile rows, up to 3, takes them the way a
+  token's row goes, each B tile meeting them in SrcA in turn. Where that can't be, the image is None.
 
   Kernel arguments:
   - a[0:2]: first work unit and unit count.
@@ -201,14 +204,23 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   assert not (dst and matmuls), "only bf16 kernels have matmuls"
   # the first matmul, which the layouts below are for, and whether it's the kernel's one matmul, with no reduction
   mm, lone = ops[matmuls[0]] if matmuls else None, len(matmuls) == 1 and not reducing
+  # R: rows, which the kernel takes as one takes a token's row (bcast, below), each B tile going into SrcA once for all
+  # R. Only the bare matmul has R > 1. The caller gives it full tile rows (no row is masked), and the result's columns
+  # must fill their tiles, since the edge's mask reaches only the first of its R Dst tiles. Its results take R output
+  # slots, at outs
+  R = rows
+  if R > 1 and not (grid and lone and len(ops) == 1 and not mm["posts"] and mm["bc"] and mm["wt"] and mm["ids"] is None
+                    and nb == 1 and rt == R <= 3 and mm["shape"][2] % 32 == 0): return None, 0, False
+  outs = min(OUTS, bh.L1_SIZE - R * tile_bytes(out))
+  if outs != OUTS: cfg = cfg | config(L1_Dest_addr=outs // 16 - 1)
   base = FRAMES + 2 * frame + len(ops)  # the first slot past the frames and the narrow ops
   rows_at, top = [], base  # where each matmul keeps its row of A in L1, or None if it doesn't fit and A streams too
   if not (top <= UNPACKABLE // (2 if wide else 1) and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS):
     raise ValueError("too many tiles in a kernel")  # tensix.widen reads a bf16 input's slot s at 2s
   for j in matmuls:
-    fits = top + ops[j]["kt"] <= UNPACKABLE
+    fits = top + R * ops[j]["kt"] <= UNPACKABLE
     rows_at.append(top if fits else None)
-    top += ops[j]["kt"] if fits else 0
+    top += R * ops[j]["kt"] if fits else 0
   me = ("op", root)
   rows, cols = size(me)[1:]  # the result's
   # With one matmul and no passes, a unit is a block of bp x bq result tiles, done column by column. The block's bp rows
@@ -217,7 +229,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # If K is too long for that, it goes in parts (grid_parts). Workers sum their result tiles over the parts in L1
   # (tensix.accumulating). The last part starts each tile from its sum (tensix.reload) and runs the rest of the tree.
   mc, parts = None, None
-  if grid and lone and mm["ids"] is None and nb == 1 and rt > 1 and ext(mm["shape"], 2) == w:
+  if grid and lone and mm["ids"] is None and nb == 1 and rt > R and ext(mm["shape"], 2) == w:
     kt = mm["kt"]
     bp, bq = worker_block(rt, w, grid)
     n_grid = (-(-w // bq), -(-rt // bp))
@@ -238,14 +250,17 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # grid workers take the columns in the bank that Runtime.readers gives them, in turn with the bank's other readers. A
   # worker reads that bank through the port it was given, and other banks through port 0. local holds each worker's
   # port, bank, position among the bank's readers, and the number of readers the bank has.
-  one = grid and lone and rt == 1 and ext(mm["shape"], 2) == w
+  one = grid and lone and rt == R and ext(mm["shape"], 2) == w
   # With one matmul and nothing reducing, a B laid out by columns streams beside A's row in chunks (tensix.chunk_tiles).
   # Each chunk is one read, or two for a block float, with CHUNKS in flight, through their own ring. ring is its size
   # in tiles, and chunked (below) is ring when B streams this way.
   ring = CHUNKS * chunk_tiles(mm["wt"]) if lone and mm["bc"] else 0
   stream = ring * tile_bytes(mm["wt"] or "bf16") if ring else DEPTH * tile_bytes("bfp8")
   long = (one and rows_at[0] is None and mm["ids"] is None and  # leave room for the singles and B's stream
-          slot_base(dtype) + (top + inputs + mm["kt"]) * tile_bytes(dtype) + stream <= OUTS)
+          slot_base(dtype) + (top + inputs + R * mm["kt"]) * tile_bytes(dtype) + stream <= outs and
+          # and with R rows, regions of 256 slots that start at a step's first tile (below). top has no singles or kept
+          # slots yet: with R > 1 the matmul is bare, and has none
+          all((256 * r - top) % R == 0 for r in range(1, -(-(top + R * mm["kt"]) // 256))))
   bcast, local, idle = None, None, None
   if one and not mc and (rows_at[0] is not None or long) and nb <= len(grid[1]):
     per = len(grid[1]) // nb * len(grid[0])  # workers for each matrix
@@ -267,6 +282,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       bcast, bq = (len(grid[0]), len(grid[1])), -(-most // min(banks.values()))
   # all four programs get the readers table, since they walk the same tiles
   ours = table("reader", local) + "\n" if local else ""
+  if R > 1 and not bcast: return None, 0, False
   long = long and bcast is not None  # without bcast, A streams like any row that doesn't fit
   # With bcast, one worker of each matrix reads A's row and multicasts it in pieces of A_PIECE tiles, flag 0 counting
   # the pieces out, and the others stream B from the start, each step waiting for its piece only. Without local, that's
@@ -359,11 +375,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   elif kept_b is not None: top = max(top, kept_b + (3 if mc else 1) * mm["kt"])
   for r in range(inputs) if not reducing else ():
     if all(ext(shapes[r], ax) == 1 for ax in range(3)) and fits(r, 1): single[r], top = top, top + 1
-  if long: rows_at, top = [top], top + mm["kt"]  # past the singles, which stay below slot 256
+  if long: rows_at, top = [top], top + R * mm["kt"]  # past the singles, which stay below slot 256
   # a block-float B goes past it, or at B8
   b8_at = slot_base(dtype) + top * tile_bytes(dtype) if long or parts and b8 else None
   if chunked and not mm["wt"]: ring_slot, top = top, top + chunked  # a bf16 B's ring goes past it too
-  if slot_base(dtype) + top * tile_bytes(dtype) > OUTS: raise ValueError("too many tiles in a kernel")
+  if slot_base(dtype) + top * tile_bytes(dtype) > outs: raise ValueError("too many tiles in a kernel")
   # An input or swept op lives in the tile's frame (fr in the C is 0 or 1), unless it's kept. A narrow op has its own
   # slot.
   def slot(r):
@@ -386,9 +402,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   def matrix(r, base):  # the batch term of r's tile number
     return "" if size(r)[0] == 1 else f"{which(r)} * a[{base + 1}] + "
   # The tile of r that goes with b, i_ and j. r is an input or the result, its [address, strides, offset] at a[base].
-  def where(r, base):
+  def where(r, base, i="i_"):
     s = size(r)
-    i, j = "i_" if ext(s, 1) > 1 else 0, "j" if ext(s, 2) > 1 else 0
+    i, j = i if ext(s, 1) > 1 else 0, "j" if ext(s, 2) > 1 else 0
     return f"{matrix(r, base)}{i} * a[{base + 2}] + {j} + a[{base + 3}]"
   B, U, M, P = range(4)  # the programs. BRISC moves tiles, and TRISC 0, 1 and 2 feed the unpack, math and pack threads
   # The math thread's last instructions for op j. In a tile at the edge, the root's padding in Dst is zeroed first.
@@ -445,6 +461,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       pk = repacked(j, pack("h", pslot(me_j), SEM_PACKED if j == root else SEM_L1))
       if parts and op["kind"] == "matmul":  # pack the sums so far onto the tile's accumulator, except in the last part
         c[P].append(f"{cond}{{ if ({final}) {{ {output(j)}{pk} }} else {{ {tt(pack('h', 'z'))} }} h ^= {DST_HALF}; }}")
+      elif R > 1:  # tile r of the half goes to output slot r: at outs, or in the frame, past A's and B's, unused
+        to = lambda r: r if out != dtype else f"{FRAMES} + fr * {frame} + {r}"
+        c[P].append(f"{cond}{{ " + " ".join(f"output({r}, {to(r)}, {where(me, 2, r)}); "
+                                            f"{tt(pack(f'h + {r * DST_HALF}', to(r), SEM_PACKED, get=r == R - 1))}"
+                                            for r in range(R)) + f" h ^= {R * DST_HALF}; }}")
       else: c[P].append(f"{cond}{{ {output(j)}{pk} h ^= {DST_HALF}; }}")
       if op["kind"] == "matmul":
         # bw is B's width in tiles, q says which matmul this is, and bfp whether B is a block float
@@ -574,7 +595,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                         f"{wait_a('m0 + nk')}chunk_issued(p, nk); }} "
                         "tagged(0); }")
             steps_u = lambda lo, hi: (f"for (unsigned m = {lo}; m < {hi}; m++) {{ unsigned z = landed_chunk(m, {per}); "
-                                      f"{tt(step_unpack('z'))} }}")
+                                      f"{tt(step_unpack('z', R))} }}")
             if not bfp:  # move unpacker 0 to the ring for B's steps
               at = lambda slot: tt(reconfigure(SEC0_base=(slot_base(dtype) + slot * tile_bytes(dtype)) // 16 - 1))
               on, off = at(ring_slot), at(0)
@@ -585,10 +606,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
             steps_u = lambda lo, hi: (f"for (unsigned m = {lo}; m < {hi}; m++) {{ unsigned z = landed(); "
                                       f"{tt(step_unpack(f'{bs} + z'))} }}")
           walk_a = f"{live}{steps_u(0, kt)}"
-          # A's row goes region by region. Region r starts at slot 256 r, at Z 0. Unpacker 1's base moves to each
-          # region, then back to the slots.
+          # A's row goes region by region, or its R rows, whose tiles go by K: tile m of row r at R m + r. Region r
+          # starts at slot 256 r, at Z 0, and at a step's first tile, as long's fit makes sure. Unpacker 1's base moves
+          # to each region, then back to the slots.
           if long:
-            cut = [0] + [256 * r - rows_at[q] for r in range(1, -(-(rows_at[q] + kt) // 256))] + [kt]
+            cut = [0] + [(256 * r - rows_at[q]) // R for r in range(1, -(-(rows_at[q] + R * kt) // 256))] + [kt]
             rebase = lambda r: tt(reconfigure(SEC1_base=(slot_base(dtype) + 256 * r * tile_bytes(dtype)) // 16 - 1) +
                                   [setadc(bh.UNPACK1, 0)] * (r > 0))
             walk_a = " ".join((rebase(r) if r else "") + " " + steps_u(lo, hi)
@@ -603,9 +625,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                       f"if ({final}) {{ {tt(sfpu(op['posts'], replays, sr))} {math_end(j)} }} "
                       f"else {{ {tt(MATH_END)} }} h ^= {DST_HALF}; }}")
         # walk a transposed B, then set the modes back
-        else: c[M].append(f"{cond}{{ {tt(math_begin(True) + walk(True) * bt)} "
-                          f"{live}for (unsigned m = 0; m < {kt}; m++) {{ {tt(matmul(replays, op['phases'], bt))} }} "
-                          f"{tt(walk(False) * bt + sfpu(op['posts'], replays, sr))} {math_end(j)} h ^= {DST_HALF}; }}")
+        # With R, the B tile in SrcA goes against A's R tiles in turn, a Dst tile each, and SrcB alone is released
+        # until the last
+        else: c[M].append(f"{cond}{{ {tt(math_begin(True, R) + walk(True) * bt)} "
+                          f"{live}for (unsigned m = 0; m < {kt}; m++) {{ "
+                          + " ".join(tt(matmul(replays, op['phases'], bt, r * DST_HALF, r < R - 1)) for r in range(R)) +
+                          f" }} {tt(walk(False) * bt + sfpu(op['posts'], replays, sr))} {math_end(j)} "
+                          f"h ^= {R * DST_HALF}; }}")
         continue
       drain = "drain(); " if any(isinstance(r, tuple) for r in operands(op)) else ""
       x, y = slot(op["x"]), slot(op["y"])
@@ -709,7 +735,7 @@ j0 = {col0};
 {sweeps}
   }}"""
   # result tiles to write to DRAM
-  total = f"a[1] * {L if swept(me) else 1}" if reducing else f"tiles / {n_parts}" if parts else "tiles"
+  total = f"a[1] * {L if swept(me) else 1}" if reducing else f"tiles / {n_parts}" if parts else f"tiles * {R}"
   first = ""
   # With bcast, the sharer of each matrix reads A's row and sends it, a piece at a time (wait_a).
   if bcast:
@@ -725,13 +751,13 @@ j0 = {col0};
     # One worker of each matrix sends it all: on a card, multicasts into one rectangle from several workers queue up
     # behind each other, and sharing A's row this way took 2-3x as long. It reads the next piece on NoC 0 while a piece
     # goes out on NoC 1.
-    get_a = lambda lo: (f"for (unsigned m = {lo}; m < {lo} + {A_PIECE} && m < {kt}; m++) "
-                        f"get(a[{x}], {in_batch}m + a[{x + 3}], {rows_at[0]} + m);")
+    get_a = lambda lo: (f"for (unsigned m = {lo}; m < {lo} + {A_PIECE} && m < {kt}; m++) for (unsigned r = 0; r < {R}; "
+                        f"r++) get(a[{x}], {in_batch}r * a[{x + 2}] + m + a[{x + 3}], {rows_at[0]} + {R} * m + r);")
     first = (near + f"  if (a[0] % {bcols} == {sharer}) {{ unsigned b = a[0] / {bcols};\n    {get_a(0)}\n"
              f"    for (unsigned m0 = 0, n = 1; m0 < {kt}; m0 += {A_PIECE}, n++) {{\n"
              f"      noc_wait(); FLAGS[0] = n; {get_a(f'm0 + {A_PIECE}')}\n"
-             f"      mcast(SLOT({rows_at[0]} + m0), ({kt} - m0 < {A_PIECE} ? {kt} - m0 : {A_PIECE}) * "
-             f"{tile_bytes(dtype)}, rect[b], {bcols - 1}, (unsigned)&FLAGS[0]); }}\n  }}\n")
+             f"      mcast(SLOT({rows_at[0]} + {R} * m0), ({kt} - m0 < {A_PIECE} ? {kt} - m0 : {A_PIECE}) * "
+             f"{R * tile_bytes(dtype)}, rect[b], {bcols - 1}, (unsigned)&FLAGS[0]); }}\n  }}\n")
   # With shared, grid workers wait for A's row before their first tile. The grid's first row reads and sends it.
   if shared:
     (xs, ys), kt, x = grid, mm["kt"], arg(mm["x"])
@@ -752,11 +778,11 @@ j0 = {col0};
     first = (f"  for (unsigned i = 0; i < {it}; i++) {{ unsigned t = a[{arg(r) + 3}] + i * a[{arg(r) + 2}]; "
              f" // the indices' tile row i\n"
              f"    noc_get(BANK(t), AT(a[{arg(r)}], t, {ib}), IDS + i * {ib}, {ib}); }}\n  noc_wait();\n" + first)
-  brisc = brisc_program(total, first + program(B), dtype, out, decls + indices, tail, b8, wt, b8_at=b8_at,
+  brisc = brisc_program(total, first + program(B), dtype, out, decls + indices, tail, b8, wt, outs, b8_at=b8_at,
                         near=bool(local))
   image = compile_kernel(brisc, unpack_program(program(U), cfg, indices + ours),
                          math_program(replays, program(M), dst, indices + ours, bool(wide)),
-                         pack_program(program(P), decls=ours))
+                         pack_program(program(P), max(2, R), ours))
   return image, (nb * rt * w // L if reducing else nb * br * bcols), bcast is not None
 
 FRAMES_A = 4  # an attention unit's frames, where they fit: its reads run up to 3 frames ahead of its math

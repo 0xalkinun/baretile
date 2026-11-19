@@ -970,23 +970,38 @@ def test_matmul_chunks(chip):
 
 def test_matmul_tile_rows(chip):
   # A lone matmul by a block-float B by columns, with several tile rows of A, takes a launch for each tile row, as a
-  # token's row takes one, when B is too wide for Tensor.matmul to cut K into a batch at one tile row. Each launch
-  # writes its rows of the result, so every tile row is bit for bit the matmul of its rows alone. A residual of the same
-  # rows goes with them, and the last tile row can be short. A narrower B stays on the grid, in one launch.
-  rt = Runtime(chip)
+  # token's row takes one, when B is too wide for Tensor.matmul to cut K into a batch at one tile row. A bare matmul
+  # takes up to 3 full tile rows a launch: each B tile goes into SrcA once and meets A's tiles in turn, a Dst tile each.
+  # Each launch writes its rows of the result, so every tile row is bit for bit the matmul of its rows alone.
+  # The cases take 2 tile rows, 3, 3 then 1, 2 then a short one alone, 3 into fp32, whose results take 3 slots, 3 whose
+  # rows of A are too long for the slots below 256, so that unpacker 1 goes through them in regions, rows of A that fit
+  # in L1 twice but not three times, as 2 then 1 and as 2, 2 then 1, rows too long for L1 twice, a tile row a launch,
+  # and once, on the grid. A narrower B stays on the grid. B is mostly wide enough
+  # for each worker to take several columns, through both Dst halves. A residual of the same rows goes a tile row a
+  # launch. The long rows of A run on a grid row of 12, where a B as narrow as 512 is wide.
   rng = np.random.default_rng(53)
-  for m, n, how, launches in ((64, 4096, "bfp4", 2), (96, 4096, "bfp8", 3), (70, 4096, "bfp4", 3), (64, 512, "bfp4", 1)):
-    a, b, r = (bf16(rng.uniform(-1, 1, shape)) for shape in ((m, 480), (480, n), (m, n)))
-    w = Tensor.of(rt, b.tolist()).cast(how).columns().realize()
-    x, res = Tensor.of(rt, a.tolist()), Tensor.of(rt, r.tolist())
+  for m, k, n, how, out, launches in ((64, 480, 4096, "bfp4", None, 1), (96, 480, 4096, "bfp8", None, 1),
+                                      (128, 480, 4096, "bfp4", None, 2), (70, 480, 4096, "bfp4", None, 2),
+                                      (96, 480, 4096, "bfp4", "fp32", 1), (96, 3232, 2304, "bfp4", None, 1),
+                                      (96, 6144, 512, "bfp4", None, 2), (160, 6144, 512, "bfp4", None, 3),
+                                      (160, 5120, 512, "bfp8", None, 3),
+                                      (64, 7712, 512, "bfp4", None, 2), (64, 15200, 512, "bfp4", None, 1),
+                                      (64, 480, 256, "bfp4", None, 1)):
+    rt = Runtime(chip, end=row_end(chip) if k > 3232 else None)
+    up = lambda a: Tensor.frombytes(rt, *a.shape, (a.astype(np.float32).view(np.uint32) >> 16).astype(np.uint16))
+    a, b, r = (bf16(rng.uniform(-1, 1, shape)) for shape in ((m, k), (k, n), (m, n)))
+    w, x, res = up(b).cast(how).columns().realize(), up(a), up(r)
     rt.wait()
-    since, y = rt.launches, (x @ w + res).realize()
-    assert kernels(rt, since) == launches, (m, n, how)
-    each = [value(Tensor.of(rt, a[i:i + 32].tolist()) @ w + Tensor.of(rt, r[i:i + 32].tolist()))[0]
-            for i in range(0, m, 32)]
-    assert launches == 1 or np.array_equal(value(y)[0], np.concatenate(each)), (m, n, how)
+    since, y = rt.launches, x.matmul(w, out).realize()
+    assert kernels(rt, since) == launches, (m, k, n, how, out, kernels(rt, since))
     v = value(w)[0]
-    assert np.all(np.abs(value(y)[0] - (a @ v + r)) <= 2**-8 * (np.abs(a) @ np.abs(v) + np.abs(r))), (m, n, how)
+    assert np.all(np.abs(value(y)[0] - a @ v) <= 2**-8 * (np.abs(a) @ np.abs(v))), (m, k, n, how, out)
+    if k > 7712 or n == 256: continue  # on the grid
+    each = [value(up(a[i:i + 32]).matmul(w, out))[0] for i in range(0, m, 32)]
+    assert np.array_equal(value(y)[0], np.concatenate(each)), (m, k, n, how, out)
+    since, z = rt.launches, (x @ w + res).realize()
+    assert kernels(rt, since) == -(-m // 32) and np.array_equal(value(z)[0], np.concatenate(
+      [value(up(a[i:i + 32]) @ w + up(r[i:i + 32]))[0] for i in range(0, m, 32)])), (m, k, n, how, out)
 
 def test_accumulate_parts(chip):
   # Build a one-worker matmul with six K tiles split into three parts. The first two parts accumulate in fp32
