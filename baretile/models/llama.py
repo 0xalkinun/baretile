@@ -61,7 +61,7 @@ def pairs(n, span):
 @functools.cache
 def paired(rt, n, span): return Tensor.of(rt, pairs(n, span).tolist(), "fp32")  # pairs, made once on the chip
 
-def precision(c, mode="bf16", kv=None):
+def precision(c, mode="bf16", kv=None, state=None):
   """The format and fidelity phases of each matmul's weights, as {(op, block): (format, phases)}.
 
   Keys:
@@ -69,6 +69,8 @@ def precision(c, mode="bf16", kv=None):
     ("head", None)           the output layer
     ("attention", stage)     stage is "decode" or "prefill". B is the cache, so the format is None
     ("kv", None)             the KV cache's format: kv if given, else bfp8 for tt and experts, else bf16
+    ("state", None)          Gated DeltaNet's states' format, state if given, else fp32: in bf16, the kernels compute
+                             in fp32 and round each state as they store it, as the packer rounds, half up
     ("draft head", None)     experts only: a bfp4 copy of the output layer at one phase, for the multi-token
                              prediction layer to draft with
     ("fc", None)             with a multi-token prediction layer, its input projection
@@ -87,6 +89,7 @@ def precision(c, mode="bf16", kv=None):
   Outside tt's decode, attention takes four phases."""
   if mode not in ("bf16", "bfp8", "bfp4", "tt", "experts"): raise ValueError(f"unknown precision mode: {mode}")
   if kv is not None and kv not in ("bf16", "bfp8", "bfp4"): raise ValueError(f"unknown KV cache format: {kv}")
+  if state is not None and state not in ("fp32", "bf16"): raise ValueError(f"unknown state format: {state}")
   four = {"bfp4": ("gate_up",), "tt": ("gate_up",), "experts": ("gate_up", "down")}.get(mode, ())  # the ops in bfp4
   fast = mode in ("tt", "experts")  # one phase for a bfp4 B and two for bfp8, else four
   def entry(op):
@@ -99,11 +102,12 @@ def precision(c, mode="bf16", kv=None):
   if c.mtp: p["fc", None] = entry("fc")
   if mode == "experts": p["draft head", None] = ("bfp4", 1)
   attention = {("attention", "decode"): (None, 2 if mode == "tt" else 4), ("attention", "prefill"): (None, 4)}
-  return p | attention | {("kv", None): (kv or ("bfp8" if fast else "bf16"), None)}
+  return p | attention | {("kv", None): (kv or ("bfp8" if fast else "bf16"), None), ("state", None): (state or "fp32", None)}
 
 def precision_of(c, op, block=None): return (c.precision or {}).get((op, block), (None, None))  # (format, phases), None where unset
 
 def cache_format(c): return precision_of(c, "kv")[0] or "bf16"  # the KV cache's format
+def state_format(c): return precision_of(c, "state")[0] or "fp32"  # Gated DeltaNet's states' format
 
 # RMSNorm scaled by w. Qwen3.5 scales by 1 + w as n w + n, which stays exact where 1 + w would round in bf16. It reads
 # the fp32 residual stream rounded to bf16, so the norm runs on the FPU, where fp32 would run it all on the SFPU. With
@@ -728,11 +732,13 @@ def prefill(ids, w, c, caches, tokens, on=lambda row: row):
 def kv_cache(c, size, zeros, slots=1, speculative=False):
   """Allocate caches for the blocks, including the prediction block, using zeros(shape). Attention caches store
   key heads followed by value heads, with size rows. DeltaNet caches hold [conv history, S] for slots
-  sequences and use zeros(shape, "float32"). Speculative decoding keeps two copies of those states."""
+  sequences and use zeros(shape, "float32"), the states then cast to bf16 on the chip if state_format says so (NumPy's
+  stay float32 and hold bf16 values). Speculative decoding keeps two copies of those states."""
   states = ((c.conv - 1, slots, 2 * c.kh * c.kd + c.vh * c.vd), (slots * c.vh, c.kd, c.vd)) if c.kh else ()
   def cache(l):
     if not linear(c, l): return zeros((2 * c.kv, size, head(c)))
-    return [zeros(shape, "float32") for _ in range(1 + speculative) for shape in states]
+    held = lambda x: x.bfloat16().realize() if isinstance(x, Tensor) and state_format(c) == "bf16" else x
+    return [held(zeros(shape, "float32")) if i % 2 else zeros(shape, "float32") for i, shape in enumerate(states * (1 + speculative))]
   return [cache(l) for l in range(c.layers + c.mtp)]
 
 def linear(c, l): return l < len(c.layer_types or ()) and c.layer_types[l] == "linear_attention"  # is block l a Gated DeltaNet block?

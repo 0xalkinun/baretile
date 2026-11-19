@@ -386,6 +386,8 @@ class Request:
     if self.room: self.room.release(); self.room = None  # frees its slot for the next offer
     self.out.put(None)
 
+def held_dtype(x): return x.t.dtype if isinstance(x, qwen.Row) else x.dtype  # a slot's part's dtype, through its Row
+
 class Engine:
   """Decode sequences together, with places cache rows and separate DeltaNet state per slot. Steps include idle
   slots to keep shapes fixed for replay. Idle slots use a reserved final row and leave recurrent state
@@ -496,11 +498,10 @@ class Engine:
              for l, s in enumerate(self.slot[u])]
     each = lambda v: [x for part in v for x in (part if isinstance(part, tuple) else (part,))]
     mapped = lambda f, v: [tuple(f(x) for x in part) if isinstance(part, tuple) else f(part) for part in v]
-    dtype = lambda x: x.t.dtype if isinstance(x, qwen.Row) else x.dtype
     def device(x):  # the bytes of a copy in DRAM: whole tiles, spread over every bank
       tiles = x.batch * -(-x.rows // 32) * -(-x.cols // 32)
-      return -(-tiles // len(bh.DRAM)) * len(bh.DRAM) * tile_bytes(dtype(x))
-    host = lambda x: x.batch * x.rows * x.cols * (4 if dtype(x) in ("fp32", "int32") else 2)  # tobytes gives KV rows as bf16
+      return -(-tiles // len(bh.DRAM)) * len(bh.DRAM) * tile_bytes(held_dtype(x))
+    host = lambda x: x.batch * x.rows * x.cols * (4 if held_dtype(x) in ("fp32", "int32") else 2)  # tobytes gives KV rows as bf16
     def keys(kind): return [k for k, v in self.sessions.items() if isinstance(each(v)[0], kind)]
     def tohost(x):
       if not isinstance(x, qwen.Row): return x.tobytes()
@@ -539,7 +540,7 @@ class Engine:
     up = lambda x, n, data, dtype: data if isinstance(data, Tensor) else Tensor.frombytes(self.rt, n, x.cols, data, x.batch, dtype)
     try:
       at = self.on(list(range(rows))) if any(isinstance(p, bytes) for p in kept) else None
-      staged = [None if p is None else tuple(up(x, x.rows, d, "fp32") for x, d in zip(s[:2], p)) if llama.linear(self.c, l) else
+      staged = [None if p is None else tuple(up(x, x.rows, d, held_dtype(x)) for x, d in zip(s[:2], p)) if llama.linear(self.c, l) else
                 up(s, rows, p, "bf16") for l, (s, p) in enumerate(zip(self.slot[u], kept))]
     except MemoryError: staged = None  # this drops the uploads made so far
     if staged is None:
@@ -547,7 +548,7 @@ class Engine:
       return False
     for l, (s, p, d) in enumerate(zip(self.slot[u], kept, staged)):
       if llama.linear(self.c, l):
-        for x, v in zip(s[:2], d or (None, None)): x.assign(Tensor.zeros(self.rt, x.rows, x.cols, x.batch, "fp32") if v is None else v)
+        for x, v in zip(s[:2], d or (None, None)): x.assign(Tensor.zeros(self.rt, x.rows, x.cols, x.batch, held_dtype(x)) if v is None else v)
       elif isinstance(p, Tensor): s[:, :rows, :].assign(p)
       elif p is not None: s.put(at, d.cast(s.dtype))  # rows from the host are bf16, cast to the cache's dtype
     self.held[u], self.taken[u], self.coherent[u] = list(key), 1.0, True

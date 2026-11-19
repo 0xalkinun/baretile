@@ -14,7 +14,7 @@ from baretile.tensix import CHUNKS, tile_bytes
 from baretile.tensor import FIDELITY
 from baretile.models import llama, train
 
-BYTES = {d: tile_bytes(d) / 1024 for d in ("bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
+BYTES = {d: tile_bytes(d) / 1024 for d in ("fp32", "bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
 # Launches in a decode step, counted on ttsim at Qwen3.6's shapes with eight slots:
 #   attention  the norms, projections, RoPE, the cache put, attention, whose parts merge in its launch, and its division,
 #              the output and its gate
@@ -49,8 +49,9 @@ CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # 8 GDDR6 banks of 4 
             launch=1e-6, pcie=25e9,  # a launch's seconds on the card (a guess), and PCIe 4.0 x16 in bytes/s
             price=1299, host=600, years=3, watts=300, host_watts=75, kwh=0.15)
 # context is the number of positions in a session's slot. They're all filled, so a step reads every row. kv is the KV
-# cache's format, and report uses the mode's unless you set it. accept is the share of drafts that get accepted.
-USE = dict(context=32768, kv="bf16", accept=0.0)
+# cache's format, and report uses the mode's unless you set it. state is Gated DeltaNet's states' format (their conv
+# inputs stay fp32). accept is the share of drafts that get accepted.
+USE = dict(context=32768, kv="bf16", state="fp32", accept=0.0)
 # Bytes a training sequence of baretile.models.train reads, from ttsim-chaos's read counter, which counts every NoC read,
 # copies within a tile's L1 included, and no writes. A block reads a fixed amount, then some a token and some a pair of
 # tokens, as attention's scores do. The rest, the embeddings, the output layer and the loss, reads a fixed amount, some
@@ -123,7 +124,8 @@ def session(c, use, speculative=False):
   kv = sum(row * use["context"] for l in range(c.layers) if not llama.linear(c, l))
   draft = c.mtp * row * use["context"]
   linear = sum(llama.linear(c, l) for l in range(c.layers))
-  state = (1 + speculative) * linear * 4 * (c.vh * c.kd * c.vd + (c.conv - 1) * (2 * c.kh * c.kd + c.vh * c.vd)) if linear else 0
+  each = lambda: c.vh * c.kd * c.vd * BYTES[use["state"]] + (c.conv - 1) * (2 * c.kh * c.kd + c.vh * c.vd) * BYTES["fp32"]
+  state = (1 + speculative) * linear * each() if linear else 0  # a block's state, and its conv inputs in fp32
   return SimpleNamespace(kv=kv, draft=draft, state=state, bytes=kv + draft + state)
 
 # the expected number of a block's experts that at least one of the tokens picks
@@ -264,16 +266,17 @@ def report(folder, mode="bf16", **keys):
   if unknown := keys.keys() - (card.keys() | use.keys() | {"probe"}): raise ValueError(f"unknown cost settings: {', '.join(sorted(unknown))}")
   if "probe" in keys: card = probed(card, keys["probe"])  # measured rates replace the spec; explicit settings override both
   for k, v in keys.items():
-    if k != "probe": (card if k in card else use)[k] = v if k == "kv" else float(v)
+    if k != "probe": (card if k in card else use)[k] = v if k in ("kv", "state") else float(v)
   for k, v in (card | use).items():
-    if k != "kv" and v is not None and (not math.isfinite(v) or v < 0): raise ValueError(f"{k} must be a finite nonnegative number")
+    if k not in ("kv", "state") and v is not None and (not math.isfinite(v) or v < 0): raise ValueError(f"{k} must be a finite nonnegative number")
   for k in ("bandwidth", "reach", "tflops", "phases", "years", "pcie"):
     if card[k] == 0: raise ValueError(f"{k} must be positive")
   if card["reserve"] >= card["dram"]: raise ValueError("reserve must be smaller than dram")
   if card["reach"] > 1 or use["accept"] > 1: raise ValueError("reach and accept must be at most one")
   if use["context"] < 1 or not float(use["context"]).is_integer(): raise ValueError("context must be a positive integer")
   c, name = llama.config(folder), os.path.basename(os.path.normpath(folder))
-  use["context"], use["kv"] = int(use["context"]), llama.precision(c, mode, keys.get("kv"))["kv", None][0]
+  prec = llama.precision(c, mode, keys.get("kv"), keys.get("state"))
+  use["context"], use["kv"], use["state"] = int(use["context"]), prec["kv", None][0], prec["state", None][0]
   s = shape(c, mode)
   cards = math.ceil(s.bytes / (card["dram"] - card["reserve"]))
   room, hour = cards * (card["dram"] - card["reserve"]) - s.bytes, hourly(card) * cards
@@ -284,7 +287,7 @@ def report(folder, mode="bf16", **keys):
   for speculative in (False, True) if c.mtp else (False,):
     one = session(c, use, speculative)
     most = int(room // one.bytes)
-    states = f" and {one.state / 1e6:.0f} MB of Gated DeltaNet states" if one.state else ""
+    states = f" and {one.state / 1e6:.0f} MB of Gated DeltaNet states ({use['state']})" if one.state else ""
     out.append(f"  a session of {use['context']} tokens holds {one.kv / 1e9:.2f} GB of KV cache ({one.kv / use['context'] / 1e3:.1f} KB per token, "
                f"{use['kv']}){states}. {most} sessions fit on the card{'s' * (cards > 1)}")
     if not most:

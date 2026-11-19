@@ -8,10 +8,12 @@ import functools
 import numpy as np
 from baretile import bh
 from baretile.runtime import DATA, ZEROS, compile_kernel
-from baretile.tensix import (ACROSS, BANKS, COPIES, DST_FREE, DST_HALF, FILLED, FOLDS, MATH_END, MINUS_ONE, ONE, OUTS, RAW, REPORT, ROWS, SEM_L1,
-                            SEM_PACKED, SFPU, SFPU_START, SYNC_WORDS, UNPACKABLE, ZERO, Loop, aim, allocate, brisc_program, fill, haloize, ins,
-                            kernel_config, mad, mask_columns, mask_rows, math_begin, math_program, matmul, mul, pack, pack_program, reconfigure,
-                            sfp_const, sfp_load, sfp_store, sfpu, slot_base, tile_of, tt, unpack, unpack_program, walk)
+from baretile.tensix import (ACROSS, BANKS, COPIES, DST_FREE, DST_HALF, FILLED, FOLDS, MATH_END, MINUS_ONE, ONE, OUTS,
+                            RAW, REPORT, ROWS, SEM_L1, SEM_DST, SEM_PACKED, SFPU, SFPU_START, SYNC_WORDS, UNPACKABLE,
+                            ZERO, Loop, aim, allocate, brisc_program, fill, haloize, ins, kernel_config, mad,
+                            mask_columns, mask_rows, math_begin, math_program, matmul, mul, pack, pack_program,
+                            reconfigure, repack, sfp_const, sfp_load, sfp_store, sfpu, slot_base, tile_of, tt, unpack,
+                            unpack_program, walk, widen)
 from baretile.tensor import Tensor
 from baretile.models import gpt2, llama
 
@@ -72,6 +74,8 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     # inputs and the states in place. In a verify step, accept says whether to go on from the state after the last
     # draft or after the token before it. The state after the first token goes into the copies in state[2:].
     o = f.delta(S, x, past, taps, p["dt_bias"], p["decay"], live, *((state[3], accept, state[2]) if m == 2 else ()))
+    if isinstance(S, np.ndarray) and llama.state_format(c) == "bf16":  # NumPy's states hold what bf16 ones on the chip do
+      for s in (S, *((state[3],) if m == 2 else ())): s[...] = gpt2.bf16_packed(s)
   else:  # a prompt, maybe in one slot of several. chunk batches its pieces of 64, then runs the state through them in turn
     # The conv inputs of each sequence are its last ones, then this call's. Realize them before the last ones are
     # written over.
@@ -81,7 +85,8 @@ def deltanet(h, p, c, state, phases, live=None, accept=None, rule=None):
     q, k, v, b, g, _ = gates(y)
     o, S2 = chunk(q, k, v, f.sigmoid(b), g, S)
     o = f.now(o)  # o reads the state, so realize it before the state is written over
-    f.assign(state[1], big(state[1], S2))
+    S2 = big(state[1], S2)  # rounded to the states' format as it's stored: a cast for bf16 on the chip
+    f.assign(state[1], S2.cast(state[1].dtype) if isinstance(S2, Tensor) else gpt2.bf16_packed(S2) if llama.state_format(c) == "bf16" else S2)
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   if not done:  # each head RMS-normed and gated by z
     o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(x[:, width:width + vw], c.vh))
@@ -169,7 +174,7 @@ def chunk(q, k, v, beta, g, S, size=64):
     f.assign(f.parts(out, n)[i::n, :, :], o)
   return out if n * s == m else out[:, :m, :], S
 
-def delta_kernel(kt, vt, vh, rep, m=1):
+def delta_kernel(kt, vt, vh, rep, m=1, dtype="fp32"):
   """The kernel for delta: the Gated DeltaNet decode step of each sequence, or a verify step's token and its draft,
   from the projections of the tokens to their outputs. It's fp32 throughout and reads each state once.
 
@@ -200,7 +205,11 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   pass sums u = S^T k and w = S^T q down the tiles of the column. Then d = beta (v - e^g u), the output of the token
   is e^g w + d (k . q), and the new tiles of the column are e^g S + k d, which is the S of the next token.
   Write the final states to S. With two tokens, save the states after the first token in first. For an inactive
-  sequence, BRISC reads only live and accept, leaves the states unchanged, and writes zero outputs."""
+  sequence, BRISC reads only live and accept, leaves the states unchanged, and writes zero outputs.
+
+  dtype is the states', fp32 or bf16. The math thread widens a bf16 state into Dst, and the packer rounds the new one,
+  half up, into a bf16 tile at OUTS for its Dst half, which BRISC writes out. After the first of two tokens, it packs
+  each new tile twice: in fp32 for the second token, then in bf16 for first."""
   kh, kd, vd = vh // rep, 32 * kt, 32 * vt
   qk, vw = kh * kd, vh * vd
   S_ = lambda e, i, j: f"(F0 + ({e}) * {kt * vt} + ({i}) * {vt} + ({j}))"  # tile (i, j) of the S of value head e
@@ -266,7 +275,10 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   to_h = lambda n: f"{name(n)}(h);"  # for a program whose result goes to Dst half h
   aim_at = lambda row: tt(aim(row))
   free = tt([ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)])  # fills wait until the SFPU is done with their rows
-  fills = lambda *pairs: free + " " + tt([w for slot, row in pairs for w in fill(slot, row)] + FILLED)
+  bf16 = dtype == "bf16"
+  # with wide, the first tile is a state's, widened from bf16 if the states are
+  fills = lambda *pairs, wide=False: free + " " + tt([w for n, (slot, row) in enumerate(pairs)
+                                                      for w in (widen({}, slot, row) if wide and bf16 and n == 0 else fill(slot, row))] + FILLED)
   half = tt([DST_FREE])  # waits until a Dst half is free for a result
   done = f"{tt(MATH_END)} h ^= {DST_HALF};"
   lib = lambda *names: f"{aim_at('h')} {call(*names)} {aim_at(0)}"  # SFPU library programs, run on the tile at h
@@ -305,17 +317,29 @@ def delta_kernel(kt, vt, vh, rep, m=1):
               (f"drain(); {aim_at(0)} {fills((KC(t), R2), (QC(t), R3))} {apply('kq first')} for (unsigned i = 1; i < {kt}; i++) "
                f"{{ {fills((f'{KC(t)} + i', R2), (f'{QC(t)} + i', R3))} {apply('kq')} }} {aim_at(R4)} {call('sum1')} {aim_at(0)}", ""),
               result(f"{free} {to_h('copy')}", KQ(t)), ("drain();", "")]
+  def new_state(t, words, home):  # the kt new tiles of the column after token t, kept for the next one (but the last), and out
+    kept = f"{COL} + i" if t < m - 1 else None
+    if not bf16: return loop("i", kt, result(words, kept, home, "2 + i"))
+    # The packer switches to bf16 for the tiles out, into the bf16 tile at OUTS for the Dst half. A kept tile is packed
+    # in fp32 first, and Dst stays for the second pack
+    out, to_bf16, to_fp32 = f"h / {DST_HALF}", tt(repack(*cfgs)), tt(repack(*cfgs[::-1]))
+    keep = f"{tt([w for w in pack('h', kept, SEM_L1) if w != ins('SEMGET', sem_sel=SEM_DST)])} {to_bf16} " if kept else ""
+    packs = f"{keep}output({out}, {out}, {home}); {tt(pack('h', out, SEM_PACKED))} {to_fp32 if kept else ''} h ^= {DST_HALF};"
+    math, packs = loop("i", kt, (result(words, kept)[0], packs))
+    return math, packs if kept else f"{to_bf16} {packs} {to_fp32}"
   column = []  # column tile j of the S of each value head, through each token in turn
+  cfgs = [kernel_config("fp32", d, wide=bf16) for d in ("fp32", "bf16")]
   for t in range(m):
-    col = (lambda i: S_("e", i, "j")) if t == 0 else (lambda i: f"{COL} + ({i})")
+    col, wide = ((lambda i: S_("e", i, "j")), True) if t == 0 else ((lambda i: f"{COL} + ({i})"), False)
     column += [("drain();" if t else "", ""),
-               (f"{fills((col(0), R2), (KC(t), R3), (QC(t), R6))} {apply('sums first')} "
-                f"for (unsigned i = 1; i < {kt}; i++) {{ {fills((col('i'), R2), (f'{KC(t)} + i', R3), (f'{QC(t)} + i', R6))} {apply('sums')} }} "
+               (f"{fills((col(0), R2), (KC(t), R3), (QC(t), R6), wide=wide)} {apply('sums first')} "
+                f"for (unsigned i = 1; i < {kt}; i++) {{ {fills((col('i'), R2), (f'{KC(t)} + i', R3), (f'{QC(t)} + i', R6), wide=wide)} "
+                f"{apply('sums')} }} "
                 f"{aim_at(R4)} {call('sum1')} {aim_at(R5)} {call('sum1')} {aim_at(0)} "
                 f"{fills((f'{BT(t)} + e', R2), (f'{VV(t)} + e * {vt} + j', R3), (f'{E(t)} + e', R6))} {apply('d')}", ""),
                result(f"{fills((KQ(t), R2))} {to_h('out')}", home=f"{1 << 30:#x} | (unit * {rep} + e) << 8 | {t} << 6 | j"),
-               loop("i", kt, result(f"{fills((col('i'), R2), (f'{KC(t)} + i', R3))} {to_h('state')}", f"{COL} + i" if t < m - 1 else None,
-                                    f"{(m - 1 - t) << 31:#x} | (unit * {rep} + e) << 8 | (i * {vt} + j)", "2 + i"))]
+               new_state(t, f"{fills((col('i'), R2), (f'{KC(t)} + i', R3), wide=wide)} {to_h('state')}",
+                         f"{(m - 1 - t) << 31:#x} | (unit * {rep} + e) << 8 | (i * {vt} + j)")]
   steps.append(loop("e", rep, loop("j", vt, (" ".join(c for c, _ in column), " ".join(c for _, c in column)))))
   math, packs = [w for w, _ in steps], [w for _, w in steps]
   units = lambda body: f"""  for (unsigned u = 0; u < a[1]; u++) {{
@@ -349,7 +373,7 @@ static void send(void) {{  // write packed output rows (zero if inactive) and ac
       noc_put((live ? SLOT(slot) : {ZEROS:#x}) + off, BANK(o), AT(A[6], o, 4096) + off, 64);
     }} else if (live) {{  // a tile of the states, or of those after the first token
       unsigned i = t >> 31 ? {first} : 2, o = {tile_of('i', 'unit', f'(t & 255) / {vt}', f'(t & 255) % {vt}', 'A')};
-      noc_put(SLOT(slot), BANK(o), AT(A[i], o, 4096), 4096);
+      noc_put({f"{OUTS:#x} + slot * 2048" if bf16 else "SLOT(slot)"}, BANK(o), AT(A[i], o, {2048 if bf16 else 4096}), {2048 if bf16 else 4096});
     }}
     noc_wait();
   }}
@@ -389,7 +413,7 @@ void kmain(volatile unsigned *args) {{
     unsigned taken = {value(1) if m > 1 else 1}, from = taken ? 2 : {first}, c = taken ? {C} : {C2};
     for (unsigned e = 0; e < {rep}; e++) for (unsigned i = 0; i < {kt}; i++) for (unsigned j = 0; j < {vt}; j++) {{
       unsigned t = {tile_of('from', f's * {vh} + hk * {rep} + e', 'i', 'j', 'A')};
-      noc_get(BANK(t), AT(A[from], t, 4096), SLOT({S_('e', 'i', 'j')}), 4096);
+      noc_get(BANK(t), AT(A[from], t, {2048 if bf16 else 4096}), SLOT({S_('e', 'i', 'j')}), {2048 if bf16 else 4096});
     }}
     for (unsigned src = 0; src < {sources}; src++) for (unsigned g = 0; g < 2; g++)  // stage the runs of q and k
       get_runs(src, s, c, g ? ck : cq, {kt}, {staged('src', 'g')}, 128, 64);
@@ -441,9 +465,9 @@ void kmain(volatile unsigned *args) {{
   helpers = "".join([helper(k, tt(ACROSS[FOLDS[k]](k))) for k in ("sum1", "sum2")] +  # sum1 sums down the columns, sum2 along the rows
                     [helper(n, tt(sfpu([n], {}))) for n in ("fexp", "frecip", "log", "sqrt")] +
                     [helper(n, tt(words)) for n, words in masks.items()] + [helper(n, body(p), "unsigned h") for n, p in programs.items()])
-  cfg = kernel_config("fp32", "fp32")
+  cfg = kernel_config("fp32", "fp32", wide=bf16)  # with bf16, unpacker 1 reads widen's zeros as bf16
   return compile_kernel(brisc, unpack_program(units("fetched();"), cfg),
-                        math_program({}, units("fetched(); " + " ".join(math) + " " + tt(REPORT)), True, helpers),
+                        math_program({}, units("fetched(); " + " ".join(math) + " " + tt(REPORT)), True, helpers, wide=bf16),
                         pack_program(units(" ".join(packs)), 2 + kt))
 
 def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2=None):
@@ -463,7 +487,8 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
     state after this step's token, and S and conv the state after its draft.
 
   q, k and v are the SiLU of the conv. q and k go to length 1, and q is scaled by kd^-1/2. beta = sigmoid(b) and
-  g = decay softplus(a + dt). Everything but live is fp32. Returns the outputs in fp32, as (value heads, the tokens of
+  g = decay softplus(a + dt). Everything but live is fp32, but the states and first may be bf16 together, which the
+  kernel stores as the packer rounds, half up. Returns the outputs in fp32, as (value heads, the tokens of
   each sequence in turn, vd). Head dimensions must be multiples of 32. There's no gradient."""
   n, kd, vd, width = conv.rows, S.rows, S.cols, conv.cols
   if kd % 32 or vd % 32: raise ValueError("delta needs key and value head dimensions divisible by 32")
@@ -475,7 +500,8 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
   if m not in (1, 2) or any((t is None) == (m == 2) for t in aux):
     raise ValueError("delta needs one token, or two tokens with first, accept and conv2 together")
   ins = (S, x, conv, taps, dt, decay, *(aux if m == 2 else ()))
-  if not all(t.dtype == "fp32" for t in ins): raise ValueError("delta needs fp32 states and inputs")
+  if not (all(t.dtype == "fp32" for t in ins[1:6] + ins[7:]) and S.dtype in ("fp32", "bf16") and (m == 1 or first.dtype == S.dtype)):
+    raise ValueError("delta needs fp32 inputs, and states in fp32 or bf16")
   if any(t.rt is not S.rt for t in (*ins, *((live,) if live is not None else ()))):
     raise ValueError("delta needs states and inputs on the same runtime")
   if not (x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width)):
@@ -487,7 +513,7 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
     raise ValueError("delta needs first like S, conv2 like conv, and accept as a row of sequences")
   live = live if live is not None else S.number(1.0, "bf16").expand(1, n * m, 1).realize()
   o = Tensor.frombytes(S.rt, n * m, vd, bytes(4 * vh * n * m * vd), vh, "fp32")  # zeroed, because no unit writes its padding rows
-  key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m)
+  key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m, S.dtype)
   return o.run(key, lambda: delta_kernel(*key[1:]), S, o, live, *((first, accept) if m > 1 else ()), x, conv, *((conv2,) if m > 1 else ()),
                taps, dt, decay, units=n * kh, name="delta")
 
@@ -652,7 +678,10 @@ class Tiles:
   A unit's tiles are L1 slots from take. What the packer writes comes first, after slot 0, then the output slots
   (outs), all within bh.PACK_REACH of slot 0; the inputs follow. BRISC fetches a unit's inputs once math has reported
   the last unit done, and writes results out as they're packed. It can fetch them as several frames, one after
-  another: math waits for the first, and at each later() for the next."""
+  another: math waits for the first, and at each later() for the next.
+
+  With out bf16, what goes out to OUT is packed in bf16, as the packer rounds, half up, and the slots in wide hold bf16
+  inputs (get's bf16), which the math thread widens into Dst."""
   programs = {"mul": lambda r: [sfp_load(0, r), sfp_load(1, R2), mul(2, 0, 1), sfp_store(2, r)],
               "rsub": lambda r: [sfp_load(0, r), sfp_load(1, R2), mad(2, 0, ONE, 1, neg=1), sfp_store(2, r)],  # R2 - r
               "neg": lambda r: [sfp_load(0, r), mul(1, 0, MINUS_ONE), sfp_store(1, r)],
@@ -676,9 +705,14 @@ class Tiles:
              "log": sfpu(["log"], {}), "sum2": ACROSS[FOLDS["sum2"]]("sum2"), "col0": mask_columns("sum", 1)}
   # on the tile at h: fp32 e^x, sqrt, 1 / x and log, each row's sum filling it, and column 0 alone
 
-  def __init__(self):
+  def __init__(self, out="fp32"):
     self.used, self.ops, self.made, self.drained, self.keeps, self.replays = 1, [], {}, 0, {}, allocate({"mm", "mmT"})
+    self.out, self.wide, self.packing = out, set(), "fp32"  # the packer's format as the ops so far leave it
     self.programs, self.called = dict(Tiles.programs), set()  # a kernel's own programs, and the library's it calls
+
+  def widened(self, slot, row):  # tensix.widen, with unpacker 1, which reads fp32 for the FPU, reading its zeros as bf16
+    zeros = lambda f: reconfigure(SEC1_format=f, SEC1_out_format=f)
+    return zeros(bh.BF16) + widen(self.replays, slot, row) + zeros(bh.FP32)
 
   def take(self, n, cols=None):
     """n slots, from the first unused: the first, or with cols, tile (i, j) of rows of cols tiles."""
@@ -704,6 +738,9 @@ class Tiles:
     waiting = sum(1 for j in self.made.values() if j >= self.drained)
     words = ["drain();"] if any(self.made.get(t, -1) >= self.drained for t in read) or waiting >= 15 else []
     if words: self.drained = len(self.ops)
+    if any(a in self.wide or b in self.wide for a, b, _ in terms):
+      raise ValueError("Tiles: a bf16 input can't be a product's operand")
+    if self.out == "bf16" and home is not None and slot != self.OUT: raise ValueError("Tiles: a bf16 result goes out from OUT")
     if terms:
       mm, was = math_begin(True) + srca(1) + formats(bh.TF32), False
       for a, b, T in terms:  # a transposed B comes as it lies: unpacker 0 turns its faces, and the walk picks them
@@ -711,19 +748,24 @@ class Tiles:
         mm, was = mm + unpack(b, a) + matmul(self.replays, 4, T), T
       if was: mm += haloize(0) + walk(False)
       words.append(tt(mm + formats(bh.FP32) + srca(0) + aim(0)))
+    elif start in self.wide: words.append(tt([DST_FREE] + free + aim("h") + self.widened(start, 0) + aim(0)))
     else: words.append(tt([DST_FREE] + free + fill(start, "h") + FILLED))
     kept = home is None or slot != self.OUT
     for p, ts in [*posts, *[("round", ())] * (kept and not exact)]:  # an FPU operand: TF32 to nearest, unbiased
       if p in self.library: self.called.add(p)
       run = f"{tt(aim('h'))} p_{p}(); {tt(aim(0))}" if p in self.library else f"p_{p}(h);"
-      words.append((f"{tt(free + [w for t, r in zip(ts, (R2, R3)) for w in fill(t, r)] + FILLED)} " if ts else "") + run)
+      put = lambda t, r: self.widened(t, r) if t in self.wide else fill(t, r)
+      words.append((f"{tt(free + [w for t, r in zip(ts, (R2, R3)) for w in put(t, r)] + FILLED)} " if ts else "") + run)
     words.append(f"{tt(MATH_END)} h ^= {DST_HALF};")
     if kept: words.append("posted++;"); self.made[slot] = len(self.ops)
-    if home is None: pack_ = f"{tt(pack('h', slot, SEM_L1))}"
+    fmt = self.out if home is not None and slot == self.OUT else "fp32"
+    pack_, self.packing = self.switch(fmt), fmt
+    if home is None: pack_ += f"{tt(pack('h', slot, SEM_L1))}"
     else:
-      to, keep = ((f"{self.OUT} + h / {DST_HALF}", f"h / {DST_HALF}") if slot == self.OUT else
+      # an fp32 output goes in the output slot of the Dst half, a bf16 one in that half's bf16 tile at OUTS
+      to, keep = ((f"{self.OUT if fmt == 'fp32' else 0} + h / {DST_HALF}", f"h / {DST_HALF}") if slot == self.OUT else
                   (slot, self.keeps.setdefault(slot, 2 + len(self.keeps))))
-      pack_ = f"output({keep}, {to}, {tile_of(2, 'e', home[0], home[1])}); {tt(pack('h', to, SEM_PACKED, *[SEM_L1] * kept))}"
+      pack_ += f"output({keep}, {to}, {tile_of(2, 'e', home[0], home[1])}); {tt(pack('h', to, SEM_PACKED, *[SEM_L1] * kept))}"
     self.ops.append((" ".join(words), f"{pack_} h ^= {DST_HALF};"))
 
   def norm(self, slot, row, kt, scale=1.0):
@@ -738,9 +780,15 @@ class Tiles:
     for p in range(2): self.op(at(i, p), **made, posts=[("lo", ())] * p)
 
   @staticmethod
-  def get(i, base, rows, cols, b="e"):  # BRISC's fetch of rows x cols tiles of the tensor at word i, from slot base on
-    return (f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) "
-            f"get(a[{i}], {tile_of(i, b, 'r', 'c')}, {base} + r * {cols} + c);")
+  def get(i, base, rows, cols, b="e", bf16=False):  # BRISC's fetch of rows x cols tiles of the tensor at word i, from slot
+    # base on. A bf16 tile takes the first half of its slot
+    t, slot = tile_of(i, b, "r", "c"), f"{base} + r * {cols} + c"
+    fetch = (f"{{ unsigned t = {t}; noc_get(BANK(t), AT(a[{i}], t, 2048), SLOT({slot}), 2048); }}" if bf16 else
+             f"get(a[{i}], {t}, {slot});")
+    return f"for (unsigned r = 0; r < {rows}; r++) for (unsigned c = 0; c < {cols}; c++) {fetch}"
+
+  def switch(self, fmt):  # the packer's config from the format it's in to fmt's
+    return "" if fmt == self.packing else f"{tt(repack(*(kernel_config('fp32', f) for f in (self.packing, fmt))))} "
 
   def later(self): self.ops.append(("fetched();", ""))  # the ops after this read the inputs of fetch's next frame
 
@@ -754,13 +802,13 @@ class Tiles:
     brisc = units(f"reached(frame_done[0]); {' ready(); '.join(fetch)} ready(); frame_done[0] = ++events;")
     cfg = kernel_config("fp32", "fp32")
     library = "".join(f"__attribute__((noinline)) static void p_{n}(void) {{ {tt(self.library[n])} }}\n" for n in sorted(self.called))
-    return compile_kernel(brisc_program(f"a[1] * {total}", brisc, "fp32", "fp32"), unpack_program(units("fetched();"), cfg),
+    return compile_kernel(brisc_program(f"a[1] * {total}", brisc, "fp32", self.out), unpack_program(units("fetched();"), cfg),
                           math_program(self.replays, units("fetched(); " + " ".join(m for m, _ in self.ops) + " " + tt(REPORT)),
                                        True, helpers(self.programs, {"round": SFPU["ftoh"][0], "lo": SFPU["ftoh"][0]}) + library,
                                        wide=True),
-                          pack_program(units(" ".join(c for _, c in self.ops)), 2 + len(self.keeps)))
+                          pack_program(units(" ".join(c for _, c in self.ops) + self.switch("fp32")), 2 + len(self.keeps)))
 
-def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
+def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None, dtype="fp32"):
   """The kernel for rule: a piece's gated delta rule after the decays, one value head a unit, in Tiles' ops. The
   inputs come rounded to TF32 by rule, except the state, which goes on in fp32 and is rounded here for the FPU.
 
@@ -790,7 +838,8 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
 
   The ops follow corrected and chunk: L = (kb k^T) decay, then the inverse of I + L in blocks, w = inv kbe (kept
   negated), v_new = inv vb - w S, the outputs qe S + ((q k^T) decay) v_new, and the state e^G S + kl v_new. L's diagonal
-  is never read, since every pairs mask lies below it. st, kt and vt are the tiles of a piece, a key and a value.
+  is never read, since every pairs mask lies below it. st, kt and vt are the tiles of a piece, a key and a value, and
+  dtype is S's, fp32 or bf16. With state, the state after the piece goes out in fp32 either way.
 
   BRISC reads a unit's inputs in frames, each while the ops before it run: with gated, the gates; with kd, seen and
   the constants (and beta and g), then q, k and v, or else the inputs but S; then S and what only the last ops read."""
@@ -814,6 +863,7 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
     (Q, K, KB, KBE, QE), VB = scaled_rows()
     DC = t.take(st * st, st)
   SS, CN = t.take(kt * vt, vt), t.take(8)
+  if dtype == "bf16": t.wide.update(range(SS(0, 0), SS(0, 0) + kt * vt))
   E0, E0T = CN + 6, CN + 7  # ones in row 0, ones in column 0
   EG, KL = (t.take(1), t.take(kt * st, st)) if state else (None, None)
   op, lower = t.op, [(i, j) for i in range(st) for j in range(i + 1)]
@@ -897,7 +947,7 @@ def rule_kernel(st, kt, vt, rep, state, kd=None, gated=None):
   rows = ((QR, KR, VR) if scaled else (Q, K, VB))
   consts = f"for (unsigned t = 0; t < 8; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't', 0, 0)}, {CN} + t);"
   qk = get(arg["q"], rows[0](0, 0), st, kt, f"e / {rep}") + get(arg["k"], rows[1](0, 0), st, kt, f"e / {rep}")
-  frames, last = [], get(arg["S"], SS(0, 0), kt, vt)
+  frames, last = [], get(arg["S"], SS(0, 0), kt, vt, bf16=dtype == "bf16")
   if gated:  # of each gate, the unit's column, from the faces that hold it, or row 0 of dt_bias and decay
     frames = ["".join(f"for (unsigned f = 0, t = {tile_of(arg[n], 0, 0, 'e / 32')}, o; f < {2 - (j > 1)}; f++) "
                       f"o = (2 * f + e % 32 / 16) * 1024, noc_get(BANK(t), AT(a[{arg[n]}], t, 4096) + o, "
@@ -929,7 +979,8 @@ def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False, raw=None):
   launch, for a piece of one tile without state, from q and k as the conv gives them; with more, cum, the decays and
   the scaled rows come from tensor ops in fp32 before it. With raw, deltanet's for one sequence (b and a as x's
   columns, dt_bias and decay a row each, z as x's columns, the norm's weight and eps), the outputs come RMS-normed and
-  gated by z, deltanet's last step, which that launch does itself, with beta and g, so beta and g aren't read."""
+  gated by z, deltanet's last step, which that launch does itself, with beta and g, so beta and g aren't read. On the
+  chip S may be bf16; the state after the piece comes in fp32 either way."""
   f, s, rep = llama.fns(q), q.shape[-2], v.shape[0] // q.shape[0]
   if raw and raw[4].shape[-1] != v.shape[0] * v.shape[-1]: raise ValueError("rule's raw is one sequence's")
   if raw and raw[2].shape[-2] * raw[3].shape[-2] != 1:
@@ -963,13 +1014,14 @@ def rule(q, k, v, beta, g, S, seen=None, state=False, normed=False, raw=None):
   else:
     e, beta = f.now(f.exp(cum)), f.now(beta)  # columns, made once: the scaled rows would each work them out again
     rows = (*map(near, (q, k, kb := kr * beta, kb * e, qr * e, v * beta)), decay)
-  key = ("rule", st, kt, vt, rep, state, q.shape[-1] if scaled else None, gated)
+  if S.dtype not in ("fp32", "bf16"): raise ValueError("rule needs an fp32 or bf16 state")
+  key = ("rule", st, kt, vt, rep, state, q.shape[-1] if scaled else None, gated, S.dtype)
   out.run(key, lambda: rule_kernel(*key[1:]), out, *rows, S, constants(q.rt), *extra, units=h, name="rule")
   o, vnew = out[:, :s, :] if gated else norm(out[:, :s, :]), out[:, 32 * st:32 * st + s, :]
   if scaled: cum = out[:, 64 * st:, :].filled(0, s)  # the kernel fills cum's tiles
   return (o, vnew, cum, out[:, 64 * st:64 * st + kd, :]) if state else (o, vnew, cum)
 
-def carry_kernel(st, kt, vt, rep, per):
+def carry_kernel(st, kt, vt, rep, per, dtype="fp32"):
   """The kernel for carry, one value head a unit, in Tiles' ops: w = on e^min(G - cum, 0) filling its tiles, where G
   is cum at end (end's row filled down, times cum's column filled, from two TF32 parts), then S = e^G S + (k w)^T
   v_new, k w turned by the identity, with S as it came. A unit fetches S last, while the ops that come before
@@ -978,14 +1030,15 @@ def carry_kernel(st, kt, vt, rep, per):
   Arguments: the first unit and the number of units, then four words for each tensor (as rule_kernel's): S, which
   the kernel writes over; k, for each key head (a unit reads its value head's, e / rep); v_new and cum, for each
   value head; end and on, for each sequence of per value heads; consts (constants). k comes as the conv gives it, and
-  the kernel takes it to length 1 (Tiles.norm)."""
-  t = Tiles()
+  the kernel takes it to length 1 (Tiles.norm). dtype is S's, fp32 or bf16, which goes out as the packer rounds."""
+  t = Tiles(dtype)
   KW, KT, VR, CP, CF = t.take(st * kt, kt), t.take(kt * st, st), t.take(st * vt, vt), t.take(2 * st, 2), t.take(2 * st, 2)
   GF, EG, W, ENF, ONF, NK = t.take(1), t.take(1), t.take(st), t.take(st), t.take(st), t.take(st)
   OUT = t.outs()
   SS, K, VN, CC, EN, ON, CN = (t.take(kt * vt, vt), t.take(st * kt, kt), t.take(st * vt, vt), t.take(st), t.take(st),
                                t.take(st), t.take(3))
   E0, E0T, op = CN + 1, CN + 2, t.op  # ones in row 0 and in column 0, after the identity: the constants it reads
+  if dtype == "bf16": t.wide.update(range(SS(0, 0), SS(0, 0) + kt * vt))
   for j in range(st):  # end's row filled down, on's column across, and cum's, in parts for the FPU
     op(ENF + j, [(E0T, EN + j, False)]), op(ONF + j, [(ON + j, E0, False)])
     t.parts(CP, j, start=CC + j)
@@ -1006,21 +1059,24 @@ def carry_kernel(st, kt, vt, rep, per):
   fetch = (get(arg["k"], K(0, 0), st, kt, f"e / {rep}") + get(arg["vnew"], VN(0, 0), st, vt) + get(arg["cum"], CC, st, 1) +
            get(arg["end"], EN, 1, st, f"e / {per}") + get(arg["on"], ON, st, 1, f"e / {per}") +
            f"for (unsigned t = 0; t < 3; t++) get(a[{arg['consts']}], {tile_of(arg['consts'], 't ? 5 + t : 0', 0, 0)}, {CN} + t);")
-  return t.kernel("carry_kernel", [fetch, get(2, SS(0, 0), kt, vt)], kt * vt)
+  return t.kernel("carry_kernel", [fetch, get(2, SS(0, 0), kt, vt, bf16=dtype == "bf16")], kt * vt)
 
 def carry(S, k, vnew, cum, end, on):
   """The state after a path through a piece that rule ran, as a prompt of the path would leave it, so nothing runs
   again (the path kept after checking a tree of tokens): S = e^G S + sum over the path of e^(G - cum_j) k_j v_new_j^T,
   where G is cum at the path's last token. k is as rule takes it, as the conv gives it, and v_new and cum as rule gives
   them; end is a row with 1 at the path's last token and on a column with 1 on its tokens, for each sequence of S's
-  value heads. S is written over and returned. On the chip it's carry_kernel's one launch."""
+  value heads. S is written over and returned. On the chip it's carry_kernel's one launch, for an fp32 or bf16 S,
+  computed in fp32 and stored as the packer rounds, half up. NumPy's S holds what it computes: for a bf16 state, the
+  caller rounds it, with gpt2.bf16_packed."""
   f, per = llama.fns(S), S.shape[0] // end.shape[0]
   if isinstance(S, np.ndarray):
     G, k = f.repeat(end, per) @ cum, unit(k)
     w = f.repeat(on, per) * np.exp(np.minimum(G - cum, 0))
     S[...] = S * np.exp(G) + f.t(f.repeat(k, S.shape[0] // k.shape[0]) * w) @ vnew
     return S
-  key = ("carry", -(-vnew.rows // 32), -(-S.rows // 32), -(-S.cols // 32), S.batch // k.batch, per)
+  if S.dtype not in ("fp32", "bf16"): raise ValueError("carry needs an fp32 or bf16 state")
+  key = ("carry", -(-vnew.rows // 32), -(-S.rows // 32), -(-S.cols // 32), S.batch // k.batch, per, S.dtype)
   return S.run(key, lambda: carry_kernel(*key[1:]), S, k, vnew, cum, end, on, constants(S.rt), units=S.batch, name="carry")
 
 @functools.cache

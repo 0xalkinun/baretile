@@ -66,8 +66,10 @@ def table(chip, probe=None):
   S, x = zeros(HD, HD, VH, "fp32"), zeros(1, width + VH * HD + 2 * VH, 1, "fp32")
   conv, taps, dt, decay = zeros(1, width, 3, "fp32"), zeros(1, width, 4, "fp32"), zeros(1, VH, 1, "fp32"), zeros(1, VH, 1, "fp32")
   live = Tensor.of(rt, [[1.0]])
-  row("Gated DeltaNet, a decode step", seconds(lambda: qwen.delta(S, x, conv, taps, dt, decay, live).realize()),
-      2 * VH * HD * HD * 4, "GB/s of the states")
+  for d, what in (("fp32", ""), ("bf16", ", bf16 states")):
+    held = zeros(HD, HD, VH, d)
+    row(f"Gated DeltaNet, a decode step{what}", seconds(lambda: qwen.delta(held, x, conv, taps, dt, decay, live).realize()),
+        2 * VH * HD * HD * tile_bytes(d) // 1024, "GB/s of the states")
   for m in (32, 64):  # and by the chunked rule, from tensor operations, as a prompt's piece runs it
     (q, k), (v, beta, g) = (zeros(m, HD, KH, "fp32") for _ in range(2)), (zeros(m, c, VH, "fp32") for c in (HD, 1, 1))
     row(f"Gated DeltaNet, {m} tokens by the chunked rule", seconds(lambda: [t.realize() for t in qwen.chunk(q, k, v, beta, g, S)]))

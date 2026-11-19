@@ -13,6 +13,10 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 - Gated DeltaNet for tokens in an order of their own, such as a tree's: `qwen.rule` runs a piece in one kernel, which
   can make the gates and the output norm itself; `qwen.conv` with `last`, `qwen.conv_state` and `qwen.carry` each take
   one launch; `qwen.predict` runs a prediction layer on its own ([models](docs/models.md#experts-and-gated-deltanet)).
+- Gated DeltaNet's states in bf16, a precision choice (`llama.precision(c, state="bf16")`, or `("state", None)` in a
+  table; fp32 by default): the kernels compute in fp32 and round each state as they store it, half up as the packer
+  does, and a prompt's last state with a cast. `qwen.carry` writes half the bytes. The bench times a decode step both
+  ways.
 - `Tensor.attend` takes a tree's places, `serve.frontier` picks a step of a tree of tokens grown best first, on the
   chip, with its places by head if asked, which `llama.attention`'s grouped rows take with no copy, and
   `serve.grouped_topk` takes the k largest of rows too wide for L1. `llama.rms_kernel` norms a few long rows at once,

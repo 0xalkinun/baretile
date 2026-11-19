@@ -14,6 +14,8 @@ HEADS = 12
 def bf16_bits(a):  # to bf16 bits, rounded to nearest even like uploads
   b = np.asarray(a, np.float32).view(np.uint32)
   return ((b + 0x7FFF + (b >> 16 & 1)) >> 16).astype(np.uint16)
+def bf16_packed(a):  # to bf16 as the packer rounds, half up on the bits, as float32 values
+  return ((np.asarray(a, np.float32).view(np.uint32) + 0x8000) >> 16 << 16).view(np.float32)
 def bf16_floats(bits): return (np.asarray(bits).astype(np.uint32) << 16).view(np.float32)  # bf16 bits to float32 values
 
 def bfp(a, dtype="bfp8"):

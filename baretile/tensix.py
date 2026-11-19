@@ -154,7 +154,7 @@ def fill(slot, row):
 # An fp32 kernel's math thread puts a bf16 tile into Dst as fp32, d rows past its aim, as a bf16 kernel loads one:
 # through SrcA, plus zeros in SrcB. Unpacker 0 can't widen bf16 into Dst (ISA FormatConversion.md), so it switches to
 # bf16 and to context 0 for the tile, with the thread config that unpacking into SrcA takes, and back once the tile is
-# in. A bf16 tile takes half an fp32 slot, so slot s is bf16 tile 2s.
+# in. A bf16 tile takes half an fp32 slot, so slot s is bf16 tile 2s. The config needs wide, for SrcB's bf16 zeros.
 def widen(replays, slot, d):
   fmt = lambda f: reconfigure(SEC0_format=f, SEC0_out_format=f)
   srca = lambda on: [ins("SETC16", setc16_reg=bh.THREAD_CFG[r], setc16_value=v) for r, v in
