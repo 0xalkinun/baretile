@@ -669,11 +669,11 @@ R2, R3 = 2 * DST_HALF, 3 * DST_HALF  # where an op fills tiles for the SFPU besi
 
 class Tiles:
   """A kernel of tile ops for one unit at a time, all in fp32 (rule_kernel, carry_kernel). Every product runs on the
-  FPU, which reads fp32 tiles as TF32 (10 bits of mantissa, as the GPU engine's tree kernel), and everything else on
-  the SFPU. The unpacker truncates to TF32, a bias that sums over K, so every tile the FPU reads is rounded to nearest
-  first: op rounds what it keeps, unless it's exact, for the SFPU alone. The math thread unpacks everything: into Dst
-  for the SFPU, into SrcA and SrcB for the FPU. Each op makes one tile in a Dst half, which pack writes into L1 for the
-  ops after it, or for BRISC to write out to a tile of the result.
+  FPU, which reads fp32 tiles as TF32 (10 bits of mantissa), and everything else on the SFPU. The unpacker truncates
+  to TF32, a bias that sums over K, so every tile the FPU reads is rounded to nearest first: op rounds what it keeps,
+  unless it's exact, for the SFPU alone. The math thread unpacks everything: into Dst for the SFPU, into SrcA and SrcB
+  for the FPU. Each op makes one tile in a Dst half, which pack writes into L1 for the ops after it, or for BRISC to
+  write out to a tile of the result.
 
   A unit's tiles are L1 slots from take. What the packer writes comes first, after slot 0, then the output slots
   (outs), all within bh.PACK_REACH of slot 0; the inputs follow. BRISC fetches a unit's inputs once math has reported

@@ -15,15 +15,17 @@ from baretile.tensor import FIDELITY
 from baretile.models import llama, train
 
 BYTES = {d: tile_bytes(d) / 1024 for d in ("fp32", "bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
-# Launches in a decode step, counted on ttsim at Qwen3.6's shapes with eight slots:
-#   attention  the norms, projections, RoPE, the cache put, attention, whose parts merge in its launch, and its division,
-#              the output and its gate
-#   experts    the extra launches of a mixture of experts
-#   deltanet   the projections, the delta kernel, and the output's norm and gate
+# Launches of a step at Qwen3.6-35B-A3B's shapes in experts mode, with eight slots on 120 tiles, as test_cost_launches
+# counts them: a dry run on ttsim of serve.Engine's decode, and of its speculative step's verify and draft, that records
+# each launch and sends none, the second call of each, as a replay runs it. It tells the kinds apart by engines of one
+# to four blocks.
+#   attention  a block's norms, projections, RoPE, the cache put, attention, the output, its gate and the block's MLP
+#   experts    what a mixture of experts adds to that MLP: the router, its top-k, the picked experts and their sum
+#   deltanet   a block's norms, projections, the delta kernel, the output's norm and gate, and the block's MLP
 #   rest       the embedding gather, the position columns, the final norm, the output layer and sampling's heads
-# The verify entries are the same for a speculative step, and draft is the call to the multi-token prediction layer.
-LAUNCHES = {"attention": 18, "experts": 18, "deltanet": 7, "rest": 14, "attention verify": 18, "deltanet verify": 7, "rest verify": 23,
-            "draft": 55}
+# The verify entries are the speculative step's, and draft is its call to the multi-token prediction layer.
+LAUNCHES = {"attention": 19, "experts": 11, "deltanet": 9, "rest": 11, "attention verify": 19, "deltanet verify": 9, "rest verify": 11,
+            "draft": 53}
 # Bytes a decode step reads beyond the weights, experts, states and attention's rows, at Qwen3.6's shapes. The first is
 # a block's activations in 32-row tiles. The second is the rest's, the logits that sampling reads, for each tile row of
 # tokens. outputs, in step, counts the outputs of the picked experts separately: the gate and up, their GLU and the
