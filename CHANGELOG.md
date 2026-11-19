@@ -32,7 +32,7 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 
 ### Changed
 
-- baretile needs tt-kmd 2.5 or later. The core's line budget is 4,695, from 4,500.
+- baretile needs tt-kmd 2.5 or later. The core's line budget is 4,716, from 4,500.
 - `Tensor.put` into a block float takes rows in its dtype and copies each run with its exponent, where it took bf16
   and rounded on BRISC. Cast the rows first, or for bfp8 have the matmul that makes them pack it, as
   `a.matmul(cache, "bfp8")` does.
@@ -53,8 +53,8 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
   matrix's live rows alone; `gather`, `put`, `topk` and a single row's upload read or spread less; `assign` moves
   straight into a new destination; the bfp4 cast rounds a matrix's live rows alone; `qwen.rule`'s kernel reads its
   inputs in frames, each while the ops before it run, and of each gate only the head's column; a matmul of several
-  tile rows by a wide block float by columns takes a launch a tile row, as a token's row does, which reads B near
-  DRAM's rate.
+  tile rows by a wide block float by columns goes as a token's row does, which reads B near DRAM's rate: up to 3 tile
+  rows a launch, each B tile going into SrcA once for all of them, or fused with what follows, a tile row a launch.
 
 ### Fixed
 

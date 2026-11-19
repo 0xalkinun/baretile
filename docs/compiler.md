@@ -181,10 +181,10 @@ A pair of 32 by 32 tiles takes sixteen `MVMUL` instructions per fidelity phase.
 A matmul with `dtype="int32"` accumulates in fp32 and then converts the result.
 
 A single tile row, as in token decoding, has workers take output columns, share
-A, and stream B from DRAM. With column storage, they read through their own
-bank ports in requests of up to 16 KiB. `CHUNKS` and `DEPTH` are four, untuned.
-A block float by columns, too wide to cut K for, takes several tile rows this
-way, a tile row a launch: on a card that beats the grid below, reading B again.
+A, and stream B from DRAM, through their own bank ports in requests of up to 16
+KiB for B by columns. `CHUNKS` and `DEPTH` are four, untuned. Against a block
+float by columns too wide to cut K for, a bare matmul takes up to 3 tile rows a
+launch so, each B tile in SrcA once for all, and a fused one a tile row.
 
 Other matrices of several tile rows, or rows of A too long for L1, have workers
 share A across grid rows and B down grid columns, in three buffers. If K doesn't

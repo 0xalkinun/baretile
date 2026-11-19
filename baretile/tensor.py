@@ -556,27 +556,34 @@ class Tensor:
     reps = tuple((u.rep, u.cyc) if u.cyc else u.rep for u in inputs)
     wide = dtype == "fp32" and any(u.dtype == "bf16" for u in inputs)
     formats = tuple(u.dtype for u in inputs) if wide else None  # an fp32 kernel's bf16 inputs
-    key = (e, shapes, dtype, self.dtype, self.rt.grid, reps, self.rt.readers, sweep, formats)
+    key = (e, shapes, dtype, self.dtype, self.rt.grid, reps, self.rt.readers, sweep, formats, 1)
     # A lone matmul by a block-float B by columns goes a tile row at a time, if the kernel for one row of tiles takes it
     # as a token's: that reads B near DRAM's rate, where the grid's blocks of several rows read it far slower. B must be
-    # too wide for Tensor.matmul to cut K into a batch at one tile row: narrower, the grid's blocks are faster.
+    # too wide for Tensor.matmul to cut K into a batch at one tile row: narrower, the grid's blocks are faster. A bare
+    # matmul goes up to 3 full tile rows a launch (fused_kernel's rows), so a last tile row cut short goes alone.
     ops = (lambda f: f(f, e))(lambda f, x: [x[0], *(o for c in x[1:] for o in f(f, c))] if isinstance(x, tuple) else [])
-    if each := (self.rows > 32 and self.batch == 1 and ops.count("matmul") == 1 and {"Cbfp8", "Cbfp4"} & set(ops)
-                and not any(o in COMBINE for o in ops) and 2 * -(-self.cols // 32) > len(self.rt.cores)):
-      row = (e, tuple((b, 32, c) if r > 32 and not u.runs else (b, r, c) for u, (b, r, c) in zip(inputs, shapes)),
-             *key[2:])
-      kernel, units, each, name = _cached(row, lambda: (*fused_kernel(*row), _name(e)))
-    if not each: kernel, units, _, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
+    each = (self.rows > 32 and self.batch == 1 and ops.count("matmul") == 1 and {"Cbfp8", "Cbfp4"} & set(ops)
+            and not any(o in COMBINE for o in ops) and 2 * -(-self.cols // 32) > len(self.rt.cores))
+    tr, runs, done = -(-self.rows // 32), [], 0  # launches, as (first tile row, kernel, units, name)
+    for g in ((3, 2, 1) if e[0] == "matmul" else (1,)) if each else ():
+      row = (e, tuple((b, 32 * g, c) if r > 32 and not u.runs else (b, r, c) for u, (b, r, c) in zip(inputs, shapes)),
+             *key[2:-1], g)
+      while done + g <= (self.rows // 32 if g > 1 else tr):
+        kernel, units, one, name = _cached(row, lambda: (*fused_kernel(*row), _name(e)))
+        if not one: break
+        runs, done = runs + [(done, kernel, units, name)], done + g
+    if done < tr:
+      kernel, units, _, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
+      runs = [(0, kernel, units, name)]
     if into is not None: self._alias(into)
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
-    # _where(True) is safe: _expr only lets a tensor by columns in as a matmul's B. With each, launch i takes tile row i
-    # of the result and of each input as tall
-    tr = -(-self.rows // 32) if each else 1
+    # _where(True) is safe: _expr only lets a tensor by columns in as a matmul's B. A launch from tile row i takes the
+    # result and each input as tall from there
     at = lambda t, i: t._where(True) if t.runs or t.rows == 1 else (*t._where()[:3], t.offset + i * t.stride)
-    for i in range(tr):
-      args = [v for t in [self] + inputs for v in at(t, i)] + [self.rows % 32 if self.rows > 1 and i == tr - 1 else 0]
-      self.rt.launch(kernel, tuple(args), units or self.tiles, name)
+    for i, kernel, units, name in runs:
+      last = self.rows % 32 if self.rows > 1 and i == runs[-1][0] else 0
+      self.rt.launch(kernel, tuple(v for t in [self] + inputs for v in at(t, i)) + (last,), units or self.tiles, name)
     return self
   def assign(self, x):
     """Write x into this tensor in place, as an optimizer updates a weight. An unrealized x is computed into this
