@@ -1440,20 +1440,36 @@ def test_attend_tree(chip):
     s = q @ np.repeat(k, 4, 0).transpose(0, 2, 1) + np.where(see, np.float32(0), np.float32(-1e9))
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, 4, 0), 0.011)
-  # 6 rows after 90 earlier tokens of a tree, each seeing the cache, a few of them and itself
-  length, back = 200, 90
-  q, k, v = (bf16(rng.normal(0, sd, shape)) for sd, shape in ((1 / 16, (8, 6, 256)), (1, (2, length + back + 6, 256)),
-                                                              (1, (2, length + back + 6, 256))))
-  see = np.zeros((6, length + back + 6), bool)
-  see[:, :length] = True
-  for r in range(6): see[r, length + rng.choice(back, 8, replace=False)], see[r, length + back + r] = True, True
-  places = [row(length + back + r, length, sum(1 << b for b in range(back + 6) if see[r, length + b]), 6) for r in range(6)]
-  tq, tk, tv = Tensor.of(rt, q.tolist()), *(Tensor.of(rt, x.tolist()).cast("bfp8").realize() for x in (k, v))
-  k, v = value(tk), value(tv)
-  got = value(tq.attend(tk.repeat_interleave(4), tv.repeat_interleave(4), Tensor.of(rt, places, "int32")))
-  s = q @ np.repeat(k, 4, 0).transpose(0, 2, 1) + np.where(see, np.float32(0), np.float32(-1e9))
-  p = np.exp(s - s.max(-1, keepdims=True))
-  close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, 4, 0), 0.011)
+  # 6 rows after 90 earlier tokens of a tree, each seeing the cache, a few of them and itself, over bfp8 keys. Then in
+  # bf16, a key head's 4 query heads as one tile row, in a window that starts within a key tile, with row 2 seeing none
+  # of the tree's keys, not even its own. Bits past a column's 16 count for nothing. The tree starts 8, 0 and 1 past a
+  # multiple of 32, so its columns reach each edge of a key tile, and in the last some rows' bases come later than
+  # others': a row sees every key before its own base.
+  back, grouped = 90, lambda x: x.reshape(2, 4, 6, 256).transpose(0, 2, 1, 3).reshape(2, 24, 256)
+  for length, window, later in ((200, 150, [0] * 6), (192, 120, [0] * 6), (193, 120, [0, 32, 0, 45, 64, 0])):
+    keys, bases = length + back + 6, length + np.array(later)
+    q, k, v = (bf16(rng.normal(0, sd, (n, rows, 256))) for sd, n, rows in ((1 / 16, 8, 6), (1, 2, keys), (1, 2, keys)))
+    see = np.arange(keys)[None] < bases[:, None]
+    for r in range(6):
+      see[r, length + rng.choice(back, 8, replace=False)] = see[r, length + 31 + 9 * r] = see[r, length + back + r] = True
+    for windowed in (False, True):
+      if windowed:
+        see[2, length:] = False
+        see &= np.arange(keys)[None] > np.arange(length + back, keys)[:, None] - window
+      places = [row(length + back + r, int(bases[r]), sum(1 << b for b in range(keys - bases[r]) if see[r, bases[r] + b]), 6)
+                for r in range(6)]
+      if windowed:
+        places = [p[:2] + [b | 0x50000 for b in p[2:]] for p in places for _ in range(4)]
+        tq, tk, tv = (Tensor.of(rt, x.tolist()) for x in (grouped(q), k, v))
+        got = value(tq.attend(tk, tv, Tensor.of(rt, places, "int32"), window))
+      else:
+        tq, tk, tv = Tensor.of(rt, q.tolist()), *(Tensor.of(rt, x.tolist()).cast("bfp8").realize() for x in (k, v))
+        k, v = value(tk), value(tv)
+        got = value(tq.attend(tk.repeat_interleave(4), tv.repeat_interleave(4), Tensor.of(rt, places, "int32")))
+      s = q @ np.repeat(k, 4, 0).transpose(0, 2, 1) + np.where(see, np.float32(0), np.float32(-1e9))
+      p = np.exp(s - s.max(-1, keepdims=True))
+      want = p / p.sum(-1, keepdims=True) @ np.repeat(v, 4, 0)
+      close(got, grouped(want) if windowed else want, 0.011)
 
 def test_attention_unit_rows(chip, monkeypatch):
   # With one worker, a unit takes up to 8 tile rows of queries, which share each key and value tile it reads. The

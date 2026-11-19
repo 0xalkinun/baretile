@@ -248,7 +248,8 @@ positions and sliding-window bounds to build the masks. A new position changes
 the mask without changing the recorded launches. For a tree of tokens, places
 also carry a base key and up to six columns of 16 bits that say which of the
 keys from the base each row sees, so each token sees the cache before the tree
-and its own ancestors in it.
+and its own ancestors in it. BRISC builds a mask tile only for a key tile that
+some row sees part of, while the tile's reads are under way.
 
 The kernel sweeps keys twice: first to find row maxima, then to compute
 exponentials and weighted values, with `tensix.exp16`, e^x to bf16's precision

@@ -974,9 +974,11 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   else: stored = tile_row(10, "m", "get", f"{store} + (kt - k0) * {ht} + m")
   # the first sweep fills the store
   keys = lambda values: f"if (!{kept}) {{ {framed} }}" + (f" else {{ {stored} }}" if not values else "")
-  fetch = lambda values: (f"reached(frame_done[fr]); if {partial} {{ " + each(f"masked({mask('r')}, r, kt);") + " } " +
-                          keys(values) + (f" {tile_row(14, 'j', getk, into(val('j')))}" if values else "") +
-                          f" l1_settle(SLOT({mask(0)})); ready(); frame_done[fr] = ++events;")
+  # a frame's mask tiles, which BRISC builds once the frame's reads are on their way
+  masks = f"if {partial} {{ " + each(f"masked({mask('r')}, r, kt);") + " } "
+  fetch = lambda values: ("reached(frame_done[fr]); " + keys(values) +
+                          (f" {tile_row(14, 'j', getk, into(val('j')))}" if values else "") +
+                          f" {masks}l1_settle(SLOT({mask(0)})); ready(); frame_done[fr] = ++events;")
   if share:  # this worker's tiles of a frame, j0 to j1, then the frame's pieces that hold them, which it multicasts
     j0, j1 = f"jm * {ht} / {rep}", f"(jm + 1) * {ht} / {rep}"
     mine = lambda at, place: (f"for (unsigned m = {j0}; m < {j1}; m++) "
@@ -998,9 +1000,8 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
                        f"noc_issue_on(1, {src}, noc_me(), (unsigned)&FLAGS[jm], to, WRITE | STATIC, 4); acks++; }} "
                        "acks_at[fr] = acks;")
     fetch = lambda values: (f"reached(frame_done[(fr + 1) % {nf}]); await(0, {rep}, tiles - 1); "
-                            "while ((int)(NOC(1, WR_ACKS) - acks_at[fr]) < 0) {} "
-                            f"if {partial} {{ " + each(f"masked({mask('r')}, r, kt);") + " } " +
-                            mine(10, key) + (" " + mine(14, val) if values else "") + " " +
+                            "while ((int)(NOC(1, WR_ACKS) - acks_at[fr]) < 0) {} " +
+                            mine(10, key) + (" " + mine(14, val) if values else "") + f" {masks}" +
                             post(kp + (vp if values else [])) +
                             f" l1_settle(SLOT({mask(0)})); ready(); frame_done[fr] = ++events;")
     start = f"acks = NOC(1, WR_ACKS); for (unsigned f = 0; f < {nf}; f++) acks_at[f] = acks; " + start
@@ -1143,24 +1144,25 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   math = "".join(f"{tt(math_begin(False) + sfpu([p], replays) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math
   packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer
   hide = 0xFF80  # bf16 -inf
-  # whether row q misses key j, from its base on: its bit in places' columns after the base, or past the last of them
-  unseen = lambda j: (f"(({j}) >= base && (({j}) - base >= {16 * tree} || !(places[at(q, 2 + (({j}) - base) / 16)] "
-                      f">> ((({j}) - base) % 16) & 1)))" if tree else "0")
+  # The mask of tile row r for key tile kt: -inf where a row doesn't see the key, else 0. Bit i of seen says whether row
+  # q sees key kt * 32 + i: from first to p, and with tree, all keys before its base and those of its bits that are
+  # set, column c's from the key s on in the tile. hidden makes each word of the mask, two keys, from their two bits.
+  by_tree = (f"int o = kt * 32 - places[at(q, 1)]; unsigned t = o >= 0 ? 0 : o <= -32 ? ~0u : (1u << -o) - 1; "
+             f"for (int c = 0, s = -o; c < {tree}; c++, s += 16) if (s > -16 && s < 32) {{ "
+             "unsigned b = places[at(q, 2 + c)] & 0xFFFF; t |= s >= 0 ? b << s : b >> -s; } seen &= t;" if tree else "")
   decls = ("static unsigned expect, merged;" + (table("store", store) if keep and wt else "") +
            (f"static unsigned acks, acks_at[{nf}];  // NoC 1's acks once this worker's writes, or a frame's, land\n"
             if share else "") + (table("peer", [bh.noc_xy(x, y) for x, y in cores]) if cores else "")) + f"""
-// The mask of tile row r for key tile kt, from its places: -inf where a row doesn't see the key, else 0.
-// Two keys go in a word.
+static const unsigned hidden[4] = {{{hide | hide << 16:#x}, {hide << 16:#x}, {hide:#x}, 0}};
 static void masked(unsigned slot, unsigned r, unsigned kt) {{
-  volatile unsigned *places = (volatile unsigned *)({places:#x} + r * 4096), *m = (volatile unsigned *)SLOT(slot);
+  volatile unsigned *places = (volatile unsigned *)({places:#x} + r * 4096);
   for (unsigned q = 0; q < 32; q++) {{
-    int p = places[at(q, 0)], first = {f"p - {window - 1}" if window else "0"};
-    int base = {"places[at(q, 1)]" if tree else "0"};  // with tree, the first key its bits are for
-    for (unsigned c = 0; c < 32; c += 2) {{
-      int j = kt * 32 + c;
-      m[at(q, c) / 2] = (j > p || j < first || {unseen('j')} ? {hide:#x} : 0) |
-                        (j + 1 > p || j + 1 < first || {unseen('j + 1')} ? {hide << 16:#x}u : 0);
-    }}
+    int p = places[at(q, 0)] - kt * 32, first = {f"p - {window - 1}" if window else "0"};
+    unsigned seen = p < 0 || first > 31 ? 0 : (p >= 31 ? ~0u : (2u << p) - 1) & (first <= 0 ? ~0u : ~0u << first);
+    {by_tree}
+    volatile unsigned *m = (volatile unsigned *)SLOT(slot) + at(q, 0) / 2;  // the row in the left faces, then the right
+    for (unsigned c = 0; c < 8; c++, seen >>= 2) m[c] = hidden[seen & 3];
+    for (unsigned c = 0; c < 8; c++, seen >>= 2) m[128 + c] = hidden[seen & 3];
   }}
 }}"""
   # the flags and their source words, which are the grid matmul's B flags, zero for the kernels after this one
