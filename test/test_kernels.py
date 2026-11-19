@@ -1417,10 +1417,10 @@ def test_attend(chip):
   assert not any(chip.read32(x, y, FLAGS + 4 * i) for x, y in rt.cores for i in range(32))
 
 def test_attend_tree(chip):
-  # A tree's 32 tokens after a cache, as a tree's verify runs them: each sees the cache and its ancestors among the tree's
-  # keys, which places give as a base (the tree's first key) and 16 bits a column, b for the key base + b. With 4 query
-  # heads a key head they share its tiles, and over a long cache its keys go in parts. Then a draft pass's rows after
-  # 90 earlier drafts, in six columns of bits. q is as RoPE scales it, by 1 / sqrt(256). Within a percent of NumPy.
+  # A tree's 32 tokens after a cache: each sees the cache and its ancestors among the tree's keys, which places give as
+  # a base (the tree's first key) and 16 bits a column, b for the key base + b. With 4 query heads a key head they
+  # share its tiles, and over a long cache its keys go in parts. Then 6 rows after 90 earlier tokens of a tree, in six
+  # columns of bits. q is as RoPE scales it, by 1 / sqrt(256). Within a percent of NumPy.
   rt, rng = Runtime(chip), np.random.default_rng(83)
   row = lambda place, base, bits, n: [place, base] + [bits >> 16 * h & 0xFFFF for h in range(n)]
   for length in (100, 1500):
@@ -1440,7 +1440,7 @@ def test_attend_tree(chip):
     s = q @ np.repeat(k, 4, 0).transpose(0, 2, 1) + np.where(see, np.float32(0), np.float32(-1e9))
     p = np.exp(s - s.max(-1, keepdims=True))
     close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, 4, 0), 0.011)
-  # A draft pass's 6 rows after 90 earlier drafts, each seeing the cache, a few of them and itself
+  # 6 rows after 90 earlier tokens of a tree, each seeing the cache, a few of them and itself
   length, back = 200, 90
   q, k, v = (bf16(rng.normal(0, sd, shape)) for sd, shape in ((1 / 16, (8, 6, 256)), (1, (2, length + back + 6, 256)),
                                                               (1, (2, length + back + 6, 256))))

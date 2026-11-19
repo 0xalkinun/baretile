@@ -627,8 +627,8 @@ void kmain(volatile unsigned *a) {{
 def conv_state(last, table, picks):
   """Write into the conv state last (conv - 1, sequences, width, as deltanet keeps it), in place, the rows that picks
   names, as conv's do: sequence b's input j is pick j sequences + b, a row of table or, past its rows, of last as it
-  was. picks is an int32 row, its indices unchecked, as conv's. On the chip, conv_state_kernel's one launch: commit's
-  conv state after a path, from verify's rows and the state before it."""
+  was. picks is an int32 row, its indices unchecked, as conv's. On the chip, conv_state_kernel's one launch: the conv
+  state after a path through a tree, from the rows the tree ran and the state before them."""
   if isinstance(last, np.ndarray):
     rows = np.concatenate([table.reshape(-1, table.shape[-1]), last.reshape(-1, last.shape[-1])])[np.ravel(picks)]
     last[...] = rows.reshape(last.shape)
@@ -996,10 +996,10 @@ def carry_kernel(st, kt, vt, rep, per):
 
 def carry(S, k, vnew, cum, end, on):
   """The state after a path through a piece that rule ran, as a prompt of the path would leave it, so nothing runs
-  again (a verified tree's commit): S = e^G S + sum over the path of e^(G - cum_j) k_j v_new_j^T, where G is
-  cum at the path's last token. k is as rule takes it, as the conv gives it, and v_new and cum as rule gives them; end is a row with 1 at the
-  path's last token and on a column with 1 on its tokens, for each sequence of S's value heads. S is written over and
-  returned. On the chip it's carry_kernel's one launch."""
+  again (the path kept after checking a tree of tokens): S = e^G S + sum over the path of e^(G - cum_j) k_j v_new_j^T,
+  where G is cum at the path's last token. k is as rule takes it, as the conv gives it, and v_new and cum as rule gives
+  them; end is a row with 1 at the path's last token and on a column with 1 on its tokens, for each sequence of S's
+  value heads. S is written over and returned. On the chip it's carry_kernel's one launch."""
   f, per = llama.fns(S), S.shape[0] // end.shape[0]
   if isinstance(S, np.ndarray):
     G, k = f.repeat(end, per) @ cum, unit(k)

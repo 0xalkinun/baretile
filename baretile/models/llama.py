@@ -402,8 +402,8 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   attention, n = phases("attention", "prefill" if prefill else "decode"), h.shape[-2]
   q, k, v = heads[:c.heads, :, :], cache[:c.kv, :, :], cache[c.kv:, :, :]
   sinks = p.get("sinks")  # gpt-oss: each head has a sink, a logit that counts in the softmax but has no value
-  # A decode step's or a draft's few rows: a key head's query heads as the rows of one tile row, which reads each key and
-  # value tile once for them all. Verify's 32 rows would take 4 tile rows a unit, which is slower than a unit a head.
+  # A few rows, as a decode step's: a key head's query heads as the rows of one tile row, which reads each key and value
+  # tile once for them all. 32 rows would take 4 tile rows a unit, which is slower than a unit a head.
   grouped = not slots and places is not None and attends(c, p) and n * rep <= 32 and places.shape[:2] == (1, n)
   if grouped:
     q = f.split(qkv[:, :c.heads * hd], c.kv).reshape(c.kv, n * rep, hd)

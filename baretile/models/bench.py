@@ -50,17 +50,17 @@ def table(chip, probe=None):
       row(f"{what}, {k} x {n} bfp4, {m} rows", s, bytes_, "GB/s of weights", dram)
       if m == 256: row(f"{what}, {k} x {n} bfp4, {m} rows: its math", s, 2 * m * k * n * 1e-3, "TFLOPS", peak)
     del weights[what]
-  for keys in (4096, 32768):  # attention over the cache: a verify step's 32 rows of every query head
+  for keys in (4096, 32768):  # attention over the cache: 32 rows of every query head
     q, places = zeros(32, HEAD, HEADS), Tensor.of(rt, [[keys - 1]] * 32, "int32")
     k, v = (zeros(keys, HEAD, KV, "bfp8").repeat_interleave(HEADS // KV) for _ in range(2))
     cache = 2 * KV * -(-keys // 32) * (HEAD // 32) * tile_bytes("bfp8")
     row(f"attention, 32 rows over {keys} cached positions", seconds(lambda: q.attend(k, v, places, fidelity=4).realize()),
         cache, "GB/s of the cache", dram)
-  # a draft pass's 6 rows over the drafter's 8k bf16 window, each key head's 4 query heads as one tile row, as llama
-  # groups a few rows
+  # a few rows a query head over a long bf16 cache, a key head's query heads grouped in one tile row as llama groups a
+  # few rows: 6 rows over 8192 positions
   keys, q, places = 8192, zeros(6 * HEADS // KV, HEAD, KV), Tensor.of(rt, [[8191]] * (6 * HEADS // KV), "int32")
   k, v = zeros(keys, HEAD, KV), zeros(keys, HEAD, KV)
-  row("attention, a draft pass's 6 rows over 8192 bf16 positions", seconds(lambda: q.attend(k, v, places, fidelity=4).realize()),
+  row("attention, 6 rows over 8192 bf16 positions", seconds(lambda: q.attend(k, v, places, fidelity=4).realize()),
       2 * KV * keys * HEAD * 2, "GB/s of the cache", dram)
   width = 2 * KH * HD + VH * HD  # Gated DeltaNet's decode step for one token: the states are read and written once
   S, x = zeros(HD, HD, VH, "fp32"), zeros(1, width + VH * HD + 2 * VH, 1, "fp32")
@@ -68,14 +68,15 @@ def table(chip, probe=None):
   live = Tensor.of(rt, [[1.0]])
   row("Gated DeltaNet, a decode step", seconds(lambda: qwen.delta(S, x, conv, taps, dt, decay, live).realize()),
       2 * VH * HD * HD * 4, "GB/s of the states")
-  for m in (32, 64):  # and by the chunked rule, from tensor operations, as a prompt's piece or a tree of drafts runs it
+  for m in (32, 64):  # and by the chunked rule, from tensor operations, as a prompt's piece runs it
     (q, k), (v, beta, g) = (zeros(m, HD, KH, "fp32") for _ in range(2)), (zeros(m, c, VH, "fp32") for c in (HD, 1, 1))
     row(f"Gated DeltaNet, {m} tokens by the chunked rule", seconds(lambda: [t.realize() for t in qwen.chunk(q, k, v, beta, g, S)]))
   (x, y), w = (zeros(32, DIM, 1, "fp32") for _ in range(2)), zeros(1, DIM)  # the fp32 residual stream and a block's output
   row(f"RMSNorm of the stream and a block's output, 32 rows of {DIM}",
       seconds(lambda: [t.realize() for t in llama.rms(x, w, SimpleNamespace(eps=1e-6, centered=True), y)]))
-  # sampling's top-k at the served 20, and a draft pass's best 4 (the tree's branch) of its 96k-token head
-  for m, cols, k, what in ((32, VOCAB, 20, "sampling's top-k"), (6, 96 * 1024, 4, "a draft pass's top-k")):
+  # top-k of 20, a request's usual top_k, over the output layer's 32 rows, and a few rows of a wide head: the 4 largest
+  # of 6 rows of 98,304 logits
+  for m, cols, k, what in ((32, VOCAB, 20, "sampling's top-k"), (6, 96 * 1024, 4, "top-k")):
     logits = np.random.default_rng(0).normal(0, 4, (m, cols)).astype(np.float32)
     z = Tensor.frombytes(rt, m, cols, logits.tobytes(), 1, "fp32")
     row(f"{what}, the {k} largest of {m} rows of {cols} logits", seconds(lambda: [t.realize() for t in serve.grouped_topk(z, k)]))
