@@ -1305,9 +1305,9 @@ def test_llama_layer(chip, n):
   on = lambda a: Tensor.of(rt, a.tolist())
   cache, np_cache = on(np.zeros((6, n, 64))), np.zeros((6, n, 64))
   places = Tensor.of(rt, [list(range(n))], "int32")
-  got = llama.layer(on(x), None, {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn)),
+  got = llama.layer(on(x), None, {k: on(v) for k, v in p.items()}, c, (on(cos), on(sin), on(turn), places),
                     (on(mask), places.reshape(1, n, 1), 0), cache, places)
-  want = llama.layer(x, None, p, c, (np.float64(cos), np.float64(sin), turn), np.float64(mask), np_cache, range(n))
+  want = llama.layer(x, None, p, c, (np.float64(cos), np.float64(sin), turn, range(n)), np.float64(mask), np_cache, range(n))
   got, want = got[0] + got[1], want[0] + want[1]  # the stream after the block
   change = np.abs(want - x).max()
   assert change > 0.5 and np.abs(np.array(got.tolist()) - want).max() < 0.03 * change, (np.abs(np.array(got.tolist()) - want).max(), change)
@@ -1338,42 +1338,48 @@ def test_rms_kernel(chip):
 
 def test_rope_kernel(chip):
   # Qwen3's q and k norm and RoPE of qkv's heads take one launch (llama.rope_kernel), within a bf16 step of numpy: with
-  # one row, 32 and two tile rows, a quarter of each head turning or all of it, centered and not, tables of one row for
-  # rows at one position, heads that qk_on leaves as they are, and on one worker, which takes all the units in turn.
-  # Past the turning dimensions it has the tensor ops' bits. In them, it adds the two products exactly, where the
-  # tensor ops' FPU add aligns the smaller to the larger's 10 bits first: a bf16 step apart at most. The result's
-  # padding rows are 0, as a matmul over them needs: with eps 0, qkv's zero padding would norm to inf. A bf16
-  # qkv, a norm weight that trains, and turning dimensions that aren't whole tiles in each half take the tensor ops.
+  # one row, 6, 13, 32 and two tile rows, a quarter of each head turning or all of it, centered and not, at one position
+  # for all rows or at a position each, apart, repeated, in the tile rows of the first and the last position and between
+  # them, and at the table's last row, heads that qk_on leaves as they are, and on one worker, which takes all the units
+  # in turn. The kernel reads the tables' rows at the positions itself. Past the turning dimensions it has the tensor
+  # ops' bits. In them, it adds the two products exactly, where the tensor ops' FPU add aligns the smaller to the
+  # larger's 10 bits first: a bf16 step apart at most. The result's padding rows are 0, as a matmul over them needs:
+  # with eps 0, qkv's zero padding would norm to inf. A bf16 qkv, a norm weight that trains, turning dimensions that
+  # aren't whole tiles in each half, and positions neither one nor one a row take the tensor ops.
   rng = np.random.default_rng(14)
-  for rows, hd, partial, centered, one, alone in ((32, 256, 0.25, True, False, False), (1, 128, None, False, False, False),
-                                                  (40, 64, None, True, False, True), (6, 256, 0.25, True, True, False)):
+  apart, tree = rng.choice(128, 32, replace=False), np.r_[np.sort(rng.integers(0, 128, 39)), 127]
+  for rows, hd, partial, centered, at, alone in ((32, 256, 0.25, True, apart, False), (1, 128, None, False, [127], False),
+                                                 (6, 256, 0.25, True, [9], False), (40, 64, None, True, tree, True),
+                                                 (13, 128, None, False, [127], False), (40, 256, 0.25, True, [41], False)):
     rt = Runtime(chip, end=chip.tensix[1]) if alone else Runtime(chip)
     c = llama.custom(dim=128, heads=4, kv=2, head_dim=hd, partial=partial, gated=centered, centered=centered, theta=1e6,
                      eps=0.0 if alone else 1e-6)
-    nh, rd, (cos, sin, turn) = 8 + 4 * centered, llama.turning(c), llama.rotary(c, 64)
-    at = np.full(rows, 9) if one else rng.choice(64, rows, replace=False)
-    cos, sin, x = cos[at], sin[at], rng.normal(0, 2, (rows, nh * hd)).astype(np.float32)
+    nh, rd, (cos, sin, turn) = 8 + 4 * centered, llama.turning(c), llama.rotary(c, 128)
+    x = rng.normal(0, 2, (rows, nh * hd)).astype(np.float32)
     w, on = bf16(rng.normal(0, 0.5, (nh, 1, hd))), np.float32(np.arange(nh) < 6).reshape(nh, 1, 1)  # v's and the gates' 0
     p = {k: Tensor.of(rt, a.tolist(), "fp32") for k, a in (("qk_norm", w), ("qk_on", on))}  # fp32, as upload makes them
-    rotary = [Tensor.of(rt, a.tolist()) for a in (cos[:1 if one else rows], sin[:1 if one else rows], turn)]
+    rotary = [Tensor.of(rt, a.tolist()) for a in (cos, sin, turn)] + [Tensor.of(rt, [list(map(int, at))], "int32")]
     heads = Tensor.frombytes(rt, rows, nh * hd, x.tobytes(), 1, "fp32").split(nh)
     before, got = rt.launches, llama.rope_launch(heads, p, c, rotary)
     assert rt.launches == before + 1
-    split, h = lambda a: a.reshape(rows, nh, hd).transpose(1, 0, 2), x.reshape(rows, nh, hd).transpose(1, 0, 2).astype(np.float64)
+    split, h = lambda a: a.reshape(-1, nh, hd).transpose(1, 0, 2), x.reshape(rows, nh, hd).transpose(1, 0, 2).astype(np.float64)
     r = 1 / np.sqrt((h * h).mean(-1, keepdims=True) + c.eps)
     n = np.where(on, h * (r * w + r if centered else r * w), h)
-    want = llama.rope(n, split(cos), split(sin), turn).transpose(1, 0, 2).reshape(rows, nh * hd)
+    want = llama.rope(n, split(cos[at]), split(sin[at]), turn).transpose(1, 0, 2).reshape(rows, nh * hd)
     assert got.dtype == "bf16" and np.abs(value(got) - want).max() <= 2**-7 * np.abs(want).max()
     assert rows == 1 or not value(got._view(-(-rows // 32) * 32, nh * hd, 1, 0))[..., rows:, :].any()  # the tiles' padding
     f = llama.fns(heads)
     r = f.rsqrt(f.mean(heads * heads) + c.eps)
     n = f.bf16(f.where(p["qk_on"], heads * (r * p["qk_norm"] + r if centered else r * p["qk_norm"]), heads))
-    ops = f.merge(llama.rope(n, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))
+    cos, sin = llama.tables(rotary)
+    assert llama.tables(rotary[1::-1] + rotary[2:])[0].tobytes() == sin.tobytes()  # other tables at the same positions
+    ops = f.merge(llama.rope(n, f.split(cos, nh), f.split(sin, nh), rotary[2]))
     a, b = (np.frombuffer(t.tobytes(), np.uint16).reshape(rows, nh, hd).astype(np.int32) for t in (got, ops))
     assert np.array_equal(a[..., rd:], b[..., rd:]) and np.abs(a - b).max() <= 1, np.abs(a - b).max()
   assert llama.rope_launch(heads.bfloat16(), p, c, rotary) is None
   assert llama.rope_launch(heads, p, llama.custom(**vars(c) | {"partial": 0.125}), rotary) is None  # 16 in each half turn
   assert llama.rope_launch(heads, p | {"qk_norm": p["qk_norm"].requires_grad_()}, c, rotary) is None
+  assert llama.rope_launch(heads, p, c, rotary[:3] + [Tensor.of(rt, [[3, 4]], "int32")]) is None
 
 def test_model_sfpu_scheduling(monkeypatch):
   # The models' kernels' own SFPU programs, which they hand to qwen.helpers, follow test_kernels' scheduling rule
@@ -1391,7 +1397,8 @@ def test_model_sfpu_scheduling(monkeypatch):
 
 def test_kv_cache(chip):
   # A two-block Llama decodes 5 tokens after a 5-token prompt, against numpy. Positions are data, not shapes, so the
-  # steps launch the same kernels and replay from the third: only the first two run forward's Python.
+  # steps launch the same kernels and replay from the third: only the first two run forward's Python. The prompt
+  # gathers the embedding's rows, the RoPE tables' once for both blocks, and the last row for the logits.
   rt, rng = Runtime(chip), np.random.default_rng(13)
   c, w = smol(rng, 2)
   t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
@@ -1402,7 +1409,9 @@ def test_kv_cache(chip):
   for i in range(6):
     new = ids if i == 0 else ids[-1:]
     places = list(range(len(ids) - len(new), len(ids)))
+    since = rt.launches
     got = llama.logits(llama.forward(on(new), on(places), t, c, kv) if i == 0 else step(on(new), on(places)))
+    assert i or sum(n for name, n, _, _ in rt.profile(since) if name == "gather") == 4
     want = llama.forward(new, places, w, c, np_kv)[0]
     assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), (i, np.abs(got - want).max(), np.abs(want).max())
     ids.append(int(want.argmax()))
@@ -2019,7 +2028,7 @@ ch, (_, back) = next(iter(links_a.items()))
 y = None
 for l, n in ((0, 0), (1, 1)):
   if x.rt is not rts[n]: x, y = (x + y).realize().to(rts[n], ch, back), None  # the hidden state crosses the link
-  rotary = (f.rows(up[n]["cos"], places[n]), f.rows(up[n]["sin"], places[n]), up[n]["turn"])
+  rotary = (up[n]["cos"], up[n]["sin"], up[n]["turn"], places[n])
   p = gpt2.block(up[n], f"layers.{l}.")
   x, y = llama.layer(x, y, p, c, rotary, gpt2.mask(places[n], 32), caches[n][l], places[n], l, True)
 got = llama.logits(f.mm(f.rows(llama.rms(x, up[1]["norm"], c, y)[1], [4]), up[1]["embed.T"], None))

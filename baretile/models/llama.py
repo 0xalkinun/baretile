@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import numpy as np
 from baretile import bh
 from baretile.runtime import compile_kernel
-from baretile.tensix import (ACROSS, DST_FREE, DST_HALF, FILLED, MATH_END, ONE, REPORT, SEM_PACKED, UNPACKABLE, aim,
-                             brisc_program, fill, ins, kernel_config, mad, mask_rows_at, math_program, mul, pack,
+from baretile.tensix import (ACROSS, COPIES, DST_FREE, DST_HALF, FILLED, MATH_END, ONE, REPORT, SEM_PACKED, UNPACKABLE,
+                             aim, brisc_program, fill, ins, kernel_config, mad, mask_rows_at, math_program, mul, pack,
                              pack_program, repack, sfp_bits, sfp_const, sfp_load, sfp_store, sfpu, slot_base, table,
                              tile_of, tt, unpack_program, widen)
 from baretile.tensor import Tensor, jit
@@ -256,35 +256,90 @@ def attends(c, w):  # whether Tensor.attend can run attention. It needs heads 64
 def rope(x, cos, sin, turn):
   return x * cos + (x @ turn) * sin
 
+def tables(rotary):  # the cos and sin tables' rows at rotary's positions. On the chip, gathered once for a call's layers
+  cos, sin, _, at = rotary
+  if not isinstance(at, Tensor): return fns(cos).rows(cos, at), fns(sin).rows(sin, at)
+  got = at.__dict__.setdefault("tables", {})  # by the tables, which models sharing the positions don't share
+  if (id(cos), id(sin)) not in got: got[id(cos), id(sin)] = (cos.gather(at), sin.gather(at))
+  return got[id(cos), id(sin)]
+
 def rope_kernel(ct, rt, n, eps, centered):
   """The kernel for rope_launch: Qwen3's RMSNorm of each head of an fp32 qkv where qk_on says, rounded to bf16, then
   RoPE, a head of a tile row a unit, in one launch. ct is a head's tiles, rt those that turn, and n the head's width.
 
   Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile stride,
   row tile stride, tile offset): the result's heads in bf16, then qkv's heads, the norm's weight (a row for each head)
-  and qk_on (a value for each head) in fp32, cos and sin in bf16 (a matrix for each head, or for at most a tile row of
-  qkv a row that all its rows take, which its tiles hold copies of), then the number of heads, the rows in the last
-  tile row (0 for 32, or for one row) and the tile rows. The result's padding rows are 0.
+  and qk_on (a value for each head) in fp32, the cos and sin tables in bf16 (a matrix for each head, a row for each
+  position), then the number of heads, the rows in the last tile row (0 for 32, or for one row) and the tile rows,
+  then the positions, an int32 row, and how many there are: one for each row of qkv, or one that all its rows take. The
+  result's padding rows are 0.
 
-  BRISC reads the unit's tiles of qkv, then the rest. Math sums their squares, each rounded, tile by tile and then along
-  the rows, for rsqrt(mean + eps). Then each tile is x times rsqrt(mean + eps) w (+ 1 centered), or x where qk_on is 0,
-  rounded, times cos, rounded, each op as the tensor ops round it. In the rt tiles that turn, x @ turn is the other
-  half's tile, negated in the first half: it's normed the same way, times sin and rounded, and the two products' exact
-  sum is rounded, where the FPU's add in the tensor ops aligns the smaller to the larger's 10 bits first. Past them, sin
-  isn't read, since turn is 0 there."""
-  X, half = 1, rt // 2  # slots: qkv's tiles, then the weight's, cos's, sin's and qk_on's
+  BRISC reads the unit's tiles of qkv and its tile of positions, then the rest. It puts a table's tiles for the unit
+  together from the rows at those positions: it reads the table's tiles whole in the tile rows of the first and the last
+  position, and the 64-byte blocks that hold the two runs of 16 of a row elsewhere, as gather_kernel does, then copies
+  the runs into place. A row at the position of the row before reads nothing more. One position for all rows goes into
+  row 0, and NoC copies within L1 take it down the tile, as a single row's tiles hold its copies. So do cos's tiles past
+  the turning dimensions, whose rows are the same at every position. Math sums their squares, each rounded, tile by tile
+  and then along the rows, for rsqrt(mean + eps). Then each tile is x times rsqrt(mean + eps) w (+ 1 centered), or x
+  where qk_on is 0, rounded, times cos, rounded, each op as the tensor ops round it. In the rt tiles that turn, x @ turn
+  is the other half's tile, negated in the first half: it's normed the same way, times sin and rounded, and the two
+  products' exact sum is rounded, where the FPU's add in the tensor ops aligns the smaller to the larger's 10 bits
+  first. Past them, sin isn't read, since turn is 0 there."""
+  # slots: qkv's tiles, then the weight's, cos's, sin's, qk_on's, the positions', and two for each of cos's and sin's
+  # tiles, which follow each other: the table's tiles in two tile rows, then the blocks
+  X, half = 1, rt // 2
   W, C = X + ct, X + 2 * ct
   S, ON = C + ct, C + ct + rt
+  IDS, B = ON + 1, ON + 2
   R2, R3, RC, RXP, RWP, RS = (k * DST_HALF for k in range(2, 8))  # Dst rows: the rsqrt, then a tile's operands
   units = lambda body: (f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned t = a[0] + u, i = t / a[26], e = t % a[26];\n"
                         f"{body}\n}}")
-  get16 = ("static void get16(unsigned base, unsigned t, unsigned slot) "
-           "{ noc_get(BANK(t), AT(base, t, 2048), SLOT(slot), 2048); }\n")  # a bf16 tile into an fp32 slot
+  decls = COPIES + f"""
+// row r's position, from row 0 of the positions' tile, and where row n's run in face f is in a bf16 tile, in bytes
+static unsigned id(unsigned r) {{ return ((volatile unsigned *)SLOT({IDS}))[at(0, r)]; }}
+static unsigned start(unsigned n, unsigned f) {{ return at(n % 32, 16 * f) * 2; }}
+static unsigned held;  // the positions' tile in IDS
+static unsigned from0[32], from1[32];  // where row r's runs in faces 0 and 1 come from, past a table tile's slots
+// copies a run of 16 bf16 values, all loads first
+static void run16(unsigned to, unsigned by) {{
+  unsigned v[8];
+  for (unsigned k = 0; k < 8; k++) v[k] = ((unsigned *)by)[k];
+  for (unsigned k = 0; k < 8; k++) ((unsigned *)to)[k] = v[k];
+}}
+"""
+  T = "for (unsigned T = 0; T < " + str(ct + rt) + "; T++)"  # a table's tile T: cos's tile T, or past ct sin's
+  # a tile whose rows are all row 0's: all of them with one position, and cos's past the turning dimensions, where the
+  # tables have the same rows at every position
+  same = f"(one || T >= {rt} && T < {ct})"
+  down = lambda n, at: f"{T} if {same} copy(SLOT({C} + T) + {at}, SLOT({C} + T) + {at} + {n}, {n});"  # rows onto rows
   brisc = units(f"  reached(frame_done[0]); for (unsigned c = 0; c < {ct}; c++) get(a[6], {tile_of(6, 'e', 'i', 'c')}, "
-                f"{X} + c); ready();\n  get(a[14], {tile_of(14, 'e', 0, 0)}, {ON});\n"
-                f"  for (unsigned c = 0; c < {ct}; c++) {{ get(a[10], {tile_of(10, 'e', 0, 'c')}, {W} + c); "
-                f"get16(a[18], {tile_of(18, 'e', 'i', 'c')}, {C} + c); }}\n"
-                f"  for (unsigned c = 0; c < {rt}; c++) get16(a[22], {tile_of(22, 'e', 'i', 'c')}, {S} + c);\n"
+                f"{X} + c);\n  unsigned one = a[33] == 1, it = {tile_of(29, 0, 0, 'one ? 0 : i')};\n"
+                f"  if (!u || it != held) for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(it), AT(a[29], it, 4096) + o, "
+                f"SLOT({IDS}) + o, 64);\n  held = it; ready();\n  get(a[14], {tile_of(14, 'e', 0, 0)}, {ON});\n"
+                f"  for (unsigned c = 0; c < {ct}; c++) get(a[10], {tile_of(10, 'e', 0, 'c')}, {W} + c);\n"
+                "  unsigned m = one ? 1 : i == a[28] - 1 && a[27] ? a[27] : 32;  // the rows to read\n"
+                "  unsigned p0 = id(0) / 32, p1 = id(m - 1) / 32;  // the tile rows read whole\n"
+                "  for (unsigned r = 0, s = 0; r < m; r++) {\n"
+                "    unsigned n = id(r), p = n / 32; if (r && n != id(r - 1)) s = r;\n"
+                "    if (p == p0 || p == p1) from0[r] = (p == p0 ? 0 : 2048) + start(n, 0), from1[r] = from0[r] + 512;"
+                "\n    else from0[r] = 4096 + 2 * s * 64 + start(n, 0) % 64, from1[r] = from0[r] + 64;\n  }\n"
+                f"  {T} {{ unsigned j = T < {ct} ? 18 : 22, c = T < {ct} ? T : T - {ct}, "
+                f"w0 = {tile_of('j', 'e', 'p0', 'c')}, w1 = {tile_of('j', 'e', 'p1', 'c')};\n"
+                f"    noc_get(BANK(w0), AT(a[j], w0, 2048), SLOT({B} + 2 * T), 2048);\n"
+                f"    if {same} continue;\n"
+                f"    if (p1 != p0) noc_get(BANK(w1), AT(a[j], w1, 2048), SLOT({B} + 2 * T) + 2048, 2048);\n"
+                "    for (unsigned r = 0; r < m; r++) {\n"
+                f"      unsigned n = id(r), p = n / 32, from = {tile_of('j', 'e', 'p', 'c')};\n"
+                "      if (p == p0 || p == p1 || r && n == id(r - 1)) continue;\n"
+                "      for (unsigned f = 0; f < 2; f++)\n        noc_get(BANK(from), AT(a[j], from, 2048) + start(n, f) / 64 * 64, "
+                f"SLOT({B} + 2 * T) + 4096 + (2 * r + f) * 64, 64);\n    }}\n  }}\n  noc_wait();\n"
+                f"  {T} for (unsigned r = 0; r < ({same} ? 1 : m); r++) {{\n"
+                f"    unsigned to = SLOT({C} + T) + start(r, 0), by = SLOT({B} + 2 * T);\n"
+                "    run16(to, by + from0[r]); run16(to + 512, by + from1[r]);\n  }\n"
+                f"  l1_settle(SLOT({C + ct + rt - 1}));  // the copies are in L1 for the NoC and the unpacker\n"
+                f"  if (one || {rt < ct:d}) {{\n"
+                f"    for (unsigned n = 32; n < 512; n *= 2) {{ {down('n', 0)} {down('n', 512)} noc_wait(); }}\n"
+                f"    {down(1024, 0)}\n  }}\n"
                 "  ready(); frame_done[0] = ++events;")
   free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
   fills = lambda *pairs: tt(free + [w for slot, row in pairs for w in fill(slot, row)] + FILLED)
@@ -321,7 +376,7 @@ def rope_kernel(ct, rt, n, eps, centered):
   setups = {"mean": sfp_const(6, 1 / n) + sfp_const(7, eps)} | {p: HALF_UP for p in programs if p[0] == "o"}
   library = "".join(f"__attribute__((noinline)) static void p_{p}(void) {{ {tt(sfpu([p], {}))} }}\n"
                     for p in ("sqrt", "frecip"))
-  return compile_kernel(brisc_program(f"a[1] * {ct}", brisc, "fp32", "bf16", get16),
+  return compile_kernel(brisc_program(f"a[1] * {ct}", brisc, "fp32", "bf16", decls),
                         unpack_program(units("fetched();"), kernel_config("fp32", "bf16", wide=True)),
                         math_program({}, math, True, qwen.helpers(programs, setups) + library, wide=True),
                         pack_program(packer))
@@ -329,21 +384,23 @@ def rope_kernel(ct, rt, n, eps, centered):
 def rope_launch(qkv, p, c, rotary):
   """Qwen3's q and k norm and then RoPE of qkv's heads, an fp32 batch, as attention does them, by rope_kernel: the heads
   side by side in bf16, or None where it doesn't apply. It needs heads a whole number of tiles wide, whose turning
-  dimensions are whole tiles in each half, the norm's weight and qk_on as fuse makes them, in fp32, and bf16 tables of
-  qkv's rows, or of one row that all of at most a tile row of qkv take. rotary's turn isn't read: it's taken to be the
-  one rotary makes. Training takes the tensor ops."""
-  (cos, sin, _), w, on, (nh, rows, hd), rd = rotary, p["qk_norm"], p["qk_on"], (qkv.batch, qkv.rows, qkv.cols), turning(c)
+  dimensions are whole tiles in each half, the norm's weight and qk_on as fuse makes them, in fp32, bf16 tables, and
+  positions as an int32 row, one for each row of qkv or one for all. Positions aren't bounds-checked. rotary's turn
+  isn't read: it's taken to be the one rotary makes, and so are the tables past the turning dimensions, the same at
+  every position. Training takes the tensor ops."""
+  (cos, sin, _, at), w, on, (nh, rows, hd), rd = rotary, p["qk_norm"], p["qk_on"], (qkv.batch, qkv.rows, qkv.cols), turning(c)
   ct, rt = hd // 32, rd // 32
   if not (qkv.dtype == w.dtype == on.dtype == "fp32" and not (qkv.requires_grad or w.requires_grad) and hd % 32 == 0
-          and rd % 64 == 0 and rd and 2 * (3 * ct + rt + 2) <= UNPACKABLE and (w.batch, w.rows, w.cols) == (nh, 1, hd)
-          and (on.batch, on.rows, on.cols) == (nh, 1, 1) and
-          all(isinstance(t, Tensor) and (t.dtype, t.batch, t.cols) == ("bf16", 1, nh * hd) and
-              (t.rows == rows or t.rows == 1 and rows <= 32) for t in (cos, sin))):
+          and rd % 64 == 0 and rd and 2 * (5 * ct + 3 * rt + 3) <= UNPACKABLE
+          and (w.batch, w.rows, w.cols) == (nh, 1, hd)
+          and (on.batch, on.rows, on.cols) == (nh, 1, 1) and isinstance(at, Tensor) and at.dtype == "int32"
+          and (at.batch, at.rows) == (1, 1) and at.cols in (1, rows) and
+          all(isinstance(t, Tensor) and (t.dtype, t.batch, t.cols) == ("bf16", 1, nh * hd) for t in (cos, sin))):
     return None
   out, tr = Tensor(qkv.rt, rows, nh * hd, dtype="bf16"), -(-rows // 32)
   key = ("rope", ct, rt, hd, c.eps, bool(c.centered))
   return out.run(key, lambda: rope_kernel(*key[1:]), out.split(nh), qkv, w, on, cos.split(nh), sin.split(nh), nh,
-                 rows % 32 if rows > 1 else 0, tr, units=tr * nh, name="rope")
+                 rows % 32 if rows > 1 else 0, tr, at.realize(), at.cols, units=tr * nh, name="rope")
 
 def layer(x, y, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None, rule=None):
   """Block l: attention, then a SwiGLU MLP, each after an RMSNorm and added back. A block whose weights have a conv
@@ -354,7 +411,8 @@ def layer(x, y, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, 
     p        the block's weights, transposed for x @ w, with q, k and v side by side and gate and up side by side.
              Other families add Qwen2's qkv_bias, Qwen3's qk_norm and qk_on, and gpt-oss's sinks and o_proj.bias
     c        the config. Its precision, if set, gives each matmul's fidelity phases
-    rotary   (cos, sin, turn), with the table rows for this call's positions
+    rotary   (cos, sin, turn, positions): the tables as rotary makes them, whose rows past the turning dimensions
+             are the same at every position, and the call's positions, one for each row or one for all
     cache    the key heads, then the value heads, with a row per position. This call writes at rows. A Gated
              DeltaNet block has its states here instead
     mask     -1e9 where a token must not look (gpt2.mask). On the chip, around's comes with its positions and window,
@@ -394,7 +452,8 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
     if normed:
       r = f.rsqrt(f.mean(qkv * qkv) + c.eps)
       qkv = f.bf16(f.where(p["qk_on"], qkv * (r * p["qk_norm"] + r if c.centered else r * p["qk_norm"]), qkv))
-    qkv = f.merge(rope(qkv, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))  # a token's heads side by side again
+    cos, sin = tables(rotary)
+    qkv = f.merge(rope(qkv, f.split(cos, nh), f.split(sin, nh), rotary[2]))  # a token's heads side by side again
   heads = f.split(qkv, nh)
   kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values together. RoPE left v's heads as they were
   rounded = isinstance(kv, np.ndarray) and cache_format(c) != "bf16"  # numpy rounds them like a block-float cache
@@ -548,7 +607,7 @@ def fuse(w, c):
 
 def around(w, c, places, size, slots=None, length=None):
   """Return (rows, rotary, mask, window, live) for tokens at places. rows selects cache positions; rotary
-  selects RoPE rows. mask covers size positions, window is the sliding-window mask or None, and live marks
+  holds the RoPE tables and places. mask covers size positions, window is the sliding-window mask or None, and live marks
   active tokens (None means all active).
 
   With slots, each sequence owns size / slots cache rows and supplies the same number of tokens. The last
@@ -557,7 +616,7 @@ def around(w, c, places, size, slots=None, length=None):
   for Tensor.attend, which reads only visible rows."""
   numpy = not isinstance(places, Tensor)
   f, places = fns(w["norm"]), np.asarray(places) if numpy else places
-  rotary, n, live = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), places.shape[-1], None
+  rotary, n, live = (w["cos"], w["sin"], w["turn"], places), places.shape[-1], None
   at = places.reshape(-1, 1) if numpy else places.reshape(1, n, 1)  # each token's position, as a column
   if not slots: rows, width, column = places, length or size, at
   else:
