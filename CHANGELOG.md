@@ -34,7 +34,8 @@ the device, kernel and model tests ([bring-up](docs/bring-up.md#running-ci-on-th
 - `llama.layer`'s rotary is `(cos, sin, turn, positions)`: the whole tables and the call's positions as an int32 row,
   one for each row or one for all, where it held the tables' rows at the positions. Pass
   `(w["cos"], w["sin"], w["turn"], places)` in place of the gathered rows: `llama.rope_kernel` reads the rows itself, in
-  the launch that norms and turns q and k.
+  the launch that norms and turns q and k. `llama.rope_launch` takes the KV cache's format and returns the heads and
+  the k and v heads, which for a bfp8 cache it packs in bfp8, so attention puts them with no cast launch.
 - Multicasts go on NoC 1, as linked transactions, so a token's matmul shares A's row while B streams on NoC 0.
 - `llama.layer(x, y, ...)` takes the residual stream and the last block's output, and returns the same pair: the
   next norm adds them. Pass `None` for y to the first block, and finish with `x, h = llama.rms(x, w["norm"], c, y)`.
