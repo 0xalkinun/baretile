@@ -10,12 +10,12 @@
 import functools, heapq, json, math, os, re, sys, time, unicodedata
 from types import SimpleNamespace
 import numpy as np
-from baretile import bh
+from baretile import bh, tensix
 from baretile.runtime import compile_kernel
 from baretile.tensix import (ACROSS, COPIES, DST_FREE, DST_HALF, FILLED, MATH_END, ONE, REPORT, SEM_PACKED, UNPACKABLE,
                              aim, brisc_program, fill, ins, kernel_config, mad, mask_rows_at, math_program, mul, pack,
                              pack_program, repack, sfp_bits, sfp_const, sfp_load, sfp_store, sfpu, slot_base, table,
-                             tile_of, tt, unpack_program, widen)
+                             tile_bytes, tile_of, tt, unpack_program, widen)
 from baretile.tensor import Tensor, jit
 from baretile.models import gpt2, qwen
 
@@ -263,16 +263,18 @@ def tables(rotary):  # the cos and sin tables' rows at rotary's positions. On th
   if (id(cos), id(sin)) not in got: got[id(cos), id(sin)] = (cos.gather(at), sin.gather(at))
   return got[id(cos), id(sin)]
 
-def rope_kernel(ct, rt, n, eps, centered):
+def rope_kernel(ct, rt, n, eps, centered, kv=None):
   """The kernel for rope_launch: Qwen3's RMSNorm of each head of an fp32 qkv where qk_on says, rounded to bf16, then
   RoPE, a head of a tile row a unit, in one launch. ct is a head's tiles, rt those that turn, and n the head's width.
+  With kv, a block float, the k and v heads are packed in it, into a tensor of their own.
 
   Arguments: the first unit and the number of units, then four words for each tensor (DRAM address, batch tile stride,
   row tile stride, tile offset): the result's heads in bf16, then qkv's heads, the norm's weight (a row for each head)
   and qk_on (a value for each head) in fp32, the cos and sin tables in bf16 (a matrix for each head, a row for each
   position), then the number of heads, the rows in the last tile row (0 for 32, or for one row) and the tile rows,
   then the positions, an int32 row, and how many there are: one for each row of qkv, or one that all its rows take. The
-  result's padding rows are 0.
+  result's padding rows are 0. With kv, then the first k head, the number of k and v heads and the tensor for them, a
+  matrix for each, whose place in the result isn't written.
 
   BRISC reads the unit's tiles of qkv and its tile of positions, then the rest. It puts a table's tiles for the unit
   together from the rows at those positions: it reads the table's tiles whole in the tile rows of the first and the last
@@ -284,13 +286,18 @@ def rope_kernel(ct, rt, n, eps, centered):
   where qk_on is 0, rounded, times cos, rounded, each op as the tensor ops round it. In the rt tiles that turn, x @ turn
   is the other half's tile, negated in the first half: it's normed the same way, times sin and rounded, and the two
   products' exact sum is rounded, where the FPU's add in the tensor ops aligns the smaller to the larger's 10 bits
-  first. Past them, sin isn't read, since turn is 0 there."""
+  first. Past them, sin isn't read, since turn is 0 there.
+
+  With kv, the packer switches to kv for a unit of a k or v head, packs its tiles into one of two buffers in turn,
+  exponents and all, and counts the unit in SYNC[7]. BRISC writes a unit's buffer out once it's counted, two units on,
+  before it fetches into L1 what the packer writes next there, or at the end."""
   # slots: qkv's tiles, then the weight's, cos's, sin's, qk_on's, the positions', and two for each of cos's and sin's
   # tiles, which follow each other: the table's tiles in two tile rows, then the blocks
   X, half = 1, rt // 2
   W, C = X + ct, X + 2 * ct
   S, ON = C + ct, C + ct + rt
   IDS, B = ON + 1, ON + 2
+  KV, kt = slot_base("fp32") + (B + 2 * (ct + rt)) * 4096, tile_bytes(kv or "bf16")  # the two buffers, with kv
   R2, R3, RC, RXP, RWP, RS = (k * DST_HALF for k in range(2, 8))  # Dst rows: the rsqrt, then a tile's operands
   units = lambda body: (f"for (unsigned u = 0; u < a[1]; u++) {{ unsigned t = a[0] + u, i = t / a[26], e = t % a[26];\n"
                         f"{body}\n}}")
@@ -306,13 +313,26 @@ static void run16(unsigned to, unsigned by) {{
   for (unsigned k = 0; k < 8; k++) v[k] = ((unsigned *)by)[k];
   for (unsigned k = 0; k < 8; k++) ((unsigned *)to)[k] = v[k];
 }}
-"""
+""" + (kv and f"""static unsigned kvs;  // units of k and v heads written
+// writes unit v's k or v tiles, once the packer has counted them, from their buffer to the tensor at a[36]
+static void written(const unsigned *a, unsigned v) {{
+  unsigned t = a[0] + v, i = t / a[26], e = t % a[26] - a[34];
+  if (e >= a[35]) return;
+  for (kvs++; peek(7) < kvs;) send();
+  for (unsigned c = 0; c < {ct}; c++) {{
+    unsigned to = {tile_of(36, 'e', 'i', 'c')};
+    noc_put({KV} + (v % 2 * {ct} + c) * {kt}, BANK(to), AT(a[36], to, {kt}), {kt});
+  }}
+  while (NIU2(CMD) & 1) {{}} while (NIU(OUTGOING)) {{}}  // the NIU has read the buffer out
+}}
+""" or "")
   T = "for (unsigned T = 0; T < " + str(ct + rt) + "; T++)"  # a table's tile T: cos's tile T, or past ct sin's
   # a tile whose rows are all row 0's: all of them with one position, and cos's past the turning dimensions, where the
   # tables have the same rows at every position
   same = f"(one || T >= {rt} && T < {ct})"
   down = lambda n, at: f"{T} if {same} copy(SLOT({C} + T) + {at}, SLOT({C} + T) + {at} + {n}, {n});"  # rows onto rows
-  brisc = units(f"  reached(frame_done[0]); for (unsigned c = 0; c < {ct}; c++) get(a[6], {tile_of(6, 'e', 'i', 'c')}, "
+  brisc = units(("  if (u > 1) written(a, u - 2);  // the unit two back's k or v\n" if kv else "") +
+                f"  reached(frame_done[0]); for (unsigned c = 0; c < {ct}; c++) get(a[6], {tile_of(6, 'e', 'i', 'c')}, "
                 f"{X} + c);\n  unsigned one = a[33] == 1, it = {tile_of(29, 0, 0, 'one ? 0 : i')};\n"
                 f"  if (!u || it != held) for (unsigned o = 0; o < 2048; o += 1024) noc_get(BANK(it), AT(a[29], it, 4096) + o, "
                 f"SLOT({IDS}) + o, 64);\n  held = it; ready();\n  get(a[14], {tile_of(14, 'e', 0, 0)}, {ON});\n"
@@ -341,6 +361,9 @@ static void run16(unsigned to, unsigned by) {{
                 f"    for (unsigned n = 32; n < 512; n *= 2) {{ {down('n', 0)} {down('n', 512)} noc_wait(); }}\n"
                 f"    {down(1024, 0)}\n  }}\n"
                 "  ready(); frame_done[0] = ++events;")
+  if kv: brisc = (f"unsigned ringed = a[1] * {ct};  // the results that go through the ring: those of q and the gates\n"
+                  f"for (unsigned u = 0; u < a[1]; u++) if ((a[0] + u) % a[26] - a[34] < a[35]) ringed -= {ct};\n"
+                  f"{brisc}\nif (a[1] > 1) written(a, a[1] - 2);\nif (a[1]) written(a, a[1] - 1);")
   free = [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)]
   fills = lambda *pairs: tt(free + [w for slot, row in pairs for w in fill(slot, row)] + FILLED)
   wide = lambda *pairs: tt([w for slot, row in pairs for w in widen({}, slot, row)])
@@ -357,8 +380,18 @@ static void run16(unsigned to, unsigned by) {{
                f"    if (on) {{ {calls(1)} }} else {{ {calls(0)} }}\n"
                f"    if (i == a[28] - 1 && a[27]) {{ {tt(aim('h'))} {mask_rows_at('a[27]')} {tt(aim(0))} }}\n"
                f"    {tt(MATH_END)} h ^= {DST_HALF};\n  }}\n  {tt(REPORT)}")
-  packer = units(f"  for (unsigned c = 0; c < {ct}; c++) {{ output(h / {DST_HALF}, h / {DST_HALF}, "
-                 f"{tile_of(2, 'e', 'i', 'c')}); {tt(pack('h', f'h / {DST_HALF}', SEM_PACKED))} h ^= {DST_HALF}; }}")
+  cfg = kernel_config("fp32", "bf16", wide=True)
+  bf16 = (f"output(h / {DST_HALF}, h / {DST_HALF}, {tile_of(2, 'e', 'i', 'c')}); "
+          f"{tt(pack('h', f'h / {DST_HALF}', SEM_PACKED))}")
+  packer = units(f"  for (unsigned c = 0; c < {ct}; c++) {{ {bf16} h ^= {DST_HALF}; }}")
+  if kv:
+    kvcfg = kernel_config("fp32", kv, wide=True) | tensix.config(L1_Dest_addr=KV // 16 - 1)
+    packer = units(f"  unsigned kv = e - a[34] < a[35];\n"
+                   f"  if (kv != packing) {{ if (kv) {{ {tt(repack(cfg, kvcfg))} }} else {{ {tt(repack(kvcfg, cfg))} }} "
+                   "packing = kv; }\n"
+                   f"  for (unsigned c = 0; c < {ct}; c++) {{ if (kv) {{ {tt(pack('h', f'u % 2 * {ct} + c'))} }} "
+                   f"else {{ {bf16} }} h ^= {DST_HALF}; }}\n"
+                   "  if (kv) { tensix_idle(); SYNC[7] = ++kvs; }")
   # An SFPMAD's result takes two cycles, and the stall logic doesn't see that SFPIADD reads it, so an SFPNOP goes
   # between them (ISA SFPMAD.md, "Instruction scheduling")
   made = lambda d: [ins("SFPNOP"), *bf16_up(d)]  # LReg d, just made, rounded to bf16
@@ -376,31 +409,36 @@ static void run16(unsigned to, unsigned by) {{
   setups = {"mean": sfp_const(6, 1 / n) + sfp_const(7, eps)} | {p: HALF_UP for p in programs if p[0] == "o"}
   library = "".join(f"__attribute__((noinline)) static void p_{p}(void) {{ {tt(sfpu([p], {}))} }}\n"
                     for p in ("sqrt", "frecip"))
-  return compile_kernel(brisc_program(f"a[1] * {ct}", brisc, "fp32", "bf16", decls),
-                        unpack_program(units("fetched();"), kernel_config("fp32", "bf16", wide=True)),
+  return compile_kernel(brisc_program("ringed" if kv else f"a[1] * {ct}", brisc, "fp32", "bf16", decls),
+                        unpack_program(units("fetched();"), cfg),
                         math_program({}, math, True, qwen.helpers(programs, setups) + library, wide=True),
-                        pack_program(packer))
+                        pack_program(packer, decls="static unsigned packing, kvs;" if kv else ""))
 
-def rope_launch(qkv, p, c, rotary):
+def rope_launch(qkv, p, c, rotary, kv="bf16"):
   """Qwen3's q and k norm and then RoPE of qkv's heads, an fp32 batch, as attention does them, by rope_kernel: the heads
-  side by side in bf16, or None where it doesn't apply. It needs heads a whole number of tiles wide, whose turning
-  dimensions are whole tiles in each half, the norm's weight and qk_on as fuse makes them, in fp32, bf16 tables, and
-  positions as an int32 row, one for each row of qkv or one for all. Positions aren't bounds-checked. rotary's turn
-  isn't read: it's taken to be the one rotary makes, and so are the tables past the turning dimensions, the same at
-  every position. Training takes the tensor ops."""
+  side by side in bf16 and the k and v heads in kv, a KV cache's format, or None where it doesn't apply. In bfp8 they
+  come packed, and their place among the heads isn't written. bfp4 takes them in bf16, since the packer's bfp4 truncates
+  where a cast rounds. It needs heads a whole number of tiles wide, whose turning dimensions are whole tiles in each
+  half, the norm's weight and qk_on as fuse makes them, in fp32, bf16 tables, and positions as an int32 row, one for
+  each row of qkv or one for all. Positions aren't bounds-checked. rotary's turn isn't read: it's taken to be the one
+  rotary makes, and so are the tables past the turning dimensions, the same at every position. Training takes the tensor
+  ops."""
   (cos, sin, _, at), w, on, (nh, rows, hd), rd = rotary, p["qk_norm"], p["qk_on"], (qkv.batch, qkv.rows, qkv.cols), turning(c)
   ct, rt = hd // 32, rd // 32
   if not (qkv.dtype == w.dtype == on.dtype == "fp32" and not (qkv.requires_grad or w.requires_grad) and hd % 32 == 0
-          and rd % 64 == 0 and rd and 2 * (5 * ct + 3 * rt + 3) <= UNPACKABLE
+          and rd % 64 == 0 and rd and 2 * (6 * ct + 3 * rt + 3) <= UNPACKABLE
           and (w.batch, w.rows, w.cols) == (nh, 1, hd)
           and (on.batch, on.rows, on.cols) == (nh, 1, 1) and isinstance(at, Tensor) and at.dtype == "int32"
           and (at.batch, at.rows) == (1, 1) and at.cols in (1, rows) and
           all(isinstance(t, Tensor) and (t.dtype, t.batch, t.cols) == ("bf16", 1, nh * hd) for t in (cos, sin))):
     return None
-  out, tr = Tensor(qkv.rt, rows, nh * hd, dtype="bf16"), -(-rows // 32)
-  key = ("rope", ct, rt, hd, c.eps, bool(c.centered))
-  return out.run(key, lambda: rope_kernel(*key[1:]), out.split(nh), qkv, w, on, cos.split(nh), sin.split(nh), nh,
-                 rows % 32 if rows > 1 else 0, tr, at.realize(), at.cols, units=tr * nh, name="rope")
+  out, tr, packed = Tensor(qkv.rt, rows, nh * hd, dtype="bf16"), -(-rows // 32), kv == "bfp8"
+  kvs = Tensor(qkv.rt, rows, hd, batch=2 * c.kv, dtype=kv) if packed else out.split(nh)[c.heads:c.heads + 2 * c.kv, :, :]
+  key = ("rope", ct, rt, hd, c.eps, bool(c.centered), kv if packed else None)
+  out.run(key, lambda: rope_kernel(*key[1:]), out.split(nh), qkv, w, on, cos.split(nh), sin.split(nh), nh,
+          rows % 32 if rows > 1 else 0, tr, at.realize(), at.cols, *(c.heads, 2 * c.kv, kvs) * packed, units=tr * nh,
+          name="rope")
+  return out, kvs
 
 def layer(x, y, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, accept=None, slots=None, rule=None):
   """Block l: attention, then a SwiGLU MLP, each after an RMSNorm and added back. A block whose weights have a conv
@@ -447,15 +485,17 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   normed = "qk_norm" in p
   qkv = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32" if normed else None)
   qkv = f.split(qkv + p["qkv_bias"] if "qkv_bias" in p else qkv, nh)  # Qwen2's bias
-  if normed and isinstance(qkv, Tensor) and (turned := rope_launch(qkv, p, c, rotary)) is not None: qkv = turned
+  if normed and isinstance(qkv, Tensor) and (turned := rope_launch(qkv, p, c, rotary, cache.dtype)) is not None:
+    qkv, kv = turned
   else:
     if normed:
       r = f.rsqrt(f.mean(qkv * qkv) + c.eps)
       qkv = f.bf16(f.where(p["qk_on"], qkv * (r * p["qk_norm"] + r if c.centered else r * p["qk_norm"]), qkv))
     cos, sin = tables(rotary)
     qkv = f.merge(rope(qkv, f.split(cos, nh), f.split(sin, nh), rotary[2]))  # a token's heads side by side again
+    kv = None
   heads = f.split(qkv, nh)
-  kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values together. RoPE left v's heads as they were
+  if kv is None: kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values together. RoPE left v's as they were
   rounded = isinstance(kv, np.ndarray) and cache_format(c) != "bf16"  # numpy rounds them like a block-float cache
   f.put(cache, rows, gpt2.bfp(kv, cache_format(c)) if rounded else kv)
   attention, n = phases("attention", "prefill" if prefill else "decode"), h.shape[-2]

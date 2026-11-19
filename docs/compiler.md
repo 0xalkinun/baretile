@@ -115,12 +115,12 @@ quantized weights.
 them. The models use these for embeddings and KV caches. Both copy a block
 float's runs of 16 with their exponents, so a row keeps its bits. `put` takes
 rows in its destination's dtype: cast them to a block-float cache's, or pack
-bfp8 in the matmul that makes them. It copies source rows and indices that
-overlap its destination before writing, and keeps singleton rows replicated
-across their tiles for later broadcasting. `assign`
-copies its source first when source and destination overlap with different
-layouts, and `realize(into=...)` computes into a temporary when its destination
-overlaps a matmul input or an input laid out differently.
+bfp8 in the kernel that makes them, as a matmul can. It copies source rows and
+indices that overlap its destination before writing, and keeps singleton rows
+replicated across their tiles for later broadcasting. `assign` copies its source
+first when source and destination overlap with different layouts, and
+`realize(into=...)` computes into a temporary when its destination overlaps a
+matmul input or an input laid out differently.
 
 Autograd walks the expression backwards and builds tensor operations for the
 gradients. `backward()` queues the forward value and every leaf gradient before

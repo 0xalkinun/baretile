@@ -1341,27 +1341,43 @@ def test_rope_kernel(chip):
   # one row, 6, 13, 32 and two tile rows, a quarter of each head turning or all of it, centered and not, at one position
   # for all rows or at a position each, apart, repeated, in the tile rows of the first and the last position and between
   # them, and at the table's last row, heads that qk_on leaves as they are, and on one worker, which takes all the units
-  # in turn. The kernel reads the tables' rows at the positions itself. Past the turning dimensions it has the tensor
-  # ops' bits. In them, it adds the two products exactly, where the tensor ops' FPU add aligns the smaller to the
-  # larger's 10 bits first: a bf16 step apart at most. The result's padding rows are 0, as a matmul over them needs:
-  # with eps 0, qkv's zero padding would norm to inf. A bf16 qkv, a norm weight that trains, turning dimensions that
-  # aren't whole tiles in each half, and positions neither one nor one a row take the tensor ops.
+  # in turn, centered and not, the last two of them v's. The kernel reads the tables' rows at the positions itself. Past
+  # the turning dimensions it has the tensor ops' bits. In them, it adds the two products exactly, where the tensor ops'
+  # FPU add aligns the smaller to the larger's 10 bits first: a bf16 step apart at most. The result's padding rows are
+  # 0, as a matmul over them needs: with eps 0, qkv's zero padding would norm to inf. A bf16 qkv, a norm weight that
+  # trains, turning dimensions that aren't whole tiles in each half, and positions neither one nor one a row take the
+  # tensor ops. For a bfp8 cache the same launch packs k and v in bfp8, which put leaves in the cache as a cast and a
+  # put of its bf16 k and v do, to the byte, with a row of zeros, a -0.0 and v's values too small for their run.
   rng = np.random.default_rng(14)
   apart, tree = rng.choice(128, 32, replace=False), np.r_[np.sort(rng.integers(0, 128, 39)), 127]
   for rows, hd, partial, centered, at, alone in ((32, 256, 0.25, True, apart, False), (1, 128, None, False, [127], False),
                                                  (6, 256, 0.25, True, [9], False), (40, 64, None, True, tree, True),
-                                                 (13, 128, None, False, [127], False), (40, 256, 0.25, True, [41], False)):
+                                                 (13, 128, None, False, [127], False), (40, 256, 0.25, True, [41], False),
+                                                 (13, 64, None, False, tree[:13], True)):
     rt = Runtime(chip, end=chip.tensix[1]) if alone else Runtime(chip)
     c = llama.custom(dim=128, heads=4, kv=2, head_dim=hd, partial=partial, gated=centered, centered=centered, theta=1e6,
                      eps=0.0 if alone else 1e-6)
     nh, rd, (cos, sin, turn) = 8 + 4 * centered, llama.turning(c), llama.rotary(c, 128)
     x = rng.normal(0, 2, (rows, nh * hd)).astype(np.float32)
+    x[:, 6 * hd:8 * hd:3] *= 2**-9  # v's values too small for their run, a -0.0, and a row of zeros where eps keeps it 0
+    x[:, 7 * hd - 1] = -0.0
+    if c.eps and rows > 1: x[rows // 2] = 0
     w, on = bf16(rng.normal(0, 0.5, (nh, 1, hd))), np.float32(np.arange(nh) < 6).reshape(nh, 1, 1)  # v's and the gates' 0
     p = {k: Tensor.of(rt, a.tolist(), "fp32") for k, a in (("qk_norm", w), ("qk_on", on))}  # fp32, as upload makes them
     rotary = [Tensor.of(rt, a.tolist()) for a in (cos, sin, turn)] + [Tensor.of(rt, [list(map(int, at))], "int32")]
     heads = Tensor.frombytes(rt, rows, nh * hd, x.tobytes(), 1, "fp32").split(nh)
-    before, got = rt.launches, llama.rope_launch(heads, p, c, rotary)
-    assert rt.launches == before + 1
+    cache, cast = (Tensor.zeros(rt, 64, hd, 4, "bfp8").realize() for _ in range(2))
+    before, (got, kv) = rt.launches, llama.rope_launch(heads, p, c, rotary)
+    assert rt.launches == before + 1 and kv.shape == (4, rows, hd) and kv.dtype == "bf16"
+    bf, packed = llama.rope_launch(heads, p, c, rotary, "bfp8")
+    assert rt.launches == before + 2 and packed.dtype == "bfp8"
+    q = lambda t: np.delete(np.frombuffer(t.tobytes(), np.uint16).reshape(rows, nh, hd), range(4, 8), 1)  # q's and the gates'
+    assert np.array_equal(q(bf), q(got))
+    places = Tensor.of(rt, [list(range(64 - rows, 64))], "int32")
+    cache.put(places, packed), cast.put(places, kv.cast("bfp8"))
+    rt.wait()  # the caches' tiles as they lie in DRAM, exponents and all
+    raw = lambda t: b"".join(chip.read(*bh.DRAM[k % 8], t.addr + k // 8 * 1088, 1088) for k in range(t.tiles))
+    assert raw(cache) == raw(cast) and value(cast).any()
     split, h = lambda a: a.reshape(-1, nh, hd).transpose(1, 0, 2), x.reshape(rows, nh, hd).transpose(1, 0, 2).astype(np.float64)
     r = 1 / np.sqrt((h * h).mean(-1, keepdims=True) + c.eps)
     n = np.where(on, h * (r * w + r if centered else r * w), h)
@@ -1376,6 +1392,7 @@ def test_rope_kernel(chip):
     ops = f.merge(llama.rope(n, f.split(cos, nh), f.split(sin, nh), rotary[2]))
     a, b = (np.frombuffer(t.tobytes(), np.uint16).reshape(rows, nh, hd).astype(np.int32) for t in (got, ops))
     assert np.array_equal(a[..., rd:], b[..., rd:]) and np.abs(a - b).max() <= 1, np.abs(a - b).max()
+  assert llama.rope_launch(heads, p, c, rotary, "bfp4")[1].dtype == "bf16"  # the packer's bfp4 would truncate
   assert llama.rope_launch(heads.bfloat16(), p, c, rotary) is None
   assert llama.rope_launch(heads, p, llama.custom(**vars(c) | {"partial": 0.125}), rotary) is None  # 16 in each half turn
   assert llama.rope_launch(heads, p | {"qk_norm": p["qk_norm"].requires_grad_()}, c, rotary) is None
